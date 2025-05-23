@@ -66,13 +66,15 @@ def set_block_rank(smem_ptr: cute.Pointer, peer_cta_rank_in_cluster: cute.Int32,
 
 
 @dsl_user_op
-def st_async(val: float | cute.Float32, smem_ptr: cute.Pointer, mbar_ptr: cute.Pointer,
-             peer_cta_rank_in_cluster: cute.typing.Int, *, loc=None, ip=None) -> None:
-    smem_ptr_i32 = set_block_rank(smem_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value()
-    mbar_ptr_i32 = set_block_rank(mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value()
+def store_shared_remote(
+    val: float | cute.Float32, smem_ptr: cute.Pointer, mbar_ptr: cute.Pointer,
+    peer_cta_rank_in_cluster: cute.typing.Int, *, loc=None, ip=None
+) -> None:
+    remote_smem_ptr_i32 = set_block_rank(smem_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value()
+    remote_mbar_ptr_i32 = set_block_rank(mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value()
     llvm.inline_asm(
         None,
-        [smem_ptr_i32, cute.Float32(val).ir_value(loc=loc, ip=ip), mbar_ptr_i32],
+        [remote_smem_ptr_i32, cute.Float32(val).ir_value(loc=loc, ip=ip), remote_mbar_ptr_i32],
         "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [$0], $1, [$2];",
         "r,f,r",
         has_side_effects=True,
@@ -93,8 +95,10 @@ def cluster_reduce(val: cute.Numeric, op: Callable, reduction_buffer: cute.Tenso
     warps_per_row, cluster_n = reduction_buffer.shape[1]
     row_idx, col_idx = warp_idx // warps_per_row, warp_idx % warps_per_row
     if lane_idx < cluster_n:
-        st_async(val, elem_pointer(reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster))),
-                 mbar_ptr, peer_cta_rank_in_cluster=lane_idx)
+        store_shared_remote(
+            val, elem_pointer(reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster))),
+            mbar_ptr, peer_cta_rank_in_cluster=lane_idx
+        )
     cute.arch.mbarrier_wait(mbar_ptr, phase=0)
     block_reduce_val = init_val
     num_iter = cute.ceil_div(warps_per_row * cluster_n, cute.arch.WARP_SIZE)
@@ -216,7 +220,6 @@ def rmsnorm_kernel(
     #     cute.print_tensor(tWgW)
     #     cute.print_tensor(tXpX)
 
-
     if cluster_n > 1:
         if tidx == 0:
             cute.arch.mbarrier_init_arrive_cnt(mbar_ptr, 1)
@@ -225,7 +228,6 @@ def rmsnorm_kernel(
             cute.arch.mbarrier_init_tx_bytes(mbar_ptr, num_warps * cluster_n * cutlass.Float32.width // 8)
         # Cluster arrive after barrier init
         cute.arch.cluster_arrive_relaxed()
-
 
     tXpX = cute.make_fragment_like(tXgX[(0, None), None, None], cutlass.Boolean)
     for i in range(cute.size(tXpX)):
