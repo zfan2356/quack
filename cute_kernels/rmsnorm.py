@@ -264,18 +264,17 @@ def rmsnorm_kernel(
     #     thr_sum_sq_A = thr_sum_sq_A + xi * xi
     #     # thr_sum_sq_A = thr_sum_sq_A + (x[i] * x[i] if pred[i] else 0.0)
     # warp_sum_sq_x = warp_reduce(thr_sum_sq_A, operator.add)
-    warp_sum_sq_x = warp_reduce(
-        (x * x).reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0),
+    sum_sq_x = (x * x).reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0)
+    sum_sq_x = warp_reduce(
+        sum_sq_x,
         operator.add,
         width=min_constexpr(tv_layout.shape[0][0], cute.arch.WARP_SIZE),
     )
-    if cluster_n > 1:
-        cute.arch.cluster_wait()
-    sum_sq_x = warp_sum_sq_x
     if cutlass.const_expr(warps_per_row * cluster_n) > 1:
         if cutlass.const_expr(cluster_n) == 1:
             sum_sq_x = block_reduce(sum_sq_x, operator.add, reduction_buffer, init_val=0.0)
         else:
+            cute.arch.cluster_wait()
             sum_sq_x = cluster_reduce(sum_sq_x, operator.add, reduction_buffer, mbar_ptr, init_val=0.0)
             # if tidx == 0:
             #     cute.printf("sum_sq_x = {}", sum_sq_x)
@@ -283,7 +282,7 @@ def rmsnorm_kernel(
     rstd = rsqrt(sum_sq_x / shape[1] + eps)
     # Only the thread corresponding to column 0 writes out the rstd to gmem
     if tXcX[0][1] == 0 and tXcX[0][0] < shape[0]:
-        if cluster_n == 1:
+        if cutlass.const_expr(cluster_n == 1):
             tXrRstd[0] = rstd
         else:
             if cute.arch.block_idx_in_cluster() == 0:
