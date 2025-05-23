@@ -3,7 +3,7 @@ import argparse
 import torch
 import time
 import operator
-from typing import Type, Callable, Union
+from typing import Type, Callable
 
 from triton.testing import do_bench
 
@@ -48,28 +48,11 @@ def block_reduce(val: cute.Numeric, op: Callable, reduction_buffer: cute.Tensor,
 
 
 @dsl_user_op
-def st_async(val: Union[float, cute.Float32], smem_ptr: cute.Pointer, mbar_ptr: cute.Pointer, peer_cta_rank_in_cluster: cute.typing.Int, *, loc=None, ip=None) -> None:
+def set_block_rank(smem_ptr: cute.Pointer, peer_cta_rank_in_cluster: cute.Int32, *, loc=None, ip=None) -> cutlass.Int32:
+    """Map the given smem pointer to the address at another CTA rank in the cluster.
+    """
     smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
-    mbar_ptr_i32 = mbar_ptr.toint(loc=loc, ip=ip).ir_value()
-    llvm.inline_asm(
-        None,
-        [smem_ptr_i32, mbar_ptr_i32, peer_cta_rank_in_cluster.ir_value(), cute.Float32(val).ir_value(loc=loc, ip=ip)],
-        ".reg .b32 smem_ptr, mbar_ptr;\n"
-        "mapa.shared::cluster.u32 smem_ptr, $0, $2;\n"
-        "mapa.shared::cluster.u32 mbar_ptr, $1, $2;\n"
-        "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [smem_ptr], $3, [mbar_ptr];",
-        "r,r,r,f",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
-@dsl_user_op
-def mapa_i32(smem_ptr: cute.Pointer, mbar_ptr: cute.Pointer, peer_cta_rank_in_cluster: cute.Int32, *, loc=None, ip=None) -> (cutlass.Int32, cutlass.Int32):
-    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
-    mbar_ptr_i32 = mbar_ptr.toint(loc=loc, ip=ip).ir_value()
-    res0 = cutlass.Int32(
+    return cutlass.Int32(
         llvm.inline_asm(
             T.i32(),
             [smem_ptr_i32, peer_cta_rank_in_cluster.ir_value()],
@@ -80,18 +63,27 @@ def mapa_i32(smem_ptr: cute.Pointer, mbar_ptr: cute.Pointer, peer_cta_rank_in_cl
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     )
-    res1 = cutlass.Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [mbar_ptr_i32, peer_cta_rank_in_cluster.ir_value()],
-            "mapa.shared::cluster.u32 $0, $1, $2;",
-            "=r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
+
+
+@dsl_user_op
+def st_async(val: float | cute.Float32, smem_ptr: cute.Pointer, mbar_ptr: cute.Pointer,
+             peer_cta_rank_in_cluster: cute.typing.Int, *, loc=None, ip=None) -> None:
+    smem_ptr_i32 = set_block_rank(smem_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value()
+    mbar_ptr_i32 = set_block_rank(mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None,
+        [smem_ptr_i32, cute.Float32(val).ir_value(loc=loc, ip=ip), mbar_ptr_i32],
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [$0], $1, [$2];",
+        "r,f,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
     )
-    return res0, res1
+
+
+@dsl_user_op
+def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
+    return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
 
 
 @cute.jit
@@ -100,16 +92,9 @@ def cluster_reduce(val: cute.Numeric, op: Callable, reduction_buffer: cute.Tenso
     lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
     warps_per_row, cluster_n = reduction_buffer.shape[1]
     row_idx, col_idx = warp_idx // warps_per_row, warp_idx % warps_per_row
-    # smem_ptr = reduction_buffer[row_idx, None].iterator + col_idx * warps_per_row + cta_rank_in_cluster
-    # peer_cta_rank_in_cluster = lane_idx
-    # smem_llvm_ptr = _cute_ir.inttoptr(cutlass.Int64(mapa_shared_cluster(smem_ptr, peer_cta_rank_in_cluster)))
-    # smem_mapa, mbar_mapa = mapa_i32(smem_ptr, mbar_ptr, peer_cta_rank_in_cluster)
-    # if lane_idx < cluster_n and warp_idx == 0:
-    #     # cute.printf("st_async: lane_idx = {}, cta_rank = {}, smem_ptr = {}, mbar_ptr = {}", lane_idx, cta_rank_in_cluster, smem_ptr, mbar_ptr)
-    #     cute.printf("st_async: lane_idx = {}, cta_rank = {}, smem_ptr = {}, smem_mapa = {}, mbar_ptr = {}, mbar_mapa = {}", lane_idx, cta_rank_in_cluster, smem_ptr, smem_mapa, mbar_ptr, mbar_mapa)
     if lane_idx < cluster_n:
-        # What's the right way to get the address an element in reduction_buffer?
-        st_async(val, reduction_buffer[row_idx, (col_idx, None)].iterator + cta_rank_in_cluster * reduction_buffer.stride[1][1], mbar_ptr, lane_idx)
+        st_async(val, elem_pointer(reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster))),
+                 mbar_ptr, peer_cta_rank_in_cluster=lane_idx)
     cute.arch.mbarrier_wait(mbar_ptr, phase=0)
     block_reduce_val = init_val
     num_iter = cute.ceil_div(warps_per_row * cluster_n, cute.arch.WARP_SIZE)
@@ -130,7 +115,7 @@ def max_constexpr(a: cutlass.Constexpr, b: cutlass.Constexpr) -> cutlass.Constex
 
 
 @dsl_user_op
-def rsqrt(a: Union[float, cute.Float32], *, loc=None, ip=None) -> cute.Float32:
+def rsqrt(a: float | cute.Float32, *, loc=None, ip=None) -> cute.Float32:
     return cute.Float32(
         llvm.inline_asm(
             T.f32(),
