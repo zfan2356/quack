@@ -44,26 +44,11 @@ def minimum(a: cutlass.Constexpr, b: cutlass.Constexpr) -> cutlass.Constexpr:
 def maximum(a: cutlass.Constexpr, b: cutlass.Constexpr) -> cutlass.Constexpr:
     return a if a > b else b
 
-
 @cute.jit
-def warp_reduce_softmax_phase_1(max_val: cute.Numeric, denom: cute.Numeric, width: cutlass.Constexpr = cute.arch.WARP_SIZE) -> Tuple[cute.Numeric, cute.Numeric]:
+def warp_reduce(val: cute.Numeric, op: Callable, width: cutlass.Constexpr = cute.arch.WARP_SIZE) -> cute.Numeric:
     for i in range(int(math.log2(width))):
-        other_max_val = cute.arch.shuffle_sync_bfly(max_val, offset=1 << i)
-        other_denom   = cute.arch.shuffle_sync_bfly(denom, offset=1 << i)
-
-        # ## This impl is usually faster than the one below (commented out)
-        new_max_val   = maximum(max_val, other_max_val)
-        denom         = denom * exp_arch(max_val - new_max_val) + other_denom * exp_arch(other_max_val - new_max_val)
-        max_val       = new_max_val
-        # ## Alternatively, 
-        # if max_val >= other_max_val:
-        #     denom     = denom + other_denom * exp_arch(other_max_val - max_val)
-        #     # max_val   = max_val
-        # else:
-        #     denom     = denom * exp_arch(max_val - other_max_val) + other_denom 
-        #     max_val   = other_max_val
-
-    return max_val, denom
+        val = op(val, cute.arch.shuffle_sync_bfly(val, offset=1 << i))
+    return val
 
 
 @cute.jit
@@ -78,41 +63,27 @@ def block_reduce_softmax_phase_1(max_val: cute.Numeric, denom: cute.Numeric,
         denom_reduction_buffer  [row_idx, col_idx] = denom
         
     cute.arch.barrier()
-    block_reduce_max_val   = init_max_val
-    block_reduce_denom_val = init_denom_val
+    block_reduce_max_val        = init_max_val
+    block_reduce_denom_val      = init_denom_val
     
     if lane_idx < warps_per_row:
-        block_reduce_max_val   = max_val_reduction_buffer[row_idx, lane_idx]
-        block_reduce_denom_val = denom_reduction_buffer[row_idx, lane_idx]
+        block_reduce_max_val    = max_val_reduction_buffer[row_idx, lane_idx]
+        block_reduce_denom_val  = denom_reduction_buffer[row_idx, lane_idx]
 
-    ret_max, ret_denom = warp_reduce_softmax_phase_1(block_reduce_max_val, block_reduce_denom_val)
-    # cute.printf('tid {} lane {} warp {} bid {} block_reduce_max_val {}, block_reduce_denom_val {}, ret_max {}, ret_denom {}', cute.arch.thread_idx(), cute.arch.lane_idx(), cute.arch.warp_idx(), cute.arch.block_idx(), block_reduce_max_val, block_reduce_denom_val, ret_max, ret_denom)            
-    return ret_max, ret_denom
-
-
-@dsl_user_op
-def st_async(val: Union[float, cute.Float32], smem_ptr: cute.Pointer, mbar_ptr: cute.Pointer, peer_cta_rank_in_cluster: cute.typing.Int, *, loc=None, ip=None) -> None:
-    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
-    mbar_ptr_i32 = mbar_ptr.toint(loc=loc, ip=ip).ir_value()
-    llvm.inline_asm(
-        None,
-        [smem_ptr_i32, mbar_ptr_i32, peer_cta_rank_in_cluster.ir_value(), cute.Float32(val).ir_value(loc=loc, ip=ip)],
-        ".reg .b32 smem_ptr, mbar_ptr;\n"
-        "mapa.shared::cluster.u32 smem_ptr, $0, $2;\n"
-        "mapa.shared::cluster.u32 mbar_ptr, $1, $2;\n"
-        "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [smem_ptr], $3, [mbar_ptr];",
-        "r,r,r,f",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
+    new_block_reduce_max_val    = warp_reduce(block_reduce_max_val, maximum)
+    new_block_reduce_denom_val  = warp_reduce(
+        block_reduce_denom_val * exp_arch(block_reduce_max_val - new_block_reduce_max_val), operator.add,
     )
+    
+    return new_block_reduce_max_val, new_block_reduce_denom_val
 
 
 @dsl_user_op
-def mapa_i32(smem_ptr: cute.Pointer, mbar_ptr: cute.Pointer, peer_cta_rank_in_cluster: cute.Int32, *, loc=None, ip=None) -> Tuple[cutlass.Int32, cutlass.Int32]:
+def set_block_rank(smem_ptr: cute.Pointer, peer_cta_rank_in_cluster: cute.Int32, *, loc=None, ip=None) -> cutlass.Int32:
+    """Map the given smem pointer to the address at another CTA rank in the cluster.
+    """
     smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
-    mbar_ptr_i32 = mbar_ptr.toint(loc=loc, ip=ip).ir_value()
-    res0 = cutlass.Int32(
+    return cutlass.Int32(
         llvm.inline_asm(
             T.i32(),
             [smem_ptr_i32, peer_cta_rank_in_cluster.ir_value()],
@@ -123,18 +94,29 @@ def mapa_i32(smem_ptr: cute.Pointer, mbar_ptr: cute.Pointer, peer_cta_rank_in_cl
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     )
-    res1 = cutlass.Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [mbar_ptr_i32, peer_cta_rank_in_cluster.ir_value()],
-            "mapa.shared::cluster.u32 $0, $1, $2;",
-            "=r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
+
+
+@dsl_user_op
+def store_shared_remote(
+    val: float | cute.Float32, smem_ptr: cute.Pointer, mbar_ptr: cute.Pointer,
+    peer_cta_rank_in_cluster: cute.typing.Int, *, loc=None, ip=None
+) -> None:
+    remote_smem_ptr_i32 = set_block_rank(smem_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value()
+    remote_mbar_ptr_i32 = set_block_rank(mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None,
+        [remote_smem_ptr_i32, cute.Float32(val).ir_value(loc=loc, ip=ip), remote_mbar_ptr_i32],
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [$0], $1, [$2];",
+        "r,f,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
     )
-    return res0, res1
+
+
+@dsl_user_op
+def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
+    return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
 
 
 @cute.jit
@@ -146,18 +128,17 @@ def cluster_reduce_softmax_phase_1(max_val: cute.Numeric, denom: cute.Numeric,
     lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
     warps_per_row, cluster_n = max_val_reduction_buffer.shape[1]
     row_idx, col_idx = warp_idx // warps_per_row, warp_idx % warps_per_row
-    # smem_ptr = reduction_buffer[row_idx, None].iterator + col_idx * warps_per_row + cta_rank_in_cluster
-    # peer_cta_rank_in_cluster = lane_idx
-    # smem_llvm_ptr = _cute_ir.inttoptr(cutlass.Int64(mapa_shared_cluster(smem_ptr, peer_cta_rank_in_cluster)))
-    # smem_mapa, mbar_mapa = mapa_i32(smem_ptr, mbar_ptr, peer_cta_rank_in_cluster)
-    # if lane_idx < cluster_n and warp_idx == 0:
-    #     # cute.printf("st_async: lane_idx = {}, cta_rank = {}, smem_ptr = {}, mbar_ptr = {}", lane_idx, cta_rank_in_cluster, smem_ptr, mbar_ptr)
-    #     cute.printf("st_async: lane_idx = {}, cta_rank = {}, smem_ptr = {}, smem_mapa = {}, mbar_ptr = {}, mbar_mapa = {}", lane_idx, cta_rank_in_cluster, smem_ptr, smem_mapa, mbar_ptr, mbar_mapa)
     if lane_idx < cluster_n:
         # What's the right way to get the address an element in reduction_buffer?
-        st_async(max_val, max_val_reduction_buffer[row_idx, (col_idx, None)].iterator + cta_rank_in_cluster * max_val_reduction_buffer.stride[1][1], max_val_mbar_ptr, lane_idx)
-        st_async(denom,   denom_reduction_buffer[row_idx, (col_idx, None)].iterator   + cta_rank_in_cluster * denom_reduction_buffer.stride[1][1],   denom_mbar_ptr, lane_idx)
-
+        store_shared_remote(
+            max_val, elem_pointer(max_val_reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster))),
+            max_val_mbar_ptr, peer_cta_rank_in_cluster=lane_idx
+        )
+        store_shared_remote(
+            denom, elem_pointer(denom_reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster))),
+            denom_mbar_ptr, peer_cta_rank_in_cluster=lane_idx
+        )
+        
     cute.arch.mbarrier_wait(max_val_mbar_ptr, phase=0)
     cute.arch.mbarrier_wait(denom_mbar_ptr, phase=0)
 
@@ -175,8 +156,13 @@ def cluster_reduce_softmax_phase_1(max_val: cute.Numeric, denom: cute.Numeric,
                 other_block_reduce_denom * exp_arch(other_block_reduce_max_val - new_block_reduce_max_val)
             
             block_reduce_max_val       = new_block_reduce_max_val
-            
-    return warp_reduce_softmax_phase_1(block_reduce_max_val, block_reduce_denom_val)
+
+    new_block_reduce_max_val    = warp_reduce(block_reduce_max_val, maximum)
+    new_block_reduce_denom_val  = warp_reduce(
+        block_reduce_denom_val * exp_arch(block_reduce_max_val - new_block_reduce_max_val), operator.add,
+    )
+    
+    return new_block_reduce_max_val, new_block_reduce_denom_val
 
 
 @cute.kernel
@@ -290,20 +276,19 @@ def softmax_kernel(
     cute.autovec_copy(tXsX, tXrX)
     x = tXrX.load().to(cute.Float32)
 
+    ######## phase 1, get row max and softmax denominator (online softmax approach)
     max_x      = x.reduce(cute.ReductionOp.MAX, init_val=float('-inf'), reduction_profile=0)
-    denom      = exp_math(x - max_x).reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0)
-
-    ######## phase 1,, get row max and softmax denominator (online softmax approach)
-    warp_max_x, warp_denom = warp_reduce_softmax_phase_1(
-        max_x, denom,
+    warp_max_x = warp_reduce(
+        max_x, maximum,
         width=minimum(tv_layout.shape[0][0], cute.arch.WARP_SIZE),
     )
-    if cluster_n > 1:
-        cute.arch.cluster_wait()
-
-    max_x = warp_max_x
-    denom = warp_denom
-
+    denom      = exp_math(x - warp_max_x).reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0)
+    warp_denom = warp_reduce(
+        denom, operator.add,
+        width=minimum(tv_layout.shape[0][0], cute.arch.WARP_SIZE),
+    )
+    max_x, denom = warp_max_x, warp_denom
+    
     if cutlass.const_expr(warps_per_row * cluster_n) > 1:
         if cutlass.const_expr(cluster_n) == 1:
             max_x, denom = block_reduce_softmax_phase_1(max_x, denom, max_val_reduction_buffer, denom_reduction_buffer, init_max_val=max_x, init_denom_val=0.0)
@@ -476,19 +461,20 @@ if __name__ == "__main__":
     run_softmax(
         args.M,
         args.N,
-        dtype=cutlass.BFloat16,
+        dtype=cutlass.Float32,
         skip_ref_check=args.skip_ref_check,
         benchmark=args.benchmark,
         warmup_iterations=args.warmup_iterations,
         iterations=args.iterations,
     )
+    
     N_vals = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
     results = []
     for N in N_vals:
         res = run_softmax(
             args.M,
             N,
-            dtype=cutlass.BFloat16,
+            dtype=cutlass.Float32,
             skip_ref_check=False,
             benchmark=True,
             warmup_iterations=args.warmup_iterations,
