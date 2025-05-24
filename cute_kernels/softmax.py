@@ -70,7 +70,7 @@ def block_reduce_softmax_phase_1(max_val: cute.Numeric, denom: cute.Numeric,
         block_reduce_max_val    = max_val_reduction_buffer[row_idx, lane_idx]
         block_reduce_denom_val  = denom_reduction_buffer[row_idx, lane_idx]
 
-    new_block_reduce_max_val    = warp_reduce(block_reduce_max_val, maximum)
+    new_block_reduce_max_val    = warp_reduce(block_reduce_max_val, cute.arch.fmax)
     new_block_reduce_denom_val  = warp_reduce(
         block_reduce_denom_val * exp_arch(block_reduce_max_val - new_block_reduce_max_val), operator.add,
     )
@@ -150,14 +150,14 @@ def cluster_reduce_softmax_phase_1(max_val: cute.Numeric, denom: cute.Numeric,
         if idx < cute.size(max_val_reduction_buffer, mode=[1]):
             other_block_reduce_max_val = max_val_reduction_buffer[row_idx, idx]
             other_block_reduce_denom   = denom_reduction_buffer[row_idx, idx]
-            new_block_reduce_max_val   = maximum(block_reduce_max_val, other_block_reduce_max_val)
+            new_block_reduce_max_val   = cute.arch.fmax(block_reduce_max_val, other_block_reduce_max_val)
 
             block_reduce_denom_val     = block_reduce_denom_val * exp_arch(block_reduce_max_val - new_block_reduce_max_val) + \
                 other_block_reduce_denom * exp_arch(other_block_reduce_max_val - new_block_reduce_max_val)
             
             block_reduce_max_val       = new_block_reduce_max_val
 
-    new_block_reduce_max_val    = warp_reduce(block_reduce_max_val, maximum)
+    new_block_reduce_max_val    = warp_reduce(block_reduce_max_val, cute.arch.fmax)
     new_block_reduce_denom_val  = warp_reduce(
         block_reduce_denom_val * exp_arch(block_reduce_max_val - new_block_reduce_max_val), operator.add,
     )
@@ -279,7 +279,7 @@ def softmax_kernel(
     ######## phase 1, get row max and softmax denominator (online softmax approach)
     max_x      = x.reduce(cute.ReductionOp.MAX, init_val=float('-inf'), reduction_profile=0)
     warp_max_x = warp_reduce(
-        max_x, maximum,
+        max_x, cute.arch.fmax,
         width=minimum(tv_layout.shape[0][0], cute.arch.WARP_SIZE),
     )
     denom      = exp_math(x - warp_max_x).reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0)
