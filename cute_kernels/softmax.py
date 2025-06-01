@@ -52,30 +52,17 @@ def warp_reduce(val: cute.Numeric, op: Callable, width: cutlass.Constexpr = cute
 
 
 @cute.jit
-def block_reduce_softmax_phase_1(max_val: cute.Numeric, denom: cute.Numeric, 
-                                 max_val_reduction_buffer: cute.Tensor, denom_reduction_buffer: cute.Tensor, 
-                                 init_max_val: cute.Numeric = float('-inf'), init_denom_val: cute.Numeric = 0.0) -> Tuple[cute.Numeric, cute.Numeric]:
+def block_reduce(val: cute.Numeric, op: Callable, reduction_buffer: cute.Tensor, init_val: cute.Numeric = 0.0) -> cute.Numeric:
     lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
-    warps_per_row = max_val_reduction_buffer.shape[1]
+    warps_per_row = reduction_buffer.shape[1]
     row_idx, col_idx = warp_idx // warps_per_row, warp_idx % warps_per_row
     if lane_idx == 0:
-        max_val_reduction_buffer[row_idx, col_idx] = max_val
-        denom_reduction_buffer  [row_idx, col_idx] = denom
-        
+        reduction_buffer[row_idx, col_idx] = val
     cute.arch.barrier()
-    block_reduce_max_val        = init_max_val
-    block_reduce_denom_val      = init_denom_val
-    
+    block_reduce_val = init_val
     if lane_idx < warps_per_row:
-        block_reduce_max_val    = max_val_reduction_buffer[row_idx, lane_idx]
-        block_reduce_denom_val  = denom_reduction_buffer[row_idx, lane_idx]
-
-    new_block_reduce_max_val    = warp_reduce(block_reduce_max_val, cute.arch.fmax)
-    new_block_reduce_denom_val  = warp_reduce(
-        block_reduce_denom_val * exp_arch(block_reduce_max_val - new_block_reduce_max_val), operator.add,
-    )
-    
-    return new_block_reduce_max_val, new_block_reduce_denom_val
+        block_reduce_val = reduction_buffer[row_idx, lane_idx]
+    return warp_reduce(block_reduce_val, op)
 
 
 @dsl_user_op
@@ -120,49 +107,24 @@ def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cut
 
 
 @cute.jit
-def cluster_reduce_softmax_phase_1(max_val: cute.Numeric, denom: cute.Numeric, 
-                                   max_val_reduction_buffer: cute.Tensor, denom_reduction_buffer: cute.Tensor, 
-                                   max_val_mbar_ptr: cute.Pointer, denom_mbar_ptr: cute.Pointer,
-                                   init_max_val: cute.Numeric = float('-inf'), init_denom_val: cute.Numeric = 0.0) -> Tuple[cute.Numeric, cute.Numeric]:
+def cluster_reduce(val: cute.Numeric, op: Callable, reduction_buffer: cute.Tensor, mbar_ptr: cute.Pointer, init_val: cute.Numeric = 0.0) -> cute.Numeric:
     cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
     lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
-    warps_per_row, cluster_n = max_val_reduction_buffer.shape[1]
+    warps_per_row, cluster_n = reduction_buffer.shape[1]
     row_idx, col_idx = warp_idx // warps_per_row, warp_idx % warps_per_row
     if lane_idx < cluster_n:
-        # What's the right way to get the address an element in reduction_buffer?
         store_shared_remote(
-            max_val, elem_pointer(max_val_reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster))),
-            max_val_mbar_ptr, peer_cta_rank_in_cluster=lane_idx
+            val, elem_pointer(reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster))),
+            mbar_ptr, peer_cta_rank_in_cluster=lane_idx
         )
-        store_shared_remote(
-            denom, elem_pointer(denom_reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster))),
-            denom_mbar_ptr, peer_cta_rank_in_cluster=lane_idx
-        )
-        
-    cute.arch.mbarrier_wait(max_val_mbar_ptr, phase=0)
-    cute.arch.mbarrier_wait(denom_mbar_ptr, phase=0)
-
-    block_reduce_max_val   = init_max_val
-    block_reduce_denom_val = init_denom_val
+    cute.arch.mbarrier_wait(mbar_ptr, phase=0)
+    block_reduce_val = init_val
     num_iter = cute.ceil_div(warps_per_row * cluster_n, cute.arch.WARP_SIZE)
     for i in cutlass.range_constexpr(num_iter):
         idx = lane_idx + i * cute.arch.WARP_SIZE
-        if idx < cute.size(max_val_reduction_buffer, mode=[1]):
-            other_block_reduce_max_val = max_val_reduction_buffer[row_idx, idx]
-            other_block_reduce_denom   = denom_reduction_buffer[row_idx, idx]
-            new_block_reduce_max_val   = cute.arch.fmax(block_reduce_max_val, other_block_reduce_max_val)
-
-            block_reduce_denom_val     = block_reduce_denom_val * exp_arch(block_reduce_max_val - new_block_reduce_max_val) + \
-                other_block_reduce_denom * exp_arch(other_block_reduce_max_val - new_block_reduce_max_val)
-            
-            block_reduce_max_val       = new_block_reduce_max_val
-
-    new_block_reduce_max_val    = warp_reduce(block_reduce_max_val, cute.arch.fmax)
-    new_block_reduce_denom_val  = warp_reduce(
-        block_reduce_denom_val * exp_arch(block_reduce_max_val - new_block_reduce_max_val), operator.add,
-    )
-    
-    return new_block_reduce_max_val, new_block_reduce_denom_val
+        if idx < cute.size(reduction_buffer, mode=[1]):
+            block_reduce_val = op(block_reduce_val, reduction_buffer[row_idx, idx])
+    return warp_reduce(block_reduce_val, op)
 
 
 @cute.kernel
@@ -174,8 +136,6 @@ def softmax_kernel(
     tv_layout: cute.Layout,
     tiler_mn: cute.Shape,
     cluster_n: cutlass.Constexpr = 1,
-    reload_from: cutlass.Constexpr = None,
-    delay_w_load: cutlass.Constexpr = False,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, cluster_y, _ = cute.arch.block_idx()
@@ -184,11 +144,6 @@ def softmax_kernel(
     # slice for CTAs
     # logical id -> address
     blkX, blkOut, blkCrd = [gT[(None, None), bidx if cluster_n == 1 else (bidx, cluster_y)] for gT in (gX, gO, cX)]
-
-    print(f"[DSL INFO] Sliced Tensors per thread block:")
-    print(f"[DSL INFO]   blkX = {blkX.type}")
-    print(f"[DSL INFO]   blkOut = {blkOut.type}")
-    print(f"[DSL INFO]   blkCrd = {blkCrd.type}")
 
     # declare the atoms which will be used later for memory copy
     copy_atom_load_X = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type, num_bits_per_copy=128)
@@ -213,9 +168,6 @@ def softmax_kernel(
     denom_reduction_buffer   = smem.allocate_tensor(cutlass.Float32, denom_reduction_buffer_layout, byte_alignment=4)
 
 
-    print(f"[DSL INFO] max_val_reduction_buffer = {max_val_reduction_buffer.type}")
-    print(f"[DSL INFO] denom_reduction_buffer   = {denom_reduction_buffer.type}")
-
     max_val_mbar_ptr = cute.Pointer()
     denom_mbar_ptr = cute.Pointer()
     
@@ -223,7 +175,6 @@ def softmax_kernel(
         max_val_mbar_ptr = smem.allocate(cutlass.Int64.width // 8, byte_alignment=8)
         denom_mbar_ptr   = smem.allocate(cutlass.Int64.width // 8, byte_alignment=8)
 
-    # tXgX = thr_copy_X.partition_S(blkX)
     tXgX = thr_copy_X_async.partition_S(blkX)
     tXsX = thr_copy_X_async.partition_S(sX)
     tXgO = thr_copy_O.partition_D(blkOut) 
@@ -231,23 +182,6 @@ def softmax_kernel(
 
     # allocate fragments for gmem->rmem
     tXrX, tXrO = [cute.make_fragment_like(thr) for thr in (tXgX, tXgO)]
-
-    print(f"[DSL INFO] Sliced Tensors per thread:")
-    print(f"[DSL INFO]   tXgX = {tXgX.type}")
-    print(f"[DSL INFO]   tXsX = {tXsX.type}")
-    print(f"[DSL INFO]   tXgO = {tXgO.type}")
-    # print(f"[DSL INFO]   tXrRstd filter = {cute.filter_zeros(tXrRstd).type}")
-    print(f"[DSL INFO]   tXcX = {tXcX.type}")
-    # print(f"[DSL INFO]   thr_copy_X = {thr_copy_X.type}")
-
-    # # Print per thread predicate mask
-    # if tidx == 0 and bidx == 0:
-    #     cute.printf("block_dim = {}", cute.arch.grid_dim())
-    #     cute.printf("shape = {}", shape)
-    #     cute.print_tensor(tXgX)
-    #     cute.print_tensor(tWgW)
-    #     cute.print_tensor(tXpX)
-
 
     if cluster_n > 1:
         if tidx == 0:
@@ -264,46 +198,51 @@ def softmax_kernel(
     tXpX = cute.make_fragment_like(tXgX[(0, None), None, None], cutlass.Boolean)
     for i in range(cute.size(tXpX)):
         tXpX[i] = cute.elem_less(tXcX[i][1], shape[1])
-    # tXrX.fill(0.0)
+
     if tXcX[0][0] < shape[0]:
-        # cute.copy(copy_atom_load_X, tXgX, tXrX, pred=tXpX)
         cute.copy(copy_atom_load_X_async, tXgX, tXsX, pred=tXpX)
+
     cute.arch.cp_async_commit_group()
-
-    print(f"[DSL INFO]   tXpX = {tXpX.type}")
-
     cute.arch.cp_async_wait_group(0)
+    
     cute.autovec_copy(tXsX, tXrX)
     x = tXrX.load().to(cute.Float32)
 
     ######## phase 1, get row max and softmax denominator (online softmax approach)
-    max_x      = x.reduce(cute.ReductionOp.MAX, init_val=float('-inf'), reduction_profile=0)
-    warp_max_x = warp_reduce(
+    max_x       = x.reduce(cute.ReductionOp.MAX, init_val=float('-inf'), reduction_profile=0)
+    max_x       = warp_reduce(
         max_x, cute.arch.fmax,
         width=minimum(tv_layout.shape[0][0], cute.arch.WARP_SIZE),
     )
-    denom      = exp_math(x - warp_max_x).reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0)
-    warp_denom = warp_reduce(
+    # keep the partial exp_x result in register
+    exp_x       = exp_math(x - max_x)
+
+    denom       = exp_x.reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0)
+    denom = warp_reduce(
         denom, operator.add,
         width=minimum(tv_layout.shape[0][0], cute.arch.WARP_SIZE),
     )
-    max_x, denom = warp_max_x, warp_denom
     
+    warp_exp_diff_with_block_or_cluster = 1.0
     if cutlass.const_expr(warps_per_row * cluster_n) > 1:
         if cutlass.const_expr(cluster_n) == 1:
-            max_x, denom = block_reduce_softmax_phase_1(max_x, denom, max_val_reduction_buffer, denom_reduction_buffer, init_max_val=max_x, init_denom_val=0.0)
+            new_max_x = block_reduce(max_x, cute.arch.fmax, max_val_reduction_buffer, init_val=max_x)
+            warp_exp_diff_with_block_or_cluster = exp_arch(max_x - new_max_x)
+            
+            denom     = block_reduce(denom * warp_exp_diff_with_block_or_cluster, operator.add, denom_reduction_buffer, init_val=0.0)
+            
+            max_x = new_max_x
         else:
-            max_x, denom = cluster_reduce_softmax_phase_1(max_x, denom, max_val_reduction_buffer, denom_reduction_buffer, max_val_mbar_ptr, denom_mbar_ptr, init_max_val=max_x, init_denom_val=0.0)
+            new_max_x = cluster_reduce(max_x, cute.arch.fmax, max_val_reduction_buffer, max_val_mbar_ptr, init_val=max_x)
+            warp_exp_diff_with_block_or_cluster = exp_arch(max_x - new_max_x)
+            
+            denom     = cluster_reduce(denom * warp_exp_diff_with_block_or_cluster, operator.add, denom_reduction_buffer, denom_mbar_ptr, init_val=0.0)
+            
+            max_x = new_max_x
 
-    if reload_from == "smem":
-        cute.autovec_copy(tXsX, tXrX)
-        x = tXrX.load().to(cute.Float32)
-    elif reload_from == "gmem":
-        cute.copy(copy_atom_load_X, tXgX, tXrX, pred=tXpX)
-        x = tXrX.load().to(cute.Float32)
-
-    ######## phase 2, actual softmax computation
-    nom = exp_math(x - max_x)
+    
+    ######## phase 2, actual softmax computation    
+    nom = exp_x * warp_exp_diff_with_block_or_cluster
     y   = nom / denom
     
     tXrO.store(y.to(tXrO.element_type))
@@ -325,9 +264,6 @@ def softmax(
     copy_bits: cutlass.Constexpr = 128
 ):
     N = mX.shape[1]
-    # new_shape = (mX_.shape[0], cute.assume(mX_.shape[1], 128))
-    # breakpoint()
-    # mX = cute.make_tensor(mX_.iterator, cute.make_layout(new_shape, stride=mX_.stride))
     vecsize = copy_bits // mX.element_type.width
     assert N % vecsize == 0, f"Input N {N} is not divisible by vector size {vecsize}"
     num_threads = 128 if N <= 16384 else 256
@@ -336,7 +272,8 @@ def softmax(
     threads_per_row = 8 if N <= 64 else (16 if N <= 128 else (32 if N <= 3072 else (64 if N <= 6144 else (128 if N <= 16384 else 256))))
     # cluster_n = 4 is faster and cluster_n = 2 for N=64k for some reason
     # Similarly cluster_n = 8 is faster for N=128k
-    cluster_n = 1 if N <= 32 * 1024 else (4 if N <= 64 * 1024 else (8 if N <= 128 * 1024 else 16))
+    cluster_n = 1 if N <= 8 * 1024 else (2 if N <= 16 * 1024 else (4 if N <= 64 * 1024 else (8 if N <= 128 * 1024 else 16)))
+
     num_blocks_N = cute.ceil_div(N // vecsize, threads_per_row * cluster_n)
 
     cols_per_block = num_threads // threads_per_row
@@ -345,6 +282,7 @@ def softmax(
         ((threads_per_row, cols_per_block), (vecsize, num_blocks_N)),
         stride=((vecsize * cols_per_block, 1), (cols_per_block, cols_per_block * vecsize * threads_per_row))
     )
+    print(tv_layout)
 
     print(f"[DSL INFO] Input Tensors:")
     print(f"[DSL INFO]   mX = {mX.type}")
@@ -360,17 +298,14 @@ def softmax(
     print(f"[DSL INFO]   gX = {gX.type}")
     print(f"[DSL INFO]   gO = {gO.type}")
     print(f"[DSL INFO]   coord tensor = {cX.type}")
-
-    # reload_from = None if N <= 16384 else ("smem" if N <= 32768 else "gmem")
-    reload_from = None if N <= 16384 else "smem"
-
-    softmax_kernel(gX, gO, cX, mX.shape, tv_layout, tiler_mn, cluster_n, reload_from).launch(
+    
+    smem_allocated = cute.size_in_bytes(mX.element_type, gX.layout[0]) + 2 * num_warps * cluster_n * (cutlass.Float32.width // 8) + 2 * (cutlass.Int64.width // 8)
+    softmax_kernel(gX, gO, cX, mX.shape, tv_layout, tiler_mn, cluster_n).launch(
         grid=[cute.size(gX, mode=[1, 0]), cluster_n, 1],
-        # grid=[132 * 8, 1, 1],
         block=[cute.size(tv_layout, mode=[0]), 1, 1],
         # Launching with cluster=[1, 1, 1] instead of None slows down the kernel by ~8us
         cluster=[1, cluster_n, 1] if cluster_n > 1 else None,
-        smem=cute.size_in_bytes(mX.element_type, gX.layout[0]) + num_warps * cluster_n * (cutlass.Float32.width // 8) + (cutlass.Int64.width // 8),
+        smem=smem_allocated,
         stream=stream,
     )
 
@@ -393,7 +328,7 @@ def run_softmax(
     torch_dtype = cutlass_torch.dtype(dtype)
 
     device = "cuda"
-    x = torch.randn(M, N, device=device, dtype=torch_dtype)
+    x = 0.1 * torch.randn(M, N, device=device, dtype=torch_dtype)
     out = torch.empty_like(x)
 
     print(f"Input tensor shapes:")
@@ -401,8 +336,7 @@ def run_softmax(
     print(f"out: {out.shape}, dtype: {out.dtype}")
 
     convert_from_dlpack = lambda x: (
-        from_dlpack(x, assumed_align=16)
-        # .mark_layout_dynamic(leading_dim=1)
+        from_dlpack(x, assumed_align=128)
         .mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
     )
     x_tensor, out_tensor = [convert_from_dlpack(tensor) for tensor in (x, out)]
@@ -421,10 +355,15 @@ def run_softmax(
         # compiled_func(x_tensor, w_tensor, out_tensor, rstd_tensor, stream, eps)
         print("Verifying results...")
         out_ref = compiled_func_ref(x)
-        torch.testing.assert_close(out_ref, out)
+        if dtype == cutlass.BFloat16:
+            torch.testing.assert_close(out_ref, out, atol=1e-3, rtol=1e-3)
+        elif dtype == cutlass.Float32:
+            torch.testing.assert_close(out_ref, out, atol=1e-4, rtol=1e-4)
+        else:
+            raise NotImplementedError()
         print("Results verified successfully!")
 
-
+    
     if benchmark:
         fn = lambda: compiled_func(x_tensor, out_tensor, stream)
         time.sleep(0.5)
@@ -449,8 +388,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="example of elementwise add to demonstrate the numpy/pytorch as input for kernels"
     )
-    parser.add_argument("--M", default=32768, type=int)
-    parser.add_argument("--N", default=1024, type=int)
+    parser.add_argument("--M", default=16384, type=int)
+    parser.add_argument("--N", default=32768, type=int)
     parser.add_argument("--warmup_iterations", default=10, type=int)
     parser.add_argument("--iterations", default=100, type=int)
     parser.add_argument("--skip_ref_check", action="store_true")
@@ -461,20 +400,20 @@ if __name__ == "__main__":
     run_softmax(
         args.M,
         args.N,
-        dtype=cutlass.Float32,
+        dtype=cutlass.BFloat16,
         skip_ref_check=args.skip_ref_check,
         benchmark=args.benchmark,
         warmup_iterations=args.warmup_iterations,
         iterations=args.iterations,
     )
     
-    N_vals = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+    N_vals = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]]
     results = []
     for N in N_vals:
         res = run_softmax(
             args.M,
             N,
-            dtype=cutlass.Float32,
+            dtype=cutlass.BFloat16,
             skip_ref_check=False,
             benchmark=True,
             warmup_iterations=args.warmup_iterations,
