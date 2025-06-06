@@ -117,6 +117,7 @@ def cluster_reduce(val: cute.Numeric, op: Callable, reduction_buffer: cute.Tenso
             val, elem_pointer(reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster))),
             mbar_ptr, peer_cta_rank_in_cluster=lane_idx
         )
+    
     cute.arch.mbarrier_wait(mbar_ptr, phase=0)
     block_reduce_val = init_val
     num_iter = cute.ceil_div(warps_per_row * cluster_n, cute.arch.WARP_SIZE)
@@ -124,8 +125,8 @@ def cluster_reduce(val: cute.Numeric, op: Callable, reduction_buffer: cute.Tenso
         idx = lane_idx + i * cute.arch.WARP_SIZE
         if idx < cute.size(reduction_buffer, mode=[1]):
             block_reduce_val = op(block_reduce_val, reduction_buffer[row_idx, idx])
-    return warp_reduce(block_reduce_val, op)
-
+    ret = warp_reduce(block_reduce_val, op)
+    return ret
 
 @cute.kernel
 def softmax_kernel(
@@ -160,7 +161,7 @@ def softmax_kernel(
     num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
     warps_per_row = maximum(tv_layout.shape[0][0] // cute.arch.WARP_SIZE, 1)
     # reduction_buffer_layout = cute.make_ordered_layout((num_warps // warps_per_row, warps_per_row), order=(1, 0))
-    
+
     max_val_reduction_buffer_layout = cute.make_ordered_layout((num_warps // warps_per_row, warps_per_row if cluster_n == 1 else (warps_per_row, cluster_n)), order=(1, 0))
     denom_reduction_buffer_layout   = cute.make_ordered_layout((num_warps // warps_per_row, warps_per_row if cluster_n == 1 else (warps_per_row, cluster_n)), order=(1, 0))
     
@@ -214,37 +215,31 @@ def softmax_kernel(
         max_x, cute.arch.fmax,
         width=minimum(tv_layout.shape[0][0], cute.arch.WARP_SIZE),
     )
-    # keep the partial exp_x result in register
-    exp_x       = exp_math(x - max_x)
 
-    denom       = exp_x.reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0)
+    if cutlass.const_expr(warps_per_row * cluster_n) > 1:
+        if cutlass.const_expr(cluster_n) == 1:
+            max_x = block_reduce(max_x, cute.arch.fmax, max_val_reduction_buffer, init_val=max_x)           
+        else:
+            cute.arch.cluster_wait()
+            max_x = cluster_reduce(max_x, cute.arch.fmax, max_val_reduction_buffer, max_val_mbar_ptr, init_val=max_x)
+
+    nom   = exp_math(x - max_x)
+    denom = nom.reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0)
     denom = warp_reduce(
         denom, operator.add,
         width=minimum(tv_layout.shape[0][0], cute.arch.WARP_SIZE),
     )
     
-    warp_exp_diff_with_block_or_cluster = 1.0
     if cutlass.const_expr(warps_per_row * cluster_n) > 1:
-        if cutlass.const_expr(cluster_n) == 1:
-            new_max_x = block_reduce(max_x, cute.arch.fmax, max_val_reduction_buffer, init_val=max_x)
-            warp_exp_diff_with_block_or_cluster = exp_arch(max_x - new_max_x)
-            
-            denom     = block_reduce(denom * warp_exp_diff_with_block_or_cluster, operator.add, denom_reduction_buffer, init_val=0.0)
-            
-            max_x = new_max_x
-        else:
-            new_max_x = cluster_reduce(max_x, cute.arch.fmax, max_val_reduction_buffer, max_val_mbar_ptr, init_val=max_x)
-            warp_exp_diff_with_block_or_cluster = exp_arch(max_x - new_max_x)
-            
-            denom     = cluster_reduce(denom * warp_exp_diff_with_block_or_cluster, operator.add, denom_reduction_buffer, denom_mbar_ptr, init_val=0.0)
-            
-            max_x = new_max_x
+        if cutlass.const_expr(cluster_n) == 1:            
+            denom     = block_reduce(denom, operator.add, denom_reduction_buffer, init_val=0.0)
+        else:            
+            denom     = cluster_reduce(denom, operator.add, denom_reduction_buffer, denom_mbar_ptr, init_val=0.0)
 
-    
+
     ######## phase 2, actual softmax computation    
-    nom = exp_x * warp_exp_diff_with_block_or_cluster
     y   = nom / denom
-    
+
     tXrO.store(y.to(tXrO.element_type))
     tOcX = thr_copy_O.partition_S(blkCrd)[(0, None), None, None]
     tOpO = cute.make_fragment_like(tXgO[(0, None), None, None], cutlass.Boolean)
@@ -272,7 +267,7 @@ def softmax(
     threads_per_row = 8 if N <= 64 else (16 if N <= 128 else (32 if N <= 3072 else (64 if N <= 6144 else (128 if N <= 16384 else 256))))
     # cluster_n = 4 is faster and cluster_n = 2 for N=64k for some reason
     # Similarly cluster_n = 8 is faster for N=128k
-    cluster_n = 1 if N <= 8 * 1024 else (2 if N <= 16 * 1024 else (4 if N <= 64 * 1024 else (8 if N <= 128 * 1024 else 16)))
+    cluster_n = 1 if N <= 8 * 1024 else (2 if N <= 16 * 1024 else (8 if N <= 64 * 1024 else 16))
 
     num_blocks_N = cute.ceil_div(N // vecsize, threads_per_row * cluster_n)
 
@@ -368,7 +363,7 @@ def run_softmax(
         fn = lambda: compiled_func(x_tensor, out_tensor, stream)
         time.sleep(0.5)
         avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
-        mem_bw = (2 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9
+        mem_bw = round(2 * x.numel() * dtype.width // 8 / (avg_time / 1000) / 1e9)
         print(f"Kernel execution time: {avg_time:.4f} ms")
         print(f"Mem throughput: {mem_bw:.2f} GB/s")
 
@@ -376,7 +371,7 @@ def run_softmax(
         for _ in range(5): fn()  # warm up
         time.sleep(0.5)
         avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
-        mem_bw_ref = (2 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9
+        mem_bw_ref = round(2 * x.numel() * dtype.width // 8 / (avg_time / 1000) / 1e9)
         print(f"Ref kernel execution time: {avg_time:.4f} ms")
         print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
 
@@ -389,7 +384,7 @@ if __name__ == "__main__":
         description="example of elementwise add to demonstrate the numpy/pytorch as input for kernels"
     )
     parser.add_argument("--M", default=16384, type=int)
-    parser.add_argument("--N", default=32768, type=int)
+    parser.add_argument("--N", default=16384, type=int)
     parser.add_argument("--warmup_iterations", default=10, type=int)
     parser.add_argument("--iterations", default=100, type=int)
     parser.add_argument("--skip_ref_check", action="store_true")
@@ -400,20 +395,20 @@ if __name__ == "__main__":
     run_softmax(
         args.M,
         args.N,
-        dtype=cutlass.BFloat16,
+        dtype=cutlass.Float32,
         skip_ref_check=args.skip_ref_check,
         benchmark=args.benchmark,
         warmup_iterations=args.warmup_iterations,
         iterations=args.iterations,
     )
     
-    N_vals = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]]
+    N_vals = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
     results = []
     for N in N_vals:
         res = run_softmax(
             args.M,
             N,
-            dtype=cutlass.BFloat16,
+            dtype=cutlass.Float32,
             skip_ref_check=False,
             benchmark=True,
             warmup_iterations=args.warmup_iterations,
@@ -422,3 +417,9 @@ if __name__ == "__main__":
         results.append(res)
     print(results)
     print("\nPASS")
+    
+    # BF16:
+    # [(1363, 154), (1814, 304), (2257, 603), (2597, 1183), (2796, 1486), (2930, 1691), (2841, 1806), (2643, 1539), (2747, 1217), (2458, 1205)]
+    
+    # FP32:
+    # [(1880, 1120), (2312, 2058), (2643, 2426), (2787, 2550), (2900, 1894), (2968, 1528), (2986, 1480), (3042, 1468), (3020, 1450), (3034, 1495)]
