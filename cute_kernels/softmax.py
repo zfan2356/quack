@@ -268,10 +268,14 @@ def softmax(
     threads_per_row = 8 if N <= 64 else (16 if N <= 128 else (32 if N <= 3072 else (64 if N <= 6144 else (128 if N <= 16384 else 256))))
     # cluster_n = 4 is faster and cluster_n = 2 for N=64k for some reason
     # Similarly cluster_n = 8 is faster for N=128k
-    cluster_n = 1 if N <= 8 * 1024 else (2 if N <= 32 * 1024 else (8 if N <= 128 * 1024 else 16))
+    # cluster_n = 1 if N <= 8 * 1024 else (2 if N <= 32 * 1024 else (8 if N <= 128 * 1024 else 16))
 
+    if cutlass.const_expr(mX.element_type.width == 16):
+        cluster_n = 1 if N <= 16 * 1024 else (2 if N <= 32 * 1024 else (4 if N <= 64 * 1024 else (8 if N <= 128 * 1024 else 16)))
+    else:  # fp32
+        cluster_n = 1 if N <= 32 * 1024 else (2 if N <= 64 * 1024 else (4 if N <= 128 * 1024 else (8 if N <= 256 * 1024 else 16)))
+    
     num_blocks_N = cute.ceil_div(N // vecsize, threads_per_row * cluster_n)
-
     cols_per_block = num_threads // threads_per_row
     tiler_mn = (cols_per_block, vecsize * num_blocks_N * threads_per_row)  # This rounds up N
     tv_layout = cute.make_layout(
@@ -376,15 +380,15 @@ def run_softmax(
         print(f"Ref kernel execution time: {avg_time:.4f} ms")
         print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
 
-        return mem_bw, mem_bw_ref
-
+        # return mem_bw, mem_bw_ref
+        return mem_bw
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="example of elementwise add to demonstrate the numpy/pytorch as input for kernels"
     )
-    parser.add_argument("--M", default=16384, type=int)
+    parser.add_argument("--M", default=8192, type=int)
     parser.add_argument("--N", default=16384, type=int)
     parser.add_argument("--warmup_iterations", default=10, type=int)
     parser.add_argument("--iterations", default=100, type=int)
@@ -403,13 +407,13 @@ if __name__ == "__main__":
         iterations=args.iterations,
     )
     
-    N_vals = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
+    N_vals = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
     results = []
     for N in N_vals:
         res = run_softmax(
             args.M,
             N,
-            dtype=cutlass.Float32,
+            dtype=cutlass.BFloat16,
             skip_ref_check=False,
             benchmark=True,
             warmup_iterations=args.warmup_iterations,
@@ -418,9 +422,3 @@ if __name__ == "__main__":
         results.append(res)
     print(results)
     print("\nPASS")
-    
-    # BF16:
-    # [(1374, 910), (1895, 1214), (2328, 1456), (2647, 1639), (2832, 1442), (2942, 1209), (2997, 1230), (3000, 1232), (3049, 1223), (3036, 1205)]
-    
-    # FP32:
-    # [(1930, 256), (2400, 507), (2724, 1009), (2823, 1992), (2924, 2465), (2985, 2643), (2996, 2277), (3027, 1565), (3012, 1524), (2933, 1494)]
