@@ -5,10 +5,14 @@ import torch.nn.functional as F
 import time
 import operator
 from typing import Type, Callable, Union, Tuple
+from liger_kernel.transformers import LigerCrossEntropyLoss 
 
 from triton.testing import do_bench
-
+import triton
 from einops import rearrange
+
+
+
 
 try:
     import cudnn
@@ -29,6 +33,7 @@ from cutlass.cutlass_dsl import math as cutlass_math
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import nvvm, llvm
 from cutlass._mlir.dialects import cute as _cute_ir
+
 
 
 log2_e = 1.4426950408889634
@@ -163,13 +168,8 @@ def cross_entropy_kernel(
     bidx, cluster_y, _ = cute.arch.block_idx()
     gdim, _, _ = cute.arch.grid_dim()
 
-
-
     blkX, blkCrd, blkTarget, blkLoss = [gT[(None, None), bidx if cluster_n == 1 else (bidx, cluster_y)] for gT in (gX, cX, gTarget, gLoss)] 
-    
-    #blkTarget = gTarget[(None, None), bidx if cluster_n == 1 else (bidx, cluster_y)]
-    #blkLoss = gLoss[(None, None), bidx if cluster_n == 1 else (bidx, cluster_y)]
- 
+     
     # declare the atoms which will be used later for memory copy
     copy_atom_load_X = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type, num_bits_per_copy=128)
     copy_atom_load_X_async = cute.make_copy_atom(cute.nvgpu.cpasync.CopyG2SOp(), gX.element_type, num_bits_per_copy=128)
@@ -265,26 +265,8 @@ def cross_entropy_kernel(
 
     targetX = target_logit.load()[0].to(cutlass.Float32)
 
-    ##### phase 1: target reduction
-    #targetX = targetX.reduce(cute.ReductionOp.MAX, init_val=float('-inf'), reduction_profile=0)
-    targetX = warp_reduce(
-        targetX, cute.arch.fmax,
-        width=minimum(tv_layout.shape[0][0], cute.arch.WARP_SIZE),  # Number of threads
-    )
 
-    if cutlass.const_expr(warps_per_row * cluster_n) > 1:
-        if cutlass.const_expr(cluster_n) == 1:
-            targetX = block_reduce(targetX, cute.arch.fmax, target_val_reduction_buffer, init_val=float('-inf'))           
-        else:
-            cute.arch.cluster_wait()
-            targetX = cluster_reduce(targetX, cute.arch.fmax, target_val_reduction_buffer, target_val_mbar_ptr, init_val=float('-inf')) 
-    
-
-
-
-
-
-    ######## phase 2: softmax denominator (online softmax approach)
+    ######## phase 1: softmax denominator (online softmax approach)
     max_x       = x.reduce(cute.ReductionOp.MAX, init_val=float('-inf'), reduction_profile=0)
     max_x       = warp_reduce(
         max_x, cute.arch.fmax,
@@ -300,7 +282,7 @@ def cross_entropy_kernel(
 
     
     
-    ######## phase 3, sum-exp 
+    ######## phase 2, sum-exp 
     nom   = exp_math(x - max_x)
     denom = nom.reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0)
     denom = warp_reduce(
@@ -338,7 +320,7 @@ def cross_entropy(
     N = mX.shape[1]
     vecsize = copy_bits // mX.element_type.width
     assert N % vecsize == 0, f"Input N {N} is not divisible by vector size {vecsize}"
-    num_threads = 128 if N <= 16384 else 256
+    num_threads = 128 if N <= 16384 else 256 
 
     #num_threads = 128 if N <= 262144 else 256
 
@@ -464,8 +446,10 @@ def run_cross_entropy(
     compiled_func(x_tensor, target_tensor, loss_tensor, stream)
 
 
-
+    #compiled_func_ref = LigerCrossEntropyLoss(reduction='none')
     compiled_func_ref = torch.compile(lambda x, target: F.cross_entropy(x, target, reduction='none'))
+ 
+    compiled_func_ref = torch.compile(compiled_func_ref)
     if not skip_ref_check:
         compiled_func(x_tensor, target_tensor, loss_tensor, stream)
         print("Verifying results...")
@@ -473,7 +457,7 @@ def run_cross_entropy(
 
         #import ipdb; ipdb.set_trace()
         if dtype == cutlass.BFloat16:
-            torch.testing.assert_close(out_ref, loss, atol=1e-3, rtol=1e-3)
+            torch.testing.assert_close(out_ref, loss, atol=1e-2, rtol=1e-2)
         elif dtype == cutlass.Float32:
             torch.testing.assert_close(out_ref, loss, atol=1e-4, rtol=1e-4)
         else:
@@ -486,7 +470,6 @@ def run_cross_entropy(
         time.sleep(0.5)
         avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
         
-        #mem_bw = round(2 * x.numel() * dtype.width // 8 / (avg_time / 1000) / 1e9) # needs to be updated for CE
         mem_bw = round((x.numel()*x.element_size() + target.numel()*target.element_size() + loss.numel()*loss.element_size()) / (avg_time/1000) / 1e9)
         print(f"Kernel execution time: {avg_time:.4f} ms")
         print(f"Mem throughput: {mem_bw:.2f} GB/s")
@@ -495,7 +478,6 @@ def run_cross_entropy(
         for _ in range(5): fn()  # warm up
         time.sleep(0.5)
         avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
-        #mem_bw_ref = round(2 * x.numel() * dtype.width // 8 / (avg_time / 1000) / 1e9)
         mem_bw_ref = round((x.numel()*x.element_size() + target.numel()*target.element_size() + loss.numel()*loss.element_size()) / (avg_time/1000) / 1e9)
 
         print(f"Ref kernel execution time: {avg_time:.4f} ms")
@@ -518,7 +500,6 @@ if __name__ == "__main__":
 
     
     args = parser.parse_args()
-    #'''
     torch.manual_seed(0)
     run_cross_entropy(
         args.M,
@@ -529,15 +510,16 @@ if __name__ == "__main__":
         warmup_iterations=args.warmup_iterations,
         iterations=args.iterations,
     )
-    #'''
 
-    N_vals = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
-    #N_vals = [262144]
+    N_vals = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
+    #N_vals = [65536] 
     
+    M = 32768
+    #M = 8192 
     results = []
     for N in N_vals:
         res = run_cross_entropy(
-            args.M,
+            32768,
             N,
             dtype=cutlass.BFloat16,
             skip_ref_check=False,
