@@ -380,8 +380,7 @@ def run_softmax(
         print(f"Ref kernel execution time: {avg_time:.4f} ms")
         print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
 
-        # return mem_bw, mem_bw_ref
-        return mem_bw
+        return mem_bw, mem_bw_ref
 
 
 if __name__ == "__main__":
@@ -407,13 +406,13 @@ if __name__ == "__main__":
         iterations=args.iterations,
     )
     
-    N_vals = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
+    MN_pairs = [(32768, 256), (32768, 512), (32768, 1024), (32768, 2048), (32768, 4096), (32768, 8192), (32768, 16384), (32768, 32768), (32768, 65536), (16384, 131072), (8192, 262144)]
     results = []
-    for N in N_vals:
+    for M, N in MN_pairs:
         res = run_softmax(
-            args.M,
+            M,
             N,
-            dtype=cutlass.BFloat16,
+            dtype=cutlass.Float32,
             skip_ref_check=False,
             benchmark=True,
             warmup_iterations=args.warmup_iterations,

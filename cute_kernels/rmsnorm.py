@@ -393,9 +393,12 @@ def rmsnorm(
     threads_per_row = 8 if N <= 64 else (16 if N <= 128 else (32 if N <= 3072 else (64 if N <= 6144 else (128 if N <= 16384 else 256))))
     # cluster_n = 4 is faster and cluster_n = 2 for N=64k for some reason
     # Similarly cluster_n = 8 is faster for N=128k
-    cluster_n = 1 if N <= 32 * 1024 else (4 if N <= 64 * 1024 else (8 if N <= 128 * 1024 else 16))
-    num_blocks_N = cute.ceil_div(N // vecsize, threads_per_row * cluster_n)
+    if cutlass.const_expr(mX.element_type.width == 16):
+        cluster_n = 1 if N <= 16 * 1024 else (2 if N <= 32 * 1024 else (4 if N <= 64 * 1024 else (8 if N <= 128 * 1024 else 16)))
+    else:  # fp32
+        cluster_n = 1 if N <= 32 * 1024 else (2 if N <= 64 * 1024 else (4 if N <= 128 * 1024 else (8 if N <= 256 * 1024 else 16)))
 
+    num_blocks_N = cute.ceil_div(N // vecsize, threads_per_row * cluster_n)
     cols_per_block = num_threads // threads_per_row
     tiler_mn = (cols_per_block, vecsize * num_blocks_N * threads_per_row)  # This rounds up N
     tv_layout = cute.make_layout(
@@ -838,33 +841,24 @@ if __name__ == "__main__":
     run_rmsnorm(
         args.M,
         args.N,
-        dtype=cutlass.BFloat16,
+        dtype=cutlass.Float32,
         skip_ref_check=args.skip_ref_check,
         benchmark=args.benchmark,
         warmup_iterations=args.warmup_iterations,
         iterations=args.iterations,
     )
-    # N_vals = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
-    # results = []
-    # for N in N_vals:
-    #     res = run_rmsnorm(
-    #         args.M,
-    #         N,
-    #         dtype=cutlass.BFloat16,
-    #         skip_ref_check=False,
-    #         benchmark=True,
-    #         warmup_iterations=args.warmup_iterations,
-    #         iterations=args.iterations,
-    #     )
-    #     results.append(res)
-    # print(results)
-    # run_rmsnorm_bwd(
-    #     args.M,
-    #     args.N,
-    #     dtype=cutlass.BFloat16,
-    #     skip_ref_check=args.skip_ref_check,
-    #     benchmark=args.benchmark,
-    #     warmup_iterations=args.warmup_iterations,
-    #     iterations=args.iterations,
-    # )
+    MN_pairs = [(32768, 256), (32768, 512), (32768, 1024), (32768, 2048), (32768, 4096), (32768, 8192), (32768, 16384), (32768, 32768), (32768, 65536), (16384, 131072), (8192, 262144)]
+    results = []
+    for M, N in MN_pairs:
+        res = run_rmsnorm(
+            M,
+            N,
+            dtype=cutlass.Float32,
+            skip_ref_check=False,
+            benchmark=True,
+            warmup_iterations=args.warmup_iterations,
+            iterations=args.iterations,
+        )
+        results.append(res)
+    print(results)
     print("\nPASS")

@@ -266,7 +266,7 @@ def cross_entropy_kernel(
     targetX = target_logit.load()[0].to(cutlass.Float32)
 
 
-    ######## phase 1: softmax denominator (online softmax approach)
+    ######## phase 1: max reduction
     max_x       = x.reduce(cute.ReductionOp.MAX, init_val=float('-inf'), reduction_profile=0)
     max_x       = warp_reduce(
         max_x, cute.arch.fmax,
@@ -280,7 +280,6 @@ def cross_entropy_kernel(
             cute.arch.cluster_wait()
             max_x = cluster_reduce(max_x, cute.arch.fmax, max_val_reduction_buffer, max_val_mbar_ptr, init_val=max_x)
 
-    
     
     ######## phase 2, sum-exp 
     nom   = exp_math(x - max_x)
@@ -297,8 +296,6 @@ def cross_entropy_kernel(
             denom     = cluster_reduce(denom, operator.add, denom_reduction_buffer, denom_mbar_ptr, init_val=0.0)
 
     
-
-
     loss_val = -targetX + max_x + log_arch(denom)
     
     if tXcX[0][1] == 0 and tXcX[0][0] < shape[0]:
@@ -322,23 +319,14 @@ def cross_entropy(
     assert N % vecsize == 0, f"Input N {N} is not divisible by vector size {vecsize}"
     num_threads = 128 if N <= 16384 else 256 
 
-    #num_threads = 128 if N <= 262144 else 256
-
-
     num_warps = num_threads // cute.arch.WARP_SIZE
     assert num_threads % cute.arch.WARP_SIZE == 0
     threads_per_row = 8 if N <= 64 else (16 if N <= 128 else (32 if N <= 3072 else (64 if N <= 6144 else (128 if N <= 16384 else 256))))
     
-    #threads_per_row = 8 if N <= 64 else (16 if N <= 128 else (32 if N <= 3072 else (64 if N <= 6144 else (128 if N <= 262144 else 256))))
-    
-    # cluster_n = 4 is faster and cluster_n = 2 for N=64k for some reason
-    # Similarly cluster_n = 8 is faster for N=128k
-    # cluster_n = 1 if N <= 8 * 1024 else (2 if N <= 32 * 1024 else (8 if N <= 128 * 1024 else 16))
-
     if cutlass.const_expr(mX.element_type.width == 16):
         cluster_n = 1 if N <= 16 * 1024 else (2 if N <= 32 * 1024 else (4 if N <= 64 * 1024 else (8 if N <= 128 * 1024 else 16)))
     else:  # fp32
-        cluster_n = 1 if N <= 32 * 1024 else (2 if N <= 64 * 1024 else (4 if N <= 128 * 1024 else (8 if N <= 256 * 1024 else 16)))
+        cluster_n = 1 if N <= 16 * 1024 else (2 if N <= 64 * 1024 else (4 if N <= 128 * 1024 else 8))
     
     num_blocks_N = cute.ceil_div(N // vecsize, threads_per_row * cluster_n)
     cols_per_block = num_threads // threads_per_row
@@ -347,28 +335,12 @@ def cross_entropy(
         ((threads_per_row, cols_per_block), (vecsize, num_blocks_N)),
         stride=((vecsize * cols_per_block, 1), (cols_per_block, cols_per_block * vecsize * threads_per_row))
     )
-    
-    
-    
-    print(tv_layout)
-
-    #print(f"[DSL INFO] Input Tensors:")
-    #print(f"[DSL INFO]   mX = {mX.type}")
-    #print(f"[DSL INFO]   mTarget = {mTarget.type}")
-    #print(f"[DSL INFO]   mLoss = {mLoss.type}")
-
-    #print(f"[DSL INFO] Tiling Parameters:")
-    #print(f"[DSL INFO]   tiler_mn = {tiler_mn} per thread block")
-    #print(f"[DSL INFO]   tv_layout = {tv_layout}")
 
     idX = cute.make_identity_tensor(mX.shape)
 
 
     mLoss_expanded_layout = cute.append(mLoss.layout, cute.make_layout((N,), stride=(0,)))
     mLoss_expanded = cute.make_tensor(mLoss.iterator, mLoss_expanded_layout)
-
-
-
 
     mTarget_expanded_layout = cute.append(mTarget.layout, cute.make_layout((N,), stride=(0,)))
     mTarget_expanded = cute.make_tensor(mTarget.iterator, mTarget_expanded_layout)
@@ -379,12 +351,6 @@ def cross_entropy(
     gTarget = cute.zipped_divide(mTarget_expanded, tiler_mn)  # one-element tuple
     gLoss = cute.zipped_divide(mLoss_expanded, tiler_mn)
 
-    #print(f"[DSL INFO] Tiled Tensors:")
-    #print(f"[DSL INFO]   gX = {gX.type}")
-    #print(f"[DSL INFO]   gTarget = {gTarget.type}")
-    #print(f"[DSL INFO]   gLoss = {gLoss.type}")
-    #print(f"[DSL INFO]   coord tensor = {cX.type}")
-    
     smem_allocated = cute.size_in_bytes(mX.element_type, gX.layout[0]) + 3 * num_warps * cluster_n * (cutlass.Float32.width // 8) + 2 * (cutlass.Int64.width // 8)
     
     
@@ -445,17 +411,13 @@ def run_cross_entropy(
 
     compiled_func(x_tensor, target_tensor, loss_tensor, stream)
 
-
-    #compiled_func_ref = LigerCrossEntropyLoss(reduction='none')
     compiled_func_ref = torch.compile(lambda x, target: F.cross_entropy(x, target, reduction='none'))
  
-    compiled_func_ref = torch.compile(compiled_func_ref)
     if not skip_ref_check:
         compiled_func(x_tensor, target_tensor, loss_tensor, stream)
         print("Verifying results...")
         out_ref = compiled_func_ref(x, target)
 
-        #import ipdb; ipdb.set_trace()
         if dtype == cutlass.BFloat16:
             torch.testing.assert_close(out_ref, loss, atol=1e-2, rtol=1e-2)
         elif dtype == cutlass.Float32:
@@ -470,7 +432,7 @@ def run_cross_entropy(
         time.sleep(0.5)
         avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
         
-        mem_bw = round((x.numel()*x.element_size() + target.numel()*target.element_size() + loss.numel()*loss.element_size()) / (avg_time/1000) / 1e9)
+        mem_bw = round((x.numel()*x.element_size() + target.numel()*target.element_size() + loss.numel()*loss.element_size()) / (avg_time/1000) / 1e9, 1)
         print(f"Kernel execution time: {avg_time:.4f} ms")
         print(f"Mem throughput: {mem_bw:.2f} GB/s")
 
@@ -478,13 +440,12 @@ def run_cross_entropy(
         for _ in range(5): fn()  # warm up
         time.sleep(0.5)
         avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
-        mem_bw_ref = round((x.numel()*x.element_size() + target.numel()*target.element_size() + loss.numel()*loss.element_size()) / (avg_time/1000) / 1e9)
+        mem_bw_ref = round((x.numel()*x.element_size() + target.numel()*target.element_size() + loss.numel()*loss.element_size()) / (avg_time/1000) / 1e9, 1)
 
         print(f"Ref kernel execution time: {avg_time:.4f} ms")
         print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
 
-        # return mem_bw, mem_bw_ref
-        return mem_bw
+        return mem_bw, mem_bw_ref
 
 
 if __name__ == "__main__":
@@ -511,17 +472,13 @@ if __name__ == "__main__":
         iterations=args.iterations,
     )
 
-    N_vals = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
-    #N_vals = [65536] 
-    
-    M = 32768
-    #M = 8192 
+    MN_pairs = [(32768, 256), (32768, 512), (32768, 1024), (32768, 2048), (32768, 4096), (32768, 8192), (32768, 16384), (32768, 32768), (32768, 65536), (16384, 131072), (8192, 262144)]
     results = []
-    for N in N_vals:
+    for M, N in MN_pairs:
         res = run_cross_entropy(
-            32768,
+            M,
             N,
-            dtype=cutlass.BFloat16,
+            dtype=cutlass.Float32,
             skip_ref_check=False,
             benchmark=True,
             warmup_iterations=args.warmup_iterations,
