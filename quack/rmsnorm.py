@@ -1,132 +1,17 @@
+# Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
+
 import math
-import torch
 import operator
-from typing import Callable
 
-from einops import rearrange
-
-try:
-    import cudnn
-except ImportError:
-    cudnn = None
+import torch
 
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
-import cutlass.torch as cutlass_torch
 
-from cutlass.cutlass_dsl import T, dsl_user_op
-from cutlass._mlir import ir
-from cutlass._mlir.dialects import nvvm, llvm
-from cutlass._mlir.dialects import cute as _cute_ir
-
-
-def warp_reduce(val: cute.Numeric, op: Callable, width: cutlass.Constexpr = cute.arch.WARP_SIZE) -> cute.Numeric:
-    for i in range(int(math.log2(width))):
-        val = op(val, cute.arch.shuffle_sync_bfly(val, offset=1 << i))
-    return val
-
-
-@cute.jit
-def block_reduce(val: cute.Numeric, op: Callable, reduction_buffer: cute.Tensor, init_val: cute.Numeric = 0.0) -> cute.Numeric:
-    lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
-    warps_per_row = reduction_buffer.shape[1]
-    row_idx, col_idx = warp_idx // warps_per_row, warp_idx % warps_per_row
-    if lane_idx == 0:
-        reduction_buffer[row_idx, col_idx] = val
-    cute.arch.barrier()
-    block_reduce_val = init_val
-    if lane_idx < warps_per_row:
-        block_reduce_val = reduction_buffer[row_idx, lane_idx]
-    return warp_reduce(block_reduce_val, op)
-
-
-@dsl_user_op
-def set_block_rank(smem_ptr: cute.Pointer, peer_cta_rank_in_cluster: cute.Int32, *, loc=None, ip=None) -> cutlass.Int32:
-    """Map the given smem pointer to the address at another CTA rank in the cluster.
-    """
-    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
-    return cutlass.Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [smem_ptr_i32, peer_cta_rank_in_cluster.ir_value()],
-            "mapa.shared::cluster.u32 $0, $1, $2;",
-            "=r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def store_shared_remote(
-    val: float | cute.Float32, smem_ptr: cute.Pointer, mbar_ptr: cute.Pointer,
-    peer_cta_rank_in_cluster: cute.typing.Int, *, loc=None, ip=None
-) -> None:
-    remote_smem_ptr_i32 = set_block_rank(smem_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value()
-    remote_mbar_ptr_i32 = set_block_rank(mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value()
-    llvm.inline_asm(
-        None,
-        [remote_smem_ptr_i32, cute.Float32(val).ir_value(loc=loc, ip=ip), remote_mbar_ptr_i32],
-        "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [$0], $1, [$2];",
-        "r,f,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
-@dsl_user_op
-def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
-    return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
-
-
-@cute.jit
-def cluster_reduce(val: cute.Numeric, op: Callable, reduction_buffer: cute.Tensor, mbar_ptr: cute.Pointer, init_val: cute.Numeric = 0.0) -> cute.Numeric:
-    cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
-    lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
-    warps_per_row, cluster_n = reduction_buffer.shape[1]
-    row_idx, col_idx = warp_idx // warps_per_row, warp_idx % warps_per_row
-    if lane_idx < cluster_n:
-        store_shared_remote(
-            val, elem_pointer(reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster))),
-            mbar_ptr, peer_cta_rank_in_cluster=lane_idx
-        )
-    cute.arch.mbarrier_wait(mbar_ptr, phase=0)
-    block_reduce_val = init_val
-    num_iter = cute.ceil_div(warps_per_row * cluster_n, cute.arch.WARP_SIZE)
-    for i in cutlass.range_constexpr(num_iter):
-        idx = lane_idx + i * cute.arch.WARP_SIZE
-        if idx < cute.size(reduction_buffer, mode=[1]):
-            block_reduce_val = op(block_reduce_val, reduction_buffer[row_idx, idx])
-    return warp_reduce(block_reduce_val, op)
-
-
-@cute.jit
-def min_constexpr(a: cutlass.Constexpr, b: cutlass.Constexpr) -> cutlass.Constexpr:
-    return a if a < b else b
-
-@cute.jit
-def max_constexpr(a: cutlass.Constexpr, b: cutlass.Constexpr) -> cutlass.Constexpr:
-    return a if a > b else b
-
-
-@dsl_user_op
-def rsqrt(a: float | cute.Float32, *, loc=None, ip=None) -> cute.Float32:
-    return cute.Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [cute.Float32(a).ir_value(loc=loc, ip=ip)],
-            "rsqrt.approx.ftz.f32 $0, $1;",
-            "=f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
+import quack.utils as utils
 
 
 @cute.kernel
@@ -153,14 +38,6 @@ def rmsnorm_kernel(
     blkX, blkOut, blkRstd, blkCrd = [gT[(None, None), bidx if cluster_n == 1 else (bidx, cluster_y)] for gT in (gX, gO, gRstd, cX)]
     blkW = gW[(None, None), 0 if cluster_n == 1 else (0, cluster_y)]
 
-
-    print(f"[DSL INFO] Sliced Tensors per thread block:")
-    print(f"[DSL INFO]   blkX = {blkX.type}")
-    print(f"[DSL INFO]   blkW = {blkW.type}")
-    print(f"[DSL INFO]   blkOut = {blkOut.type}")
-    print(f"[DSL INFO]   blkRstd = {blkRstd.type}")
-    print(f"[DSL INFO]   blkCrd = {blkCrd.type}")
-
     # declare the atoms which will be used later for memory copy
     copy_atom_load_X = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type, num_bits_per_copy=128)
     copy_atom_load_X_async = cute.make_copy_atom(cute.nvgpu.cpasync.CopyG2SOp(), gX.element_type, num_bits_per_copy=128)
@@ -176,11 +53,10 @@ def rmsnorm_kernel(
     # Don't use blkX.layout here, because the stride is N, not N_rounded
     sX = smem.allocate_tensor(gX.element_type, cute.make_ordered_layout(blkX.shape, order=(1, 0)), byte_alignment=16)
     num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
-    warps_per_row = max_constexpr(tv_layout.shape[0][0] // cute.arch.WARP_SIZE, 1)
+    warps_per_row = utils.max_constexpr(tv_layout.shape[0][0] // cute.arch.WARP_SIZE, 1)
     # reduction_buffer_layout = cute.make_ordered_layout((num_warps // warps_per_row, warps_per_row), order=(1, 0))
     reduction_buffer_layout = cute.make_ordered_layout((num_warps // warps_per_row, warps_per_row if cluster_n == 1 else (warps_per_row, cluster_n)), order=(1, 0))
     reduction_buffer = smem.allocate_tensor(cutlass.Float32, reduction_buffer_layout, byte_alignment=4)
-    print(f"[DSL INFO] reduction_buffer = {reduction_buffer.type}")
     mbar_ptr = cute.Pointer()
     if cluster_n > 1:
         mbar_ptr = smem.allocate(cutlass.Int64.width // 8, byte_alignment=8)
@@ -196,25 +72,6 @@ def rmsnorm_kernel(
     tWrW = cute.make_fragment_like(tWgW)
     tXrW = thr_copy_X.retile(tWrW)
     tXrX, tXrO = [cute.make_fragment_like(thr) for thr in (tXgX, tXgO)]
-
-    print(f"[DSL INFO] Sliced Tensors per thread:")
-    print(f"[DSL INFO]   tXgX = {tXgX.type}")
-    print(f"[DSL INFO]   tXsX = {tXsX.type}")
-    print(f"[DSL INFO]   tWgW = {tWgW.type}")
-    print(f"[DSL INFO]   tWrW = {tWrW.type}")
-    print(f"[DSL INFO]   tXgO = {tXgO.type}")
-    print(f"[DSL INFO]   tXrRstd = {tXrRstd.type}")
-    # print(f"[DSL INFO]   tXrRstd filter = {cute.filter_zeros(tXrRstd).type}")
-    print(f"[DSL INFO]   tXcX = {tXcX.type}")
-    # print(f"[DSL INFO]   thr_copy_X = {thr_copy_X.type}")
-
-    # # Print per thread predicate mask
-    # if tidx == 0 and bidx == 0:
-    #     cute.printf("block_dim = {}", cute.arch.grid_dim())
-    #     cute.printf("shape = {}", shape)
-    #     cute.print_tensor(tXgX)
-    #     cute.print_tensor(tWgW)
-    #     cute.print_tensor(tXpX)
 
     if cluster_n > 1:
         if tidx == 0:
@@ -241,43 +98,22 @@ def rmsnorm_kernel(
     if not delay_w_load:
         cute.copy(copy_atom_load_W, tWgW, tWrW, pred=tWpW)
 
-    print(f"[DSL INFO]   tXpX = {tXpX.type}")
-    print(f"[DSL INFO]   tWpP = {tWpW.type}")
-
     cute.arch.cp_async_wait_group(0)
     cute.autovec_copy(tXsX, tXrX)
     x = tXrX.load().to(cute.Float32)
-    # if tidx == 1 and bidx == 0:
-    #     cute.print_tensor(tXpX)
-    #     for i in range(cute.size(tXcX)):
-    #         cute.printf("tXcX[{}] = {}, {}", i, tXcX[i][0], tXcX[i][1])
-    #     cute.printf(shape)
-    #     for i in range(cute.size(tXrX)):
-    #         xi = x[i].to(cute.Float32)
-    #         cute.printf("x[{}] = {}", i, xi)
-
-    # thr_sum_sq_A = cutlass.Float32.zero
-    # for i in range(cute.size(tXrX)):
-    #     xi = x[i].to(cute.Float32)
-    #     thr_sum_sq_A = thr_sum_sq_A + xi * xi
-    #     # thr_sum_sq_A = thr_sum_sq_A + (x[i] * x[i] if pred[i] else 0.0)
-    # warp_sum_sq_x = warp_reduce(thr_sum_sq_A, operator.add)
     sum_sq_x = (x * x).reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0)
-    sum_sq_x = warp_reduce(
+    sum_sq_x = utils.warp_reduce(
         sum_sq_x,
         operator.add,
-        width=min_constexpr(tv_layout.shape[0][0], cute.arch.WARP_SIZE),
+        width=utils.min_constexpr(tv_layout.shape[0][0], cute.arch.WARP_SIZE),
     )
     if cutlass.const_expr(warps_per_row * cluster_n) > 1:
         if cutlass.const_expr(cluster_n) == 1:
-            sum_sq_x = block_reduce(sum_sq_x, operator.add, reduction_buffer, init_val=0.0)
+            sum_sq_x = utils.block_reduce(sum_sq_x, operator.add, reduction_buffer, init_val=0.0)
         else:
             cute.arch.cluster_wait()
-            sum_sq_x = cluster_reduce(sum_sq_x, operator.add, reduction_buffer, mbar_ptr, init_val=0.0)
-            # if tidx == 0:
-            #     cute.printf("sum_sq_x = {}", sum_sq_x)
-    # rstd = cute.Float32(1.0) / cutlass._mlir.dialects.math.sqrt(var + eps)
-    rstd = rsqrt(sum_sq_x / shape[1] + eps)
+            sum_sq_x = utils.cluster_reduce(sum_sq_x, operator.add, reduction_buffer, mbar_ptr, init_val=0.0)
+    rstd = utils.rsqrt(sum_sq_x / shape[1] + eps)
     # Only the thread corresponding to column 0 writes out the rstd to gmem
     if tXcX[0][1] == 0 and tXcX[0][0] < shape[0]:
         if cutlass.const_expr(cluster_n == 1):
@@ -304,69 +140,9 @@ def rmsnorm_kernel(
     if tXcX[0][0] < shape[0]:
         cute.copy(copy_atom_store_O, tXrO, tXgO, pred=tOpO)
 
-    # # Wait for all thread blocks in the Cluster
-    # if cluster_n > 1:
-    #     # cute.arch.cluster_arrive()
-    #     cute.arch.cluster_wait()
-
-    # row_idx = tXcX[0][0]
-    # jump = gdim
-    # for row_offset in cutlass.range_dynamic(bidx, cute.size(gX, mode=[1]), jump):
-    #     cute.arch.cp_async_wait_group(0)
-    #     cute.autovec_copy(tXsX, tXrX)
-    #     x = tXrX.load().to(cute.Float32)
-
-    #     # thr_sum_sq_A = cutlass.Float32.zero
-    #     # for i in range(cute.size(tXrX)):
-    #     #     xi = x[i].to(cute.Float32)
-    #     #     thr_sum_sq_A = thr_sum_sq_A + xi * xi
-    #     #     # thr_sum_sq_A = thr_sum_sq_A + (x[i] * x[i] if pred[i] else 0.0)
-    #     # warp_sum_sq_x = warp_reduce(thr_sum_sq_A, operator.add)
-    #     warp_sum_sq_x = warp_reduce(
-    #         (x * x).reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0),
-    #         operator.add,
-    #         width=min_constexpr(tv_layout.shape[0][0], cute.arch.WARP_SIZE),
-    #     )
-    #     sum_sq_x = warp_sum_sq_x
-    #     if cutlass.const_expr(warps_per_row) > 1:
-    #         cute.arch.barrier()
-    #         sum_sq_x = block_reduce(sum_sq_x, operator.add, reduction_buffer, init_val=0.0)
-    #     var = sum_sq_x / shape[1]
-    #     # rstd = cute.Float32(1.0) / cutlass._mlir.dialects.math.sqrt(var + eps)
-    #     rstd = rsqrt(var + eps)
-    #     tXgO, tXrRstd = [thr_copy_O.partition_D(gT[(None, None), row_offset]) for gT in (gO, gRstd)]
-    #     # Only the thread corresponding to column 0 writes out the rstd to gmem
-    #     if cute.get(tXcX[0], mode=[1]) == 0 and row_idx < shape[0]:
-    #         tXrRstd[0] = rstd
-    #     cute.autovec_copy(tXsX, tXrX)
-    #     x = tXrX.load().to(cute.Float32)
-    #     tXgX = thr_copy_X_async.partition_S(gX[(None, None), row_offset + jump])
-    #     if row_idx + jump < shape[0]:
-    #         cute.copy(copy_atom_load_X_async, tXgX, tXsX, pred=tXpX)
-    #     cute.arch.cp_async_commit_group()
-    #     x_hat = x * rstd
-    #     w = tXrW.load().to(cute.Float32)
-    #     y = x_hat * w
-    #     tXrO.store(y.to(tXrO.element_type))
-    #     tOcX = thr_copy_O.partition_S(blkCrd)
-    #     tOpO = cute.make_fragment_like(tXgO[(0, None), None, None], cutlass.Boolean)
-    #     for i in range(cute.size(tOpO)):
-    #         tOpO[i] = cute.elem_less(tOcX[i][1], shape[1])
-    #     if row_idx < shape[0]:
-    #         cute.copy(copy_atom_store_O, tXrO, tXgO, pred=tOpO)
-    #     row_idx += jump
-    #     # cute.copy(copy_atom_store_O, tXrO, tXgO)
-
-    #     # if tidx == 0 and bidx == 0:
-    #     #     # cute.printf("tXrX[0] = {}", tXrX[0])
-    #     #     # cute.printf(f"sum_A type = {type(warp_sum_sq_x)}")
-    #     #     cute.printf("sum_A = {}", warp_sum_sq_x)
-    #     #     cute.printf("var_A = {}", var)
-    #     #     cute.printf("rstd_A = {}", rstd)
-
 
 @cute.jit
-def rmsnorm(
+def rmsnorm_call(
     # mX_: cute.Tensor,
     mX: cute.Tensor,
     mW: cute.Tensor,
@@ -402,40 +178,25 @@ def rmsnorm(
         stride=((vecsize * cols_per_block, 1), (cols_per_block, cols_per_block * vecsize * threads_per_row))
     )
 
-    print(f"[DSL INFO] Input Tensors:")
-    print(f"[DSL INFO]   mX = {mX.type}")
-    print(f"[DSL INFO]   mW = {mW.type}")
-    print(f"[DSL INFO]   mOut = {mOut.type}")
-    print(f"[DSL INFO]   mRstd = {mRstd.type}")
-
-    print(f"[DSL INFO] Tiling Parameters:")
-    print(f"[DSL INFO]   tiler_mn = {tiler_mn} per thread block")
-    print(f"[DSL INFO]   tv_layout = {tv_layout}")
-
     mW_expanded_layout = cute.prepend(mW.layout, cute.make_layout((tiler_mn[0],), stride=(0,)))
     mW_expanded = cute.make_tensor(mW.iterator, mW_expanded_layout)
     mRstd_expanded_layout = cute.append(mRstd.layout, cute.make_layout((N,), stride=(0,)))
     mRstd_expanded = cute.make_tensor(mRstd.iterator, mRstd_expanded_layout)
     idX = cute.make_identity_tensor(mX.shape)
     gX, gW, gO, gRstd, cX = [cute.zipped_divide(mT, tiler_mn) for mT in (mX, mW_expanded, mOut, mRstd_expanded, idX)]  # ((TileM,TileN),(RestM,RestN))
-    print(f"[DSL INFO] Tiled Tensors:")
-    print(f"[DSL INFO]   gX = {gX.type}")
-    print(f"[DSL INFO]   gW = {gW.type}")
-    print(f"[DSL INFO]   gO = {gO.type}")
-    print(f"[DSL INFO]   gRstd = {gRstd.type}")
-    print(f"[DSL INFO]   coord tensor = {cX.type}")
 
     # reload_from = None if N <= 16384 else ("smem" if N <= 32768 else "gmem")
     reload_from = None if N <= 16384 else "smem"
     # delay_w_load = N > 64 * 1024
     delay_w_load = False
+    N_rounded = tiler_mn[1]
     rmsnorm_kernel(gX, gW, gO, gRstd, cX, eps, mX.shape, tv_layout, tiler_mn, cluster_n, reload_from).launch(
         grid=[cute.size(gX, mode=[1, 0]), cluster_n, 1],
-        # grid=[132 * 8, 1, 1],
         block=[cute.size(tv_layout, mode=[0]), 1, 1],
         # Launching with cluster=[1, 1, 1] instead of None slows down the kernel by ~8us
         cluster=[1, cluster_n, 1] if cluster_n > 1 else None,
-        smem=cute.size_in_bytes(mX.element_type, gX.layout[0]) + num_warps * cluster_n * (cutlass.Float32.width // 8) + (cutlass.Int64.width // 8),
+        # We don't want to use gX.layout[0] here since that has stride in N, not N_rounded, leading IMA on smem
+        smem=cute.size_in_bytes(mX.element_type, cute.make_layout(gX.shape[0])) + num_warps * cluster_n * (cutlass.Float32.width // 8) + (cutlass.Int64.width // 8),
         stream=stream,
     )
 
@@ -450,217 +211,77 @@ def rstd_ref(x, eps=1e-6):
     return 1.0 / torch.sqrt(torch.mean(x_f32 * x_f32, dim=-1) + eps)
 
 
-def rmsnorm_cudnn_setup(M, N, dtype):
-    x_gpu = torch.empty(M, N, dtype=dtype, device="cuda")
-    scale_gpu = torch.empty(1, N, dtype=dtype, device="cuda")
-    epsilon_cpu = torch.ones((1, 1), dtype=torch.float32, device="cpu")
-    out_gpu = torch.empty_like(x_gpu)
-    inv_var_gpu = torch.empty(M, 1, dtype=torch.float32, device="cuda")
-    handle = cudnn.create_handle()
-    graph = cudnn.pygraph(
-        handle=handle,
-        intermediate_data_type=cudnn.data_type.FLOAT,
-        compute_data_type=cudnn.data_type.FLOAT,
+torch2cute_dtype_map = {
+    torch.float16: cutlass.Float16,
+    torch.bfloat16: cutlass.BFloat16,
+    torch.float32: cutlass.Float32,
+}
+
+
+def rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    return_rstd: bool = False,
+) -> torch.Tensor:
+    """RMSNorm forward pass.
+
+    Args:
+        x: Input tensor of shape (M, N)
+        weight: Weight tensor of shape (N,)
+        eps: Small value for numerical stability
+        return_rstd: Whether to return the reciprocal standard deviation
+
+    Returns:
+        Normalized output tensor of same shape as x
+        If return_rstd is True, also returns rstd tensor of shape (M,)
+    """
+    assert x.dim() == 2, "Input must be 2D"
+    assert weight.dim() == 1, "Weight must be 1D"
+    assert x.shape[-1] == weight.shape[0], "Last dimension of input must match weight dimension"
+    assert x.is_cuda and weight.is_cuda, "Tensors must be on CUDA device"
+    assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
+    assert weight.dtype == torch.float32, "Weight must be float32"
+
+    M, N = x.shape
+    device = x.device
+
+    # Create output tensors
+    out = torch.empty_like(x)
+    rstd = torch.empty(M, device=device, dtype=torch.float32)
+
+    # Convert to cute tensors
+    dtype = torch2cute_dtype_map[x.dtype]
+    convert_from_dlpack = lambda x: (
+        from_dlpack(x.detach(), assumed_align=16)
+        .mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
     )
-    # create tensor handles with the graph API
-    x = graph.tensor_like(x_gpu.detach()).set_name("X")
-    scale = graph.tensor_like(scale_gpu.detach()).set_name("scale")
-    epsilon = graph.tensor_like(epsilon_cpu).set_name("epsilon")
-    (out, inv_var) = graph.rmsnorm(
-        name="rmsnorm",
-        input=x,
-        norm_forward_phase=cudnn.norm_forward_phase.TRAINING,
-        scale=scale,
-        epsilon=epsilon,
-    )
-    # enable all outputs
-    out.set_name("output").set_output(True).set_data_type(out_gpu.dtype)
-    inv_var.set_name("inv_var").set_output(True).set_data_type(inv_var_gpu.dtype)
-    graph.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-    # Mapping of (handles -> memory)
-    variant_pack = {
-        x: x_gpu.detach(),
-        scale: scale_gpu.detach(),
-        epsilon: epsilon_cpu,
-        out: out_gpu,
-        inv_var: inv_var_gpu,
-    }
-    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
+    x_tensor, out_tensor = [
+        # utils.convert_from_dlpack(t, leading_dim=t.ndim - 1, divisibility=128 // dtype.width)
+        convert_from_dlpack(t)
+        for t in (x, out)
+    ]
+    weight_tensor = utils.convert_from_dlpack(weight.detach(), leading_dim=0, divisibility=128 // cutlass.Float32.width)
+    rstd_tensor = from_dlpack(rstd.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
 
-    def run(*args, **kwargs):
-        graph.execute(variant_pack, workspace)
-        return out_gpu, inv_var_gpu
+    torch_stream = torch.cuda.current_stream()
+    stream = cuda.CUstream(torch_stream.cuda_stream)
 
-    return run
+    # Create compile key for caching
+    compile_key = (dtype, M, N)
+    if compile_key not in rmsnorm.compile_cache:
+        rmsnorm.compile_cache[compile_key] = cute.compile(
+            rmsnorm_call, x_tensor, weight_tensor, out_tensor, rstd_tensor, stream, N
+        )
 
-
-def rmsnorm_bwd_ref(x, w, dout, rstd, eps=1e-6):
-    x_f32 = x.float()
-    x_hat = x_f32 * rstd.unsqueeze(1)
-    wdy = dout * w
-    c1 = (x_hat * wdy).mean(dim=-1, keepdim=True)
-    dx = (wdy - x_hat * c1) * rstd.unsqueeze(1)
-    return dx.to(x.dtype)
-
-
-
-
-@cute.kernel
-def rmsnorm_bwd_kernel(
-    gX: cute.Tensor,
-    gW: cute.Tensor,
-    gDout: cute.Tensor,
-    gRstd: cute.Tensor,
-    gDx: cute.Tensor,
-    cX: cute.Tensor,  # coordinate tensor
-    eps: cute.Float32,
-    shape: cute.Shape,
-    tv_layout: cute.Layout,
-    tiler_mn: cute.Shape,
-):
-    tidx, _, _ = cute.arch.thread_idx()
-    bidx, _, _ = cute.arch.block_idx()
-
-    # slice for CTAs
-    # logical id -> address
-    blkX, blkDout, blkRstd, blkDx, blkCrd = [gT[(None, None), bidx] for gT in (gX, gDout, gRstd, gDx, cX)]
-    blkW = gW[(None, None), 0]
-
-    # print(f"[DSL INFO] Sliced Tensors per thread block:")
-    # print(f"[DSL INFO]   blkX = {blkX.type}")
-    # print(f"[DSL INFO]   blkW = {blkW.type}")
-    # print(f"[DSL INFO]   blkDout = {blkDout.type}")
-    # print(f"[DSL INFO]   blkRstd = {blkRstd.type}")
-    # print(f"[DSL INFO]   blkDx = {blkDx.type}")
-    # print(f"[DSL INFO]   blkCrd = {blkCrd.type}")
-
-    # declare the atoms which will be used later for memory copy
-    copy_atom_load_X = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type)
-    copy_atom_load_W = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gW.element_type)
-    copy_atom_load_Dout = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gDout.element_type)
-    copy_atom_store_Dx = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gDx.element_type)
-
-    thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
-    thr_copy_W = cute.make_tiled_copy(copy_atom_load_W, tv_layout, tiler_mn).get_slice(tidx)
-    thr_copy_Dout = cute.make_tiled_copy(copy_atom_load_Dout, tv_layout, tiler_mn).get_slice(tidx)
-    thr_copy_Dx = cute.make_tiled_copy(copy_atom_store_Dx, tv_layout, tiler_mn).get_slice(tidx)
-
-    tWgW = thr_copy_W.partition_S(blkW)
-    tXgX = thr_copy_X.partition_S(blkX)
-    thrDout, tXrRstd = [thr_copy_Dout.partition_S(blk) for blk in (blkDout, blkRstd)]
-    thrDx = thr_copy_Dx.partition_D(blkDx)
-    tXcX = thr_copy_W.partition_S(blkCrd)
-
-    smem = cutlass.utils.SmemAllocator()
-    num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
-    warps_per_row = max_constexpr(tv_layout.shape[0][0] // cute.arch.WARP_SIZE, 1)
-    reduction_buffer_layout = cute.make_ordered_layout((num_warps // warps_per_row, warps_per_row), order=(1, 0))
-    reduction_buffer = smem.allocate_tensor(cutlass.Float32, reduction_buffer_layout, byte_alignment=4)
-    # print(f"[DSL INFO] reduction_buffer = {reduction_buffer.type}")
-
-
-    # allocate fragments for gmem->rmem
-    tXrW = cute.make_fragment_like(tWgW)
-    tXrX, frgDout, frgDx = [cute.make_fragment_like(thr) for thr in (tXgX, thrDout, thrDx)]
-    tXpX = cute.make_fragment(tXrW.shape, cutlass.Boolean)
-
-    print(f"[DSL INFO] Sliced Tensors per thread:")
-    print(f"[DSL INFO]   tXgX = {tXgX.type}")
-    print(f"[DSL INFO]   tWgW = {tWgW.type}")
-    print(f"[DSL INFO]   thrDout = {thrDout.type}")
-    print(f"[DSL INFO]   tXrRstd = {tXrRstd.type}")
-    print(f"[DSL INFO]   tXcX = {tXcX.type}")
-
-    # Print per thread predicate mask
-    # if tidx == 0 and bidx == 0:
-    #     cute.printf("block_dim = {}", cute.arch.grid_dim())
-    #     cute.printf("shape = {}", shape)
-    #     cute.print_tensor(tXgX)
-    #     cute.print_tensor(tWgW)
-    #     cute.print_tensor(tXpX)
-
-    for i in range(cute.size(tXpX)):
-        tXpX[i] = cute.elem_less(tXcX[i], shape)
-    cute.copy(copy_atom_load_W, tWgW, tXrW, pred=tXpX)
-    tXrX.fill(0.0)
-    cute.copy(copy_atom_load_X, tXgX, tXrX, pred=tXpX)
-    frgDout.fill(0.0)
-    cute.copy(copy_atom_load_Dout, thrDout, frgDout, pred=tXpX)
-
-    x = tXrX.load().to(cute.Float32)
-    w = tXrW.load().to(cute.Float32)
-    dout = frgDout.load().to(cute.Float32)
-    rstd = tXrRstd[0]
-    x_hat = x * rstd
-    wdy = dout * w
-    warp_sum_xhat_wdy = warp_reduce(
-        (x_hat * wdy).reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0),
-        operator.add,
-        width=min_constexpr(tv_layout.shape[0][0], cute.arch.WARP_SIZE),
-    )
-    sum_xhat_wdy = warp_sum_xhat_wdy
-    if cutlass.const_expr(warps_per_row) > 1:
-        sum_xhat_wdy = block_reduce(sum_xhat_wdy, operator.add, reduction_buffer, init_val=0.0)
-    mean_xhat_wdy = sum_xhat_wdy / shape[1]
-    dx = (wdy - x_hat * mean_xhat_wdy) * rstd
-    frgDx.store(dx.to(frgDout.element_type))
-    cute.copy(copy_atom_store_Dx, frgDx, thrDx, pred=tXpX)
-
-
-@cute.jit
-def rmsnorm_bwd(
-    mX: cute.Tensor,
-    mW: cute.Tensor,
-    mDout: cute.Tensor,
-    mRstd: cute.Tensor,
-    mDx: cute.Tensor,
-    eps: cutlass.Float32 = 1e-6,
-    copy_bits: cutlass.Constexpr = 128
-):
-    N = mX.shape[1]
-    vecsize = copy_bits // mX.element_type.width
-    assert N % vecsize == 0, f"Input N {N} is not divisible by vector size {vecsize}"
-    num_threads = 128 if N <= 16384 else 256
-    assert num_threads % cute.arch.WARP_SIZE == 0
-    threads_per_row = 8 if N <= 64 else (16 if N <= 128 else (32 if N <= 3072 else (64 if N <= 6144 else (128 if N <= 16384 else 256))))
-    num_blocks_N = cute.ceil_div(N // vecsize, threads_per_row)
-
-    cols_per_block = num_threads // threads_per_row
-    tiler_mn = (cols_per_block, N)
-    tv_layout = cute.make_layout(
-        ((threads_per_row, cols_per_block), (vecsize, num_blocks_N)),
-        stride=((vecsize * cols_per_block, 1), (cols_per_block, cols_per_block * vecsize * threads_per_row))
+    # Execute kernel
+    rmsnorm.compile_cache[compile_key](
+        x_tensor, weight_tensor, out_tensor, rstd_tensor, stream, eps
     )
 
-    print(f"[DSL INFO] Input Tensors:")
-    print(f"[DSL INFO]   mX = {mX.type}")
-    print(f"[DSL INFO]   mW = {mW.type}")
-    print(f"[DSL INFO]   mDout = {mDout.type}")
-    print(f"[DSL INFO]   mRstd = {mRstd.type}")
-    print(f"[DSL INFO]   mDx = {mDx.type}")
-
-    print(f"[DSL INFO] Tiling Parameters:")
-    print(f"[DSL INFO]   tiler_mn = {tiler_mn} per thread block")
-    print(f"[DSL INFO]   tv_layout = {tv_layout}")
-
-    mW_expanded_layout = cute.prepend(mW.layout, cute.make_layout((tiler_mn[0],), stride=(0,)))
-    mW_expanded = cute.make_tensor(mW.iterator, mW_expanded_layout)
-    mRstd_expanded_layout = cute.append(mRstd.layout, cute.make_layout((N,), stride=(0,)))
-    mRstd_expanded = cute.make_tensor(mRstd.iterator, mRstd_expanded_layout)
-    idX = cute.make_identity_tensor(mX.shape)
-    gX, gW, gDout, gRstd, gDx, cX = [cute.zipped_divide(mT, tiler_mn) for mT in (mX, mW_expanded, mDout, mRstd_expanded, mDx, idX)]  # ((TileM,TileN),(RestM,RestN))
-    print(f"[DSL INFO] Tiled Tensors:")
-    print(f"[DSL INFO]   gX = {gX.type}")
-    print(f"[DSL INFO]   gW = {gW.type}")
-    print(f"[DSL INFO]   gDout = {gDout.type}")
-    print(f"[DSL INFO]   gRstd = {gRstd.type}")
-    print(f"[DSL INFO]   gDx = {gDx.type}")
-    print(f"[DSL INFO]   coord tensor = {cX.type}")
-
-    rmsnorm_bwd_kernel(gX, gW, gDout, gRstd, gDx, cX, eps, mX.shape, tv_layout, tiler_mn).launch(
-        grid=[cute.size(gX, mode=[1]), 1, 1],
-        block=[cute.size(tv_layout, mode=[0]), 1, 1],
-        smem=32 * 4  # TODO
-    )
+    if return_rstd:
+        return out, rstd
+    return out
 
 
+rmsnorm.compile_cache = {}
