@@ -42,10 +42,10 @@ def run_rmsnorm(
     print(f"w: {w.shape}, dtype: {w.dtype}")
 
     eps = 1e-6
-    
+
     print("Executing kernel...")
     out, rstd = rmsnorm(x, w, eps=eps, return_rstd=True)
-    
+
     compiled_func_ref = torch.compile(rmsnorm_ref)
     if not skip_ref_check:
         print("Verifying results...")

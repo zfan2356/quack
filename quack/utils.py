@@ -132,6 +132,16 @@ def cluster_reduce(val: cute.Numeric, op: Callable, reduction_buffer: cute.Tenso
     return warp_reduce(block_reduce_val, op)
 
 
+@cute.jit
+def block_or_cluster_reduce(val: cute.Numeric, op: Callable, reduction_buffer: cute.Tensor, mbar_ptr: Optional[cute.Pointer], init_val: cute.Numeric = 0.0) -> cute.Numeric:
+    """Perform either block or cluster reduction based on whether mbar_ptr is provided.
+    """
+    if cutlass.const_expr(mbar_ptr is None):
+        return block_reduce(val, op, reduction_buffer, init_val=init_val)
+    else:
+        return cluster_reduce(val, op, reduction_buffer, mbar_ptr, init_val=init_val)
+
+
 def exp2f(x: cute.TensorSSA | cutlass.Float32) -> cute.TensorSSA | cutlass.Float32:
     """exp2f calculation for both vector and scalar.
 

@@ -57,12 +57,12 @@ def rmsnorm_kernel(
     # reduction_buffer_layout = cute.make_ordered_layout((num_warps // warps_per_row, warps_per_row), order=(1, 0))
     reduction_buffer_layout = cute.make_ordered_layout((num_warps // warps_per_row, warps_per_row if cluster_n == 1 else (warps_per_row, cluster_n)), order=(1, 0))
     reduction_buffer = smem.allocate_tensor(cutlass.Float32, reduction_buffer_layout, byte_alignment=4)
-    mbar_ptr = cute.Pointer()
-    if cluster_n > 1:
+    if cutlass.const_expr(cluster_n > 1):
         mbar_ptr = smem.allocate(cutlass.Int64.width // 8, byte_alignment=8)
+    else:
+        mbar_ptr = None
 
     tWgW = thr_copy_W.partition_S(blkW)
-    # tXgX = thr_copy_X.partition_S(blkX)
     tXgX = thr_copy_X_async.partition_S(blkX)
     tXsX = thr_copy_X_async.partition_S(sX)
     tXgO, tXrRstd = [thr_copy_O.partition_D(blk) for blk in (blkOut, blkRstd)]
@@ -101,18 +101,17 @@ def rmsnorm_kernel(
     cute.arch.cp_async_wait_group(0)
     cute.autovec_copy(tXsX, tXrX)
     x = tXrX.load().to(cute.Float32)
-    sum_sq_x = (x * x).reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0)
     sum_sq_x = utils.warp_reduce(
-        sum_sq_x,
+        (x * x).reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0),
         operator.add,
         width=utils.min_constexpr(tv_layout.shape[0][0], cute.arch.WARP_SIZE),
     )
-    if cutlass.const_expr(warps_per_row * cluster_n) > 1:
-        if cutlass.const_expr(cluster_n) == 1:
-            sum_sq_x = utils.block_reduce(sum_sq_x, operator.add, reduction_buffer, init_val=0.0)
-        else:
-            cute.arch.cluster_wait()
-            sum_sq_x = utils.cluster_reduce(sum_sq_x, operator.add, reduction_buffer, mbar_ptr, init_val=0.0)
+    if cutlass.const_expr(cluster_n > 1):
+        cute.arch.cluster_wait()
+    if cutlass.const_expr(warps_per_row > 1 or cluster_n > 1):
+        sum_sq_x = utils.block_or_cluster_reduce(
+            sum_sq_x, operator.add, reduction_buffer, mbar_ptr, init_val=0.0
+        )
     rstd = utils.rsqrt(sum_sq_x / shape[1] + eps)
     # Only the thread corresponding to column 0 writes out the rstd to gmem
     if tXcX[0][1] == 0 and tXcX[0][0] < shape[0]:
@@ -142,7 +141,7 @@ def rmsnorm_kernel(
 
 
 @cute.jit
-def rmsnorm_call(
+def rmsnorm_interface(
     # mX_: cute.Tensor,
     mX: cute.Tensor,
     mW: cute.Tensor,
@@ -153,7 +152,6 @@ def rmsnorm_call(
     eps: cutlass.Float32 = 1e-6,
     copy_bits: cutlass.Constexpr = 128
 ):
-    N = mX.shape[1]
     # new_shape = (mX_.shape[0], cute.assume(mX_.shape[1], 128))
     # breakpoint()
     # mX = cute.make_tensor(mX_.iterator, cute.make_layout(new_shape, stride=mX_.stride))
@@ -201,16 +199,6 @@ def rmsnorm_call(
     )
 
 
-def rmsnorm_ref(x, w, eps=1e-6):
-    x_f32 = x.float()
-    return (x_f32 / (torch.sqrt(torch.mean(x_f32 * x_f32, dim=-1, keepdim=True) + eps)) * w).to(x.dtype)
-
-
-def rstd_ref(x, eps=1e-6):
-    x_f32 = x.float()
-    return 1.0 / torch.sqrt(torch.mean(x_f32 * x_f32, dim=-1) + eps)
-
-
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
@@ -242,15 +230,10 @@ def rmsnorm(
     assert x.is_cuda and weight.is_cuda, "Tensors must be on CUDA device"
     assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
     assert weight.dtype == torch.float32, "Weight must be float32"
-
     M, N = x.shape
     device = x.device
-
-    # Create output tensors
     out = torch.empty_like(x)
     rstd = torch.empty(M, device=device, dtype=torch.float32)
-
-    # Convert to cute tensors
     dtype = torch2cute_dtype_map[x.dtype]
     convert_from_dlpack = lambda x: (
         from_dlpack(x.detach(), assumed_align=16)
@@ -263,25 +246,26 @@ def rmsnorm(
     ]
     weight_tensor = utils.convert_from_dlpack(weight.detach(), leading_dim=0, divisibility=128 // cutlass.Float32.width)
     rstd_tensor = from_dlpack(rstd.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
-
-    torch_stream = torch.cuda.current_stream()
-    stream = cuda.CUstream(torch_stream.cuda_stream)
-
-    # Create compile key for caching
-    compile_key = (dtype, M, N)
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    compile_key = (dtype, N)
     if compile_key not in rmsnorm.compile_cache:
         rmsnorm.compile_cache[compile_key] = cute.compile(
-            rmsnorm_call, x_tensor, weight_tensor, out_tensor, rstd_tensor, stream, N
+            rmsnorm_interface, x_tensor, weight_tensor, out_tensor, rstd_tensor, current_stream, N
         )
-
-    # Execute kernel
     rmsnorm.compile_cache[compile_key](
-        x_tensor, weight_tensor, out_tensor, rstd_tensor, stream, eps
+        x_tensor, weight_tensor, out_tensor, rstd_tensor, current_stream, eps
     )
-
-    if return_rstd:
-        return out, rstd
-    return out
+    return (out, rstd) if return_rstd else out
 
 
 rmsnorm.compile_cache = {}
+
+
+def rmsnorm_ref(x, w, eps=1e-6):
+    x_f32 = x.float()
+    return (x_f32 / (torch.sqrt(torch.mean(x_f32 * x_f32, dim=-1, keepdim=True) + eps)) * w).to(x.dtype)
+
+
+def rstd_ref(x, eps=1e-6):
+    x_f32 = x.float()
+    return 1.0 / torch.sqrt(torch.mean(x_f32 * x_f32, dim=-1) + eps)

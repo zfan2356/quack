@@ -20,7 +20,6 @@ from quack.rmsnorm import rmsnorm, rmsnorm_ref, rstd_ref
 def test_rmsnorm_forward(M, N, input_dtype, eps):
     """Test RMSNorm forward pass against reference implementation."""
     device = "cuda"
-
     # Set tolerance based on dtype
     if input_dtype == torch.bfloat16:
         atol = 5e-2
@@ -28,19 +27,11 @@ def test_rmsnorm_forward(M, N, input_dtype, eps):
         atol = 1e-2
     else:
         atol = 1e-4
-
-    # Set seed for reproducibility
     torch.random.manual_seed(0)
-
-    # Create input tensors
     x = torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=True)
     weight = torch.randn(N, device=device, dtype=torch.float32, requires_grad=True)
-
-    # Clone for reference
     x_ref = x.detach().clone().requires_grad_()
     weight_ref = weight.detach().clone().requires_grad_()
-
-    # Forward pass
     out, rstd = rmsnorm(x, weight, eps=eps, return_rstd=True)
     out_ref = rmsnorm_ref(x_ref, weight_ref, eps=eps)
     rstd_ref_val = rstd_ref(x_ref, eps=eps)
