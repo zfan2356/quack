@@ -99,7 +99,7 @@ def softmax_kernel(
             max_x, cute.arch.fmax, reduction_buffer[None, None, 0], max_mbar_ptr, init_val=-cutlass.Float32.inf
         )
     log2_e = math.log2(math.e)
-    exp_x = cute.math.exp2((x - max_x) * log2_e)
+    exp_x = cute.math.exp2((x - max_x) * log2_e, fastmath=True)
     denom = utils.warp_reduce(
         exp_x.reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0),
         operator.add,
@@ -180,7 +180,6 @@ def softmax(x: torch.Tensor) -> torch.Tensor:
     assert x.dim() == 2, "Input must be 2D"
     assert x.is_cuda, "Tensor must be on CUDA device"
     assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
-
     M, N = x.shape
     device = x.device
     out = torch.empty_like(x)

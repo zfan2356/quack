@@ -1,175 +1,35 @@
 import math
-import argparse
 import torch
-import torch.nn.functional as F
-import time
 import operator
-from typing import Type, Callable, Union, Tuple
-from liger_kernel.transformers import LigerCrossEntropyLoss 
-
-from triton.testing import do_bench
-import triton
-from einops import rearrange
-
-
-
-
-try:
-    import cudnn
-except ImportError:
-    cudnn = None
+from typing import Callable, Union
 
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
-import cutlass.torch as cutlass_torch
 
-from cutlass.cutlass_dsl import T, dsl_user_op, const, for_generate, yield_out, if_generate
-from cutlass.cutlass_dsl import math as cutlass_math
+import quack.utils as utils
 
-
-from cutlass._mlir import ir
-from cutlass._mlir.dialects import nvvm, llvm
-from cutlass._mlir.dialects import cute as _cute_ir
-
-
-
-log2_e = 1.4426950408889634
-
-def exp_arch(val):
-    return cute.arch.exp2(val * log2_e)
-
-def exp_math(val):
-    return cute.math.exp2(val * log2_e)
-
-
-@dsl_user_op
-def log_arch(a: Union[float, cutlass.Float32], *, loc=None, ip=None) -> cutlass.Float32:
-    lg2_a = cutlass.Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [cutlass.Float32(a).ir_value(loc=loc, ip=ip)],
-            "lg2.approx.ftz.f32 $0, $1;",
-            "=f,f",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    ) 
-    return lg2_a / log2_e
-
-@cute.jit
-def minimum(a: cutlass.Constexpr, b: cutlass.Constexpr) -> cutlass.Constexpr:
-    return a if a < b else b
-
-@cute.jit
-def maximum(a: cutlass.Constexpr, b: cutlass.Constexpr) -> cutlass.Constexpr:
-    return a if a > b else b
-
-@cute.jit
-def warp_reduce(val: cute.Numeric, op: Callable, width: cutlass.Constexpr = cute.arch.WARP_SIZE) -> cute.Numeric:
-    for i in range(int(math.log2(width))):
-        val = op(val, cute.arch.shuffle_sync_bfly(val, offset=1 << i))
-    return val
-
-
-@cute.jit
-def block_reduce(val: cute.Numeric, op: Callable, reduction_buffer: cute.Tensor, init_val: cute.Numeric = 0.0) -> cute.Numeric:
-    lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
-    warps_per_row = reduction_buffer.shape[1]
-    row_idx, col_idx = warp_idx // warps_per_row, warp_idx % warps_per_row
-    if lane_idx == 0:
-        reduction_buffer[row_idx, col_idx] = val
-    cute.arch.barrier()
-    block_reduce_val = init_val
-    if lane_idx < warps_per_row:
-        block_reduce_val = reduction_buffer[row_idx, lane_idx]
-    return warp_reduce(block_reduce_val, op)
-
-
-@dsl_user_op
-def set_block_rank(smem_ptr: cute.Pointer, peer_cta_rank_in_cluster: cute.Int32, *, loc=None, ip=None) -> cutlass.Int32:
-    """Map the given smem pointer to the address at another CTA rank in the cluster.
-    """
-    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
-    return cutlass.Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [smem_ptr_i32, peer_cta_rank_in_cluster.ir_value()],
-            "mapa.shared::cluster.u32 $0, $1, $2;",
-            "=r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def store_shared_remote(
-    val: float | cute.Float32, smem_ptr: cute.Pointer, mbar_ptr: cute.Pointer,
-    peer_cta_rank_in_cluster: cute.typing.Int, *, loc=None, ip=None
-) -> None:
-    remote_smem_ptr_i32 = set_block_rank(smem_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value()
-    remote_mbar_ptr_i32 = set_block_rank(mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value()
-    llvm.inline_asm(
-        None,
-        [remote_smem_ptr_i32, cute.Float32(val).ir_value(loc=loc, ip=ip), remote_mbar_ptr_i32],
-        "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [$0], $1, [$2];",
-        "r,f,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
-@dsl_user_op
-def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
-    return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
-
-
-@cute.jit
-def cluster_reduce(val: cute.Numeric, op: Callable, reduction_buffer: cute.Tensor, mbar_ptr: cute.Pointer, init_val: cute.Numeric = 0.0) -> cute.Numeric:
-    cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
-    lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
-    warps_per_row, cluster_n = reduction_buffer.shape[1]
-    row_idx, col_idx = warp_idx // warps_per_row, warp_idx % warps_per_row
-    if lane_idx < cluster_n:
-        store_shared_remote(
-            val, elem_pointer(reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster))),
-            mbar_ptr, peer_cta_rank_in_cluster=lane_idx
-        )
-    
-    cute.arch.mbarrier_wait(mbar_ptr, phase=0)
-    block_reduce_val = init_val
-    num_iter = cute.ceil_div(warps_per_row * cluster_n, cute.arch.WARP_SIZE)
-    for i in cutlass.range_constexpr(num_iter):
-        idx = lane_idx + i * cute.arch.WARP_SIZE
-        if idx < cute.size(reduction_buffer, mode=[1]):
-            block_reduce_val = op(block_reduce_val, reduction_buffer[row_idx, idx])
-    ret = warp_reduce(block_reduce_val, op)
-    return ret
 
 @cute.kernel
 def cross_entropy_kernel(
-    gX: cute.Tensor,
-    gTarget: cute.Tensor, # (M,)
-    gLoss: cute.Tensor, # (M,)
-    cX: cute.Tensor,  # coordinate tensor
-    shape: cute.Shape,
+    mX: cute.Tensor,  # (M, N)
+    mTarget: cute.Tensor, # (M,)
+    mLoss: cute.Tensor, # (M,)
     tv_layout: cute.Layout,
     tiler_mn: cute.Shape,
-    gX_full: cute.Tensor,
     cluster_n: cutlass.Constexpr = 1,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, cluster_y, _ = cute.arch.block_idx()
     gdim, _, _ = cute.arch.grid_dim()
 
-    blkX, blkCrd, blkTarget, blkLoss = [gT[(None, None), bidx if cluster_n == 1 else (bidx, cluster_y)] for gT in (gX, cX, gTarget, gLoss)] 
-     
+    shape: cute.Shape = mX.shape
+    idX = cute.make_identity_tensor(mX.shape)
+    gX, cX = [cute.zipped_divide(mT, tiler_mn) for mT in (mX, idX)]
+    blkX, blkCrd = [gT[(None, None), bidx if cluster_n == 1 else (bidx, cluster_y)] for gT in (gX, cX)]
+
     # declare the atoms which will be used later for memory copy
     copy_atom_load_X = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type, num_bits_per_copy=128)
     copy_atom_load_X_async = cute.make_copy_atom(cute.nvgpu.cpasync.CopyG2SOp(), gX.element_type, num_bits_per_copy=128)
@@ -178,135 +38,100 @@ def cross_entropy_kernel(
     thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
     thr_copy_X_async = cute.make_tiled_copy(copy_atom_load_X_async, tv_layout, tiler_mn).get_slice(tidx)
 
-
     smem = cutlass.utils.SmemAllocator()
-    
+
     # Don't use blkX.layout here, because the stride is N, not N_rounded
     sX = smem.allocate_tensor(gX.element_type, cute.make_ordered_layout(blkX.shape, order=(1, 0)), byte_alignment=16)
     num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
-    warps_per_row = maximum(tv_layout.shape[0][0] // cute.arch.WARP_SIZE, 1)
+    warps_per_row = utils.max_constexpr(tv_layout.shape[0][0] // cute.arch.WARP_SIZE, 1)
 
+    reduction_buffer_layout = cute.make_ordered_layout(
+        # 2 stages: 1 for max, 1 for sum
+        (num_warps // warps_per_row, warps_per_row if cluster_n == 1 else (warps_per_row, cluster_n), 2),
+        order=(1, 0, 2)
+    )
+    reduction_buffer = smem.allocate_tensor(cutlass.Float32, reduction_buffer_layout, byte_alignment=4)
+    if cutlass.const_expr(cluster_n > 1):
+        # 1 mbar for max reduction, 1 mbar for sum reduction
+        mbar_ptr = smem.allocate_array(cutlass.Int64, num_elems=2)
+    else:
+        mbar_ptr = None
 
-    target_val_reduction_buffer_layout = cute.make_ordered_layout((num_warps // warps_per_row, warps_per_row if cluster_n == 1 else (warps_per_row, cluster_n)), order=(1, 0))
-    max_val_reduction_buffer_layout = cute.make_ordered_layout((num_warps // warps_per_row, warps_per_row if cluster_n == 1 else (warps_per_row, cluster_n)), order=(1, 0))
-    denom_reduction_buffer_layout   = cute.make_ordered_layout((num_warps // warps_per_row, warps_per_row if cluster_n == 1 else (warps_per_row, cluster_n)), order=(1, 0)) 
-    
-    target_val_reduction_buffer = smem.allocate_tensor(cutlass.Float32, target_val_reduction_buffer_layout, byte_alignment=4)
-    max_val_reduction_buffer = smem.allocate_tensor(cutlass.Float32, max_val_reduction_buffer_layout, byte_alignment=4)
-    denom_reduction_buffer   = smem.allocate_tensor(cutlass.Float32, denom_reduction_buffer_layout, byte_alignment=4)
-
-
-    target_val_mbar_ptr = cute.Pointer()
-    max_val_mbar_ptr = cute.Pointer()
-    denom_mbar_ptr = cute.Pointer()
-    
-    if cluster_n > 1:
-        target_val_mbar_ptr = smem.allocate(cutlass.Int64.width // 8, byte_alignment=8)
-        max_val_mbar_ptr = smem.allocate(cutlass.Int64.width // 8, byte_alignment=8)
-        denom_mbar_ptr   = smem.allocate(cutlass.Int64.width // 8, byte_alignment=8)
-
-
-
-
-    #### Thread View 
+    #### Thread View
     tXgX = thr_copy_X_async.partition_S(blkX)
     tXsX = thr_copy_X_async.partition_S(sX)
-    
-    tXcX = thr_copy_X.partition_S(blkCrd)[(0, None), None, None]
-    tXrLoss = thr_copy_X.partition_D(blkLoss)
-    tXrTarget = thr_copy_X.partition_D(blkTarget)
 
+    tXcX = thr_copy_X.partition_S(blkCrd)[(0, None), None, None]
 
     # allocate fragments for gmem->rmem
     tXrX = cute.make_fragment_like(tXgX)  # only logits fragment needed
 
-
     if cluster_n > 1:
-        if tidx == 0:
-            cute.arch.mbarrier_init_arrive_cnt(target_val_mbar_ptr, 1)
-            cute.arch.mbarrier_init_arrive_cnt(max_val_mbar_ptr, 1)
-            cute.arch.mbarrier_init_arrive_cnt(denom_mbar_ptr, 1)
+        if tidx < 2:
+            cute.arch.mbarrier_init_arrive_cnt(mbar_ptr + tidx, 1)
         cute.arch.mbarrier_init_fence()
-        if tidx == 0:
-            cute.arch.mbarrier_init_tx_bytes(target_val_mbar_ptr, num_warps * cluster_n * cutlass.Float32.width // 8)
-            cute.arch.mbarrier_init_tx_bytes(max_val_mbar_ptr, num_warps * cluster_n * cutlass.Float32.width // 8)
-            cute.arch.mbarrier_init_tx_bytes(denom_mbar_ptr, num_warps * cluster_n * cutlass.Float32.width // 8)
+        if tidx < 2:
+            cute.arch.mbarrier_init_tx_bytes(mbar_ptr + tidx, num_warps * cluster_n * cutlass.Float32.width // 8)
         # Cluster arrive after barrier init
         cute.arch.cluster_arrive_relaxed()
 
-
-
-
     row = tXcX[0][0]
-    col = tXrTarget[0].to(cute.Int32)
-
-    ptr = elem_pointer(gX_full, (row, col))
-
-    src_scalar = cute.make_tensor(ptr, cute.make_layout((1,), stride=(1,)))
-    target_logit = cute.make_fragment_like(src_scalar, gX.element_type)
-
-    cute.copy(copy_atom_scalar, src_scalar, target_logit)
-    
-     
+    target = cute.Int32.zero
+    if row < shape[0] and tXcX[0][1] == 0:
+        target = cute.Int32(mTarget[row])
 
     tXpX = cute.make_fragment_like(tXgX[(0, None), None, None], cutlass.Boolean)
     for i in range(cute.size(tXpX)):
         tXpX[i] = cute.elem_less(tXcX[i][1], shape[1])
-
-
-    if tXcX[0][0] < shape[0]:
+    if row < shape[0]:
         cute.copy(copy_atom_load_X_async, tXgX, tXsX, pred=tXpX)
-
     cute.arch.cp_async_commit_group()
     cute.arch.cp_async_wait_group(0)
-    
     cute.autovec_copy(tXsX, tXrX)
     x = tXrX.load().to(cute.Float32)
 
-    targetX = target_logit.load()[0].to(cutlass.Float32)
+    target_logit = cute.Float32.zero
+    if row < shape[0] and tXcX[0][1] == 0:
+        target_logit = cute.Float32(mX[row, target])
 
-
-    ######## phase 1: max reduction
-    max_x       = x.reduce(cute.ReductionOp.MAX, init_val=float('-inf'), reduction_profile=0)
-    max_x       = warp_reduce(
-        max_x, cute.arch.fmax,
-        width=minimum(tv_layout.shape[0][0], cute.arch.WARP_SIZE),
+    max_x = utils.warp_reduce(
+        x.reduce(cute.ReductionOp.MAX, init_val=float('-inf'), reduction_profile=0),
+        cute.arch.fmax,
+        width=utils.min_constexpr(tv_layout.shape[0][0], cute.arch.WARP_SIZE),
     )
+    if cutlass.const_expr(cluster_n > 1):
+        cute.arch.cluster_wait()
+    if cutlass.const_expr(warps_per_row > 1 or cluster_n > 1):
+        max_mbar_ptr = mbar_ptr + 0 if cluster_n > 1 else None
+        max_x = utils.block_or_cluster_reduce(
+            max_x, cute.arch.fmax, reduction_buffer[None, None, 0], max_mbar_ptr, init_val=-cutlass.Float32.inf
+        )
+    log2_e = math.log2(math.e)
+    # exp_x = cute.math.exp2((x - max_x) * log2_e, fastmath=True)
+    exp_x = utils.exp2f((x - max_x) * log2_e)  # a bit faster, idk why
+    denom = utils.warp_reduce(
+        exp_x.reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0),
+        operator.add,
+        width=utils.min_constexpr(tv_layout.shape[0][0], cute.arch.WARP_SIZE),
+    )
+    if cutlass.const_expr(warps_per_row > 1 or cluster_n > 1):
+        sum_mbar_ptr = mbar_ptr + 1 if cluster_n > 1 else None
+        denom = utils.block_or_cluster_reduce(
+            denom, operator.add, reduction_buffer[None, None, 1], sum_mbar_ptr, init_val=0.0
+        )
 
-    if cutlass.const_expr(warps_per_row * cluster_n) > 1:
-        if cutlass.const_expr(cluster_n) == 1:
-            max_x = block_reduce(max_x, cute.arch.fmax, max_val_reduction_buffer, init_val=max_x)           
+    if tXcX[0][1] == 0 and row < shape[0]:
+        ln_2 = math.log(2.0)
+        loss_val = -target_logit + max_x + utils.log2f(denom) * ln_2
+        if cutlass.const_expr(cluster_n == 1):
+            mLoss[row] = loss_val.to(mLoss.element_type)
         else:
-            cute.arch.cluster_wait()
-            max_x = cluster_reduce(max_x, cute.arch.fmax, max_val_reduction_buffer, max_val_mbar_ptr, init_val=max_x)
-
-    
-    ######## phase 2, sum-exp 
-    nom   = exp_math(x - max_x)
-    denom = nom.reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0)
-    denom = warp_reduce(
-        denom, operator.add,
-        width=minimum(tv_layout.shape[0][0], cute.arch.WARP_SIZE),
-    )
-    
-    if cutlass.const_expr(warps_per_row * cluster_n) > 1:
-        if cutlass.const_expr(cluster_n) == 1:            
-            denom     = block_reduce(denom, operator.add, denom_reduction_buffer, init_val=0.0)
-        else:            
-            denom     = cluster_reduce(denom, operator.add, denom_reduction_buffer, denom_mbar_ptr, init_val=0.0)
-
-    
-    loss_val = -targetX + max_x + log_arch(denom)
-    
-    if tXcX[0][1] == 0 and tXcX[0][0] < shape[0]:
-        tXrLoss[0] = loss_val.to(gLoss.element_type)
-    
-
-
+            if cute.arch.block_idx_in_cluster() == 0:
+                mLoss[row] = loss_val.to(mLoss.element_type)
 
 
 @cute.jit
-def cross_entropy(
+def cross_entropy_interface(
     mX: cute.Tensor,
     mTarget: cute.Tensor,
     mLoss: cute.Tensor,
@@ -314,20 +139,19 @@ def cross_entropy(
     N: cutlass.Constexpr,
     copy_bits: cutlass.Constexpr = 128
 ):
-    N = mX.shape[1]
     vecsize = copy_bits // mX.element_type.width
     assert N % vecsize == 0, f"Input N {N} is not divisible by vector size {vecsize}"
-    num_threads = 128 if N <= 16384 else 256 
+    num_threads = 128 if N <= 16384 else 256
 
     num_warps = num_threads // cute.arch.WARP_SIZE
     assert num_threads % cute.arch.WARP_SIZE == 0
     threads_per_row = 8 if N <= 64 else (16 if N <= 128 else (32 if N <= 3072 else (64 if N <= 6144 else (128 if N <= 16384 else 256))))
-    
+
     if cutlass.const_expr(mX.element_type.width == 16):
         cluster_n = 1 if N <= 16 * 1024 else (2 if N <= 32 * 1024 else (4 if N <= 64 * 1024 else (8 if N <= 128 * 1024 else 16)))
     else:  # fp32
         cluster_n = 1 if N <= 16 * 1024 else (2 if N <= 64 * 1024 else (4 if N <= 128 * 1024 else 8))
-    
+
     num_blocks_N = cute.ceil_div(N // vecsize, threads_per_row * cluster_n)
     cols_per_block = num_threads // threads_per_row
     tiler_mn = (cols_per_block, vecsize * num_blocks_N * threads_per_row)  # This rounds up N
@@ -336,26 +160,9 @@ def cross_entropy(
         stride=((vecsize * cols_per_block, 1), (cols_per_block, cols_per_block * vecsize * threads_per_row))
     )
 
-    idX = cute.make_identity_tensor(mX.shape)
-
-
-    mLoss_expanded_layout = cute.append(mLoss.layout, cute.make_layout((N,), stride=(0,)))
-    mLoss_expanded = cute.make_tensor(mLoss.iterator, mLoss_expanded_layout)
-
-    mTarget_expanded_layout = cute.append(mTarget.layout, cute.make_layout((N,), stride=(0,)))
-    mTarget_expanded = cute.make_tensor(mTarget.iterator, mTarget_expanded_layout)
-
-
-    gX, cX = [cute.zipped_divide(mT, tiler_mn) for mT in (mX, idX)]
-    
-    gTarget = cute.zipped_divide(mTarget_expanded, tiler_mn)  # one-element tuple
-    gLoss = cute.zipped_divide(mLoss_expanded, tiler_mn)
-
-    smem_allocated = cute.size_in_bytes(mX.element_type, gX.layout[0]) + 3 * num_warps * cluster_n * (cutlass.Float32.width // 8) + 2 * (cutlass.Int64.width // 8)
-    
-    
-    cross_entropy_kernel(gX, gTarget, gLoss, cX, mX.shape, tv_layout, tiler_mn, mX, cluster_n).launch(
-        grid=[cute.size(gX, mode=[1, 0]), cluster_n, 1],
+    smem_allocated = cute.size_in_bytes(mX.element_type, cute.make_layout(tiler_mn)) + 2 * num_warps * cluster_n * (cutlass.Float32.width // 8) + 2 * (cutlass.Int64.width // 8)
+    cross_entropy_kernel(mX, mTarget, mLoss, tv_layout, tiler_mn, cluster_n).launch(
+        grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), cluster_n, 1],
         block=[cute.size(tv_layout, mode=[0]), 1, 1],
         # Launching with cluster=[1, 1, 1] instead of None slows down the kernel by ~8us
         cluster=[1, cluster_n, 1] if cluster_n > 1 else None,
@@ -364,126 +171,51 @@ def cross_entropy(
     )
 
 
-def run_cross_entropy(
-    M,
-    N,
-    dtype: Type[cutlass.Numeric],
-    skip_ref_check=False,
-    benchmark=True,
-    warmup_iterations=2,
-    iterations=200,
-):
-    if not torch.cuda.is_available():
-        raise RuntimeError(f"Ampere GPU is required to run this example!")
+torch2cute_dtype_map = {
+    torch.float16: cutlass.Float16,
+    torch.bfloat16: cutlass.BFloat16,
+    torch.float32: cutlass.Float32,
+}
 
-    print(f"Tensor dimensions: [{M}, {N}]")
-    print(f"Input and Output Data type: {dtype}")
 
-    torch_dtype = cutlass_torch.dtype(dtype)
+def cross_entropy(
+    x: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Cross entropy forward pass.
 
-    device = "cuda"
-    x = 0.1 * torch.randn(M, N, device=device, dtype=torch_dtype)
-    target = torch.randint(0, N, (M,), device=device, dtype=torch.int64)
-    loss = torch.zeros(M, device=device, dtype=torch_dtype)
+    Args:
+        x: Input logits tensor of shape (M, N)
+        target: Target class indices tensor of shape (M,)
 
-    print(f"Input tensor shapes:")
-    print(f"x: {x.shape}, dtype: {x.dtype}")
-    print(f"target: {target.shape}, dtype: {target.dtype}")
-    print(f"loss: {loss.shape}, dtype: {loss.dtype}")
-
-    convert_from_dlpack = lambda x: (
-        from_dlpack(x, assumed_align=128)
+    Returns:
+        Cross entropy loss tensor of shape (M,)
+    """
+    assert x.dim() == 2, "Input must be 2D"
+    assert target.dim() == 1, "Target must be 1D"
+    assert x.shape[0] == target.shape[0], "Batch dimensions must match"
+    assert x.is_cuda and target.is_cuda, "Tensors must be on CUDA device"
+    assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported input dtype"
+    assert target.dtype == torch.int64, "Target must be int64"
+    M, N = x.shape
+    device = x.device
+    loss = torch.empty(M, device=device, dtype=x.dtype)
+    dtype = torch2cute_dtype_map[x.dtype]
+    convert_from_dlpack = lambda tensor: (
+        from_dlpack(tensor.detach(), assumed_align=16)
         .mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
     )
-
-    
-    x_tensor, = [convert_from_dlpack(tensor) for tensor in (x, )]
-
-    loss_tensor = from_dlpack(loss, assumed_align=4).mark_compact_shape_dynamic(mode=0)
-    target_tensor = from_dlpack(target, assumed_align=8).mark_compact_shape_dynamic(mode=0)
-
-    torch_stream = torch.cuda.current_stream()
-    stream = cuda.CUstream(torch_stream.cuda_stream)
-
-    print("Compiling kernel with cute.compile ...")
-    compiled_func = cute.compile(cross_entropy, x_tensor, target_tensor, loss_tensor, stream, x.shape[1])
-    print("Executing kernel...")
-
-    compiled_func(x_tensor, target_tensor, loss_tensor, stream)
-
-    compiled_func_ref = torch.compile(lambda x, target: F.cross_entropy(x, target, reduction='none'))
- 
-    if not skip_ref_check:
-        compiled_func(x_tensor, target_tensor, loss_tensor, stream)
-        print("Verifying results...")
-        out_ref = compiled_func_ref(x, target)
-
-        if dtype == cutlass.BFloat16:
-            torch.testing.assert_close(out_ref, loss, atol=1e-2, rtol=1e-2)
-        elif dtype == cutlass.Float32:
-            torch.testing.assert_close(out_ref, loss, atol=1e-4, rtol=1e-4)
-        else:
-            raise NotImplementedError()
-        print("Results verified successfully!")
-
-    
-    if benchmark:
-        fn = lambda: compiled_func(x_tensor, target_tensor, loss_tensor, stream)
-        time.sleep(0.5)
-        avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
-        
-        mem_bw = round((x.numel()*x.element_size() + target.numel()*target.element_size() + loss.numel()*loss.element_size()) / (avg_time/1000) / 1e9, 1)
-        print(f"Kernel execution time: {avg_time:.4f} ms")
-        print(f"Mem throughput: {mem_bw:.2f} GB/s")
-
-        fn = lambda: compiled_func_ref(x, target)
-        for _ in range(5): fn()  # warm up
-        time.sleep(0.5)
-        avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
-        mem_bw_ref = round((x.numel()*x.element_size() + target.numel()*target.element_size() + loss.numel()*loss.element_size()) / (avg_time/1000) / 1e9, 1)
-
-        print(f"Ref kernel execution time: {avg_time:.4f} ms")
-        print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
-
-        return mem_bw, mem_bw_ref
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="example of elementwise add to demonstrate the numpy/pytorch as input for kernels"
-    )
-    parser.add_argument("--M", default=8192, type=int)
-    parser.add_argument("--N", default=16384, type=int)
-    parser.add_argument("--warmup_iterations", default=10, type=int)
-    parser.add_argument("--iterations", default=100, type=int)
-    parser.add_argument("--skip_ref_check", action="store_true")
-    parser.add_argument("--benchmark", action="store_true")
-
-    
-    args = parser.parse_args()
-    torch.manual_seed(0)
-    run_cross_entropy(
-        args.M,
-        args.N,
-        dtype=cutlass.Float32,
-        skip_ref_check=args.skip_ref_check,
-        benchmark=args.benchmark,
-        warmup_iterations=args.warmup_iterations,
-        iterations=args.iterations,
-    )
-
-    MN_pairs = [(32768, 256), (32768, 512), (32768, 1024), (32768, 2048), (32768, 4096), (32768, 8192), (32768, 16384), (32768, 32768), (32768, 65536), (16384, 131072), (8192, 262144)]
-    results = []
-    for M, N in MN_pairs:
-        res = run_cross_entropy(
-            M,
-            N,
-            dtype=cutlass.Float32,
-            skip_ref_check=False,
-            benchmark=True,
-            warmup_iterations=args.warmup_iterations,
-            iterations=args.iterations,
+    x_tensor, = [convert_from_dlpack(tensor) for tensor in (x,)]
+    loss_tensor = from_dlpack(loss.detach(), assumed_align=4).mark_compact_shape_dynamic(mode=0)
+    target_tensor = from_dlpack(target.detach(), assumed_align=8).mark_compact_shape_dynamic(mode=0)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    compile_key = (dtype, N)
+    if compile_key not in cross_entropy.compile_cache:
+        cross_entropy.compile_cache[compile_key] = cute.compile(
+            cross_entropy_interface, x_tensor, target_tensor, loss_tensor, stream, N
         )
-        results.append(res)
-    print(results)
-    print("\nPASS")
+    cross_entropy.compile_cache[compile_key](x_tensor, target_tensor, loss_tensor, stream)
+    return loss
+
+
+cross_entropy.compile_cache = {}
