@@ -1,4 +1,4 @@
-# QuACK: A Quirky Assortment of CuTe Kernels
+# 🦆 QuACK: A Quirky Assortment of CuTe Kernels 🦆
 
 ## Installation
 
@@ -12,11 +12,11 @@ pip install quack-kernels
 - CUDA toolkit 12.9+
 - Python 3.12
 
-## Kernels
+## Kernels 🐥
 
-- RMSNorm forward
-- Softmax forward
-- Cross entropy forward
+- 🦆 RMSNorm forward
+- 🦆 Softmax forward
+- 🦆 Cross entropy forward
 
 
 ## Usage
