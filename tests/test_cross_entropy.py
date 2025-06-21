@@ -8,9 +8,10 @@ from quack.cross_entropy import cross_entropy
 
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
+# @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize(
     "N",
-    [256, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768, 49152, 65536, 98304, 131072, 196608, 262144]
+    [192, 256, 512, 760, 1024, 1128, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
     # [256]
 )
 @pytest.mark.parametrize("M", [1, 77, 289])
@@ -18,16 +19,7 @@ from quack.cross_entropy import cross_entropy
 def test_cross_entropy_forward(M, N, input_dtype):
     """Test Cross Entropy forward pass against reference implementation."""
     device = "cuda"
-    # Set tolerance based on dtype
-    if input_dtype == torch.bfloat16:
-        atol = 1e-2
-        rtol = 1e-2
-    elif input_dtype == torch.float16:
-        atol = 1e-3
-        rtol = 1e-3
-    else:
-        atol = 1e-4
-        rtol = 1e-4
+    atol, rtol = 1e-5, 1e-5
     torch.random.manual_seed(0)
     # Create input tensors (scale down to avoid overflow)
     x = 0.1 * torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=False)
@@ -36,10 +28,10 @@ def test_cross_entropy_forward(M, N, input_dtype):
     target_ref = target.detach().clone()
     # Forward pass
     loss = cross_entropy(x, target)
-    loss_ref = F.cross_entropy(x_ref, target_ref, reduction='none')
+    loss_ref = F.cross_entropy(x_ref.float(), target_ref, reduction='none')
     # Check output shape and dtype
     assert loss.shape == (M,)
-    assert loss.dtype == input_dtype
+    assert loss.dtype == torch.float32
     # Check accuracy
     torch.testing.assert_close(loss, loss_ref, atol=atol, rtol=rtol)
     # Check cross entropy properties

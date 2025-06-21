@@ -1,7 +1,7 @@
 import math
 import torch
 import operator
-from typing import Callable, Union
+from typing import Callable, Union, Optional
 
 import cuda.bindings.driver as cuda
 
@@ -17,6 +17,7 @@ def cross_entropy_kernel(
     mX: cute.Tensor,  # (M, N)
     mTarget: cute.Tensor, # (M,)
     mLoss: cute.Tensor, # (M,)
+    mLSE: Optional[cute.Tensor], # (M,)
     tv_layout: cute.Layout,
     tiler_mn: cute.Shape,
     cluster_n: cutlass.Constexpr = 1,
@@ -77,13 +78,23 @@ def cross_entropy_kernel(
     if row < shape[0] and tXcX[0][1] == 0:
         target = cute.Int32(mTarget[row])
 
-    tXpX = utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
+    is_even_N = cutlass.const_expr(shape[1] == tiler_mn[1] * cluster_n)
+    tXpX = utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1]) if not is_even_N else None
     if row < shape[0]:
         cute.copy(copy_atom_load_X_async, tXgX, tXsX, pred=tXpX)
     cute.arch.cp_async_commit_group()
     cute.arch.cp_async_wait_group(0)
     cute.autovec_copy(tXsX, tXrX)
     x = tXrX.load().to(cute.Float32)
+    # Fill OOB values with -inf
+    if cutlass.const_expr(not is_even_N):
+        tXrX_fp32 = cute.make_fragment_like(tXrX, cutlass.Float32)
+        tXrX_fp32.store(x)
+        for rest_v in range(tXpX.shape[0]):
+            for rest_k in range(tXpX.shape[2]):
+                if not tXpX[rest_v, 0, rest_k]:
+                    tXrX_fp32[(None, rest_v), None, rest_k].fill(-cutlass.Float32.inf)
+        x = tXrX_fp32.load()
 
     target_logit = cute.Float32.zero
     if row < shape[0] and tXcX[0][1] == 0:
@@ -113,8 +124,11 @@ def cross_entropy_kernel(
 
     if tXcX[0][1] == 0 and row < shape[0] and (cluster_n == 1 or cute.arch.block_idx_in_cluster() == 0):
         ln_2 = math.log(2.0)
-        loss_val = -target_logit + max_x + utils.log2f(denom) * ln_2
+        lse = max_x + utils.log2f(denom) * ln_2
+        loss_val = lse - target_logit
         mLoss[row] = loss_val.to(mLoss.element_type)
+        if cutlass.const_expr(mLSE is not None):
+            mLSE[row] = lse
 
 
 @cute.jit
@@ -122,6 +136,7 @@ def cross_entropy_interface(
     mX: cute.Tensor,
     mTarget: cute.Tensor,
     mLoss: cute.Tensor,
+    mLSE: Optional[cute.Tensor],
     stream: cuda.CUstream,
     N: cutlass.Constexpr,
     copy_bits: cutlass.Constexpr = 128
@@ -148,7 +163,7 @@ def cross_entropy_interface(
     )
 
     smem_allocated = cute.size_in_bytes(mX.element_type, cute.make_layout(tiler_mn)) + 2 * num_warps * cluster_n * (cutlass.Float32.width // 8) + 2 * (cutlass.Int64.width // 8)
-    cross_entropy_kernel(mX, mTarget, mLoss, tv_layout, tiler_mn, cluster_n).launch(
+    cross_entropy_kernel(mX, mTarget, mLoss, mLSE, tv_layout, tiler_mn, cluster_n).launch(
         grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), cluster_n, 1],
         block=[cute.size(tv_layout, mode=[0]), 1, 1],
         # Launching with cluster=[1, 1, 1] instead of None slows down the kernel by ~8us
@@ -168,6 +183,7 @@ torch2cute_dtype_map = {
 def cross_entropy(
     x: torch.Tensor,
     target: torch.Tensor,
+    return_lse: bool = False,
 ) -> torch.Tensor:
     """Cross entropy forward pass.
 
@@ -186,7 +202,8 @@ def cross_entropy(
     assert target.dtype == torch.int64, "Target must be int64"
     M, N = x.shape
     device = x.device
-    loss = torch.empty(M, device=device, dtype=x.dtype)
+    loss = torch.empty(M, device=device, dtype=torch.float32)
+    lse = torch.empty(M, device=device, dtype=torch.float32) if return_lse else None
     dtype = torch2cute_dtype_map[x.dtype]
     convert_from_dlpack = lambda tensor: (
         from_dlpack(tensor.detach(), assumed_align=16)
@@ -194,15 +211,16 @@ def cross_entropy(
     )
     x_tensor, = [convert_from_dlpack(tensor) for tensor in (x,)]
     loss_tensor = from_dlpack(loss.detach(), assumed_align=4).mark_compact_shape_dynamic(mode=0)
+    lse_tensor = from_dlpack(loss.detach(), assumed_align=4).mark_compact_shape_dynamic(mode=0) if lse is not None else None
     target_tensor = from_dlpack(target.detach(), assumed_align=8).mark_compact_shape_dynamic(mode=0)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    compile_key = (dtype, N)
+    compile_key = (dtype, N, lse_tensor is not None)
     if compile_key not in cross_entropy.compile_cache:
         cross_entropy.compile_cache[compile_key] = cute.compile(
-            cross_entropy_interface, x_tensor, target_tensor, loss_tensor, stream, N
+            cross_entropy_interface, x_tensor, target_tensor, loss_tensor, lse_tensor, stream, N
         )
-    cross_entropy.compile_cache[compile_key](x_tensor, target_tensor, loss_tensor, stream)
-    return loss
+    cross_entropy.compile_cache[compile_key](x_tensor, target_tensor, loss_tensor, lse_tensor, stream)
+    return loss if not return_lse else (loss, lse)
 
 
 cross_entropy.compile_cache = {}

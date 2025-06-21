@@ -74,7 +74,8 @@ def softmax_kernel(
         # Cluster arrive after barrier init
         cute.arch.cluster_arrive_relaxed()
 
-    tXpX = utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
+    is_even_N = cutlass.const_expr(shape[1] == tiler_mn[1] * cluster_n)
+    tXpX = utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1]) if not is_even_N else None
     if tXcX[0][0] < shape[0]:
         cute.copy(copy_atom_load_X_async, tXgX, tXsX, pred=tXpX)
     cute.arch.cp_async_commit_group()
@@ -82,6 +83,15 @@ def softmax_kernel(
 
     cute.autovec_copy(tXsX, tXrX)
     x = tXrX.load().to(cute.Float32)
+    # Fill OOB values with -inf
+    if cutlass.const_expr(not is_even_N):
+        tXrX_fp32 = cute.make_fragment_like(tXrX, cutlass.Float32)
+        tXrX_fp32.store(x)
+        for rest_v in range(tXpX.shape[0]):
+            for rest_k in range(tXpX.shape[2]):
+                if not tXpX[rest_v, 0, rest_k]:
+                    tXrX_fp32[(None, rest_v), None, rest_k].fill(-cutlass.Float32.inf)
+        x = tXrX_fp32.load()
     threads_per_row = tv_layout.shape[0][0]
     max_x = utils.row_reduce(
         x,
@@ -105,7 +115,7 @@ def softmax_kernel(
     inv = 1.0 / denom
     y = exp_x * inv
     tXrO.store(y.to(tXrO.element_type))
-    tOpO = utils.predicate_k(thr_copy_O.partition_S(cX), limit=shape[1])
+    tOpO = utils.predicate_k(thr_copy_O.partition_S(cX), limit=shape[1]) if not is_even_N else None
     if tXcX[0][0] < shape[0]:
         cute.copy(copy_atom_store_O, tXrO, tXgO, pred=tOpO)
 

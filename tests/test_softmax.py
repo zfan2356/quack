@@ -7,11 +7,11 @@ import torch.nn.functional as F
 from quack.softmax import softmax
 
 
-# TODO this might fail if N is not a multiple of 256 since we don't init X to be -inf?
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
+# @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize(
     "N",
-    [256, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768, 49152, 65536, 98304, 131072, 196608, 262144]
+    [192, 256, 512, 760, 1024, 1128, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
 )
 @pytest.mark.parametrize("M", [1, 37, 199])
 # @pytest.mark.parametrize("M", [1])
