@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
+import operator
 import math
 from typing import Type, Callable, Optional
 
@@ -57,7 +58,7 @@ def block_reduce(val: cute.Numeric, op: Callable, reduction_buffer: cute.Tensor,
     """reduction_buffer has shape (num_warps / warp_per_row, warps_per_row)
     """
     lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
-    warps_per_row = reduction_buffer.shape[1]
+    warps_per_row = cute.size(reduction_buffer.shape[1])
     row_idx, col_idx = warp_idx // warps_per_row, warp_idx % warps_per_row
     if lane_idx == 0:
         reduction_buffer[row_idx, col_idx] = val
@@ -142,6 +143,46 @@ def block_or_cluster_reduce(val: cute.Numeric, op: Callable, reduction_buffer: c
         return cluster_reduce(val, op, reduction_buffer, mbar_ptr, init_val=init_val)
 
 
+@cute.jit
+def row_reduce(
+    x: cute.TensorSSA | cute.Numeric,
+    op: cute.ReductionOp,
+    threads_per_row: cutlass.Constexpr[int],
+    reduction_buffer: Optional[cute.Tensor] = None,
+    mbar_ptr: Optional[cute.Pointer] = None,
+    init_val: cute.Numeric = 0.0,
+    hook_fn: Optional[Callable] = None,
+) -> cute.Numeric:
+    """reduction_buffer must have shape (num_warps / warps_per_row, (warps_per_row, cluster_n))
+    """
+    if cutlass.const_expr(isinstance(x, cute.TensorSSA)):
+        val = x.reduce(op, init_val=init_val, reduction_profile=0)
+    else:
+        val = x
+    warp_op = {
+        cute.ReductionOp.ADD: operator.add,
+        cute.ReductionOp.MAX: cute.arch.fmax if cutlass.const_expr(x.dtype == cute.Float32) else max,
+        cute.ReductionOp.MIN: min,
+        cute.ReductionOp.MUL: operator.mul,
+    }[op]
+    val = warp_reduce(
+        val,
+        warp_op,
+        width=min_constexpr(threads_per_row, cute.arch.WARP_SIZE),
+    )
+    if cutlass.const_expr(hook_fn is not None):
+        hook_fn()
+    if cutlass.const_expr(reduction_buffer is not None):
+        warps_per_row, cluster_n = reduction_buffer.shape[1]
+        assert cluster_n == 1 or mbar_ptr is not None, "mbar_ptr must be provided for cluster reduction"
+        if cutlass.const_expr(warps_per_row > 1 or cluster_n > 1):
+            val = block_or_cluster_reduce(
+                val, warp_op, reduction_buffer, mbar_ptr, init_val=init_val
+            )
+    return val
+
+
+
 def exp2f(x: cute.TensorSSA | cutlass.Float32) -> cute.TensorSSA | cutlass.Float32:
     """exp2f calculation for both vector and scalar.
 
@@ -188,3 +229,18 @@ def rsqrt(a: float | cute.Float32, *, loc=None, ip=None) -> cute.Float32:
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     )
+
+
+def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
+    # Only compute predicates for the "k" dimension. For the mn dimension, we will use "if"
+    tApA = cute.make_fragment(
+        cute.make_layout(
+            (cute.size(tAcA, mode=[0, 1]), cute.size(tAcA, mode=[1]), cute.size(tAcA, mode=[2])),
+            stride=(cute.size(tAcA, mode=[2]), 0, 1),
+        ),
+        cutlass.Boolean,
+    )
+    for rest_v in range(tApA.shape[0]):
+        for rest_k in range(tApA.shape[2]):
+            tApA[rest_v, 0, rest_k] = cute.elem_less(tAcA[(0, rest_v), 0, rest_k][1], limit)
+    return tApA

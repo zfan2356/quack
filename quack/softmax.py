@@ -48,7 +48,7 @@ def softmax_kernel(
 
     reduction_buffer_layout = cute.make_ordered_layout(
         # 2 stages: 1 for max, 1 for sum
-        (num_warps // warps_per_row, warps_per_row if cluster_n == 1 else (warps_per_row, cluster_n), 2),
+        (num_warps // warps_per_row, (warps_per_row, cluster_n), 2),
         order=(1, 0, 2)
     )
     reduction_buffer = smem.allocate_tensor(cutlass.Float32, reduction_buffer_layout, byte_alignment=4)
@@ -86,30 +86,26 @@ def softmax_kernel(
 
     cute.autovec_copy(tXsX, tXrX)
     x = tXrX.load().to(cute.Float32)
-    max_x = utils.warp_reduce(
-        x.reduce(cute.ReductionOp.MAX, init_val=float('-inf'), reduction_profile=0),
-        cute.arch.fmax,
-        width=utils.min_constexpr(tv_layout.shape[0][0], cute.arch.WARP_SIZE),
+    threads_per_row = tv_layout.shape[0][0]
+    max_x = utils.row_reduce(
+        x,
+        cute.ReductionOp.MAX,
+        threads_per_row,
+        reduction_buffer[None, None, 0],
+        mbar_ptr + 0 if cluster_n > 1 else None,
+        init_val=-cutlass.Float32.inf,
+        hook_fn=cute.arch.cluster_wait if cutlass.const_expr(cluster_n > 1) else None
     )
-    if cutlass.const_expr(cluster_n > 1):
-        cute.arch.cluster_wait()
-    if cutlass.const_expr(warps_per_row > 1 or cluster_n > 1):
-        max_mbar_ptr = mbar_ptr + 0 if cluster_n > 1 else None
-        max_x = utils.block_or_cluster_reduce(
-            max_x, cute.arch.fmax, reduction_buffer[None, None, 0], max_mbar_ptr, init_val=-cutlass.Float32.inf
-        )
     log2_e = math.log2(math.e)
     exp_x = cute.math.exp2((x - max_x) * log2_e, fastmath=True)
-    denom = utils.warp_reduce(
-        exp_x.reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0),
-        operator.add,
-        width=utils.min_constexpr(tv_layout.shape[0][0], cute.arch.WARP_SIZE),
+    denom = utils.row_reduce(
+        exp_x,
+        cute.ReductionOp.ADD,
+        threads_per_row,
+        reduction_buffer[None, None, 1],
+        mbar_ptr + 1 if cluster_n > 1 else None,
+        init_val=0.0,
     )
-    if cutlass.const_expr(warps_per_row > 1 or cluster_n > 1):
-        sum_mbar_ptr = mbar_ptr + 1 if cluster_n > 1 else None
-        denom = utils.block_or_cluster_reduce(
-            denom, operator.add, reduction_buffer[None, None, 1], sum_mbar_ptr, init_val=0.0
-        )
     inv = 1.0 / denom
     y = exp_x * inv
 

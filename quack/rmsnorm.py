@@ -16,13 +16,11 @@ import quack.utils as utils
 
 @cute.kernel
 def rmsnorm_kernel(
-    gX: cute.Tensor,
-    gW: cute.Tensor,
-    gO: cute.Tensor,
-    gRstd: cute.Tensor,
-    cX: cute.Tensor,  # coordinate tensor
+    mX: cute.Tensor,
+    mW: cute.Tensor,
+    mO: cute.Tensor,
+    mRstd: cute.Tensor,
     eps: cute.Float32,
-    shape: cute.Shape,
     tv_layout: cute.Layout,
     tiler_mn: cute.Shape,
     cluster_n: cutlass.Constexpr = 1,
@@ -31,42 +29,46 @@ def rmsnorm_kernel(
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, cluster_y, _ = cute.arch.block_idx()
-    gdim, _, _ = cute.arch.grid_dim()
-
-    # slice for CTAs
-    # logical id -> address
-    blkX, blkOut, blkRstd, blkCrd = [gT[(None, None), bidx if cluster_n == 1 else (bidx, cluster_y)] for gT in (gX, gO, gRstd, cX)]
-    blkW = gW[(None, None), 0 if cluster_n == 1 else (0, cluster_y)]
-
-    # declare the atoms which will be used later for memory copy
-    copy_atom_load_X = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type, num_bits_per_copy=128)
-    copy_atom_load_X_async = cute.make_copy_atom(cute.nvgpu.cpasync.CopyG2SOp(), gX.element_type, num_bits_per_copy=128)
-    copy_atom_load_W = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gW.element_type, num_bits_per_copy=128)
-    copy_atom_store_O = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gO.element_type, num_bits_per_copy=128)
-
-    thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
-    thr_copy_X_async = cute.make_tiled_copy(copy_atom_load_X_async, tv_layout, tiler_mn).get_slice(tidx)
-    thr_copy_W = cute.make_tiled_copy(copy_atom_load_W, tv_layout, tiler_mn).get_slice(tidx)
-    thr_copy_O = cute.make_tiled_copy(copy_atom_store_O, tv_layout, tiler_mn).get_slice(tidx)
 
     smem = cutlass.utils.SmemAllocator()
-    # Don't use blkX.layout here, because the stride is N, not N_rounded
-    sX = smem.allocate_tensor(gX.element_type, cute.make_ordered_layout(blkX.shape, order=(1, 0)), byte_alignment=16)
+    sX = smem.allocate_tensor(mX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16)
     num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
     warps_per_row = utils.max_constexpr(tv_layout.shape[0][0] // cute.arch.WARP_SIZE, 1)
-    # reduction_buffer_layout = cute.make_ordered_layout((num_warps // warps_per_row, warps_per_row), order=(1, 0))
-    reduction_buffer_layout = cute.make_ordered_layout((num_warps // warps_per_row, warps_per_row if cluster_n == 1 else (warps_per_row, cluster_n)), order=(1, 0))
+    reduction_buffer_layout = cute.make_ordered_layout(
+        (num_warps // warps_per_row, (warps_per_row, cluster_n)),
+        order=(1, 0)
+    )
     reduction_buffer = smem.allocate_tensor(cutlass.Float32, reduction_buffer_layout, byte_alignment=4)
     if cutlass.const_expr(cluster_n > 1):
         mbar_ptr = smem.allocate(cutlass.Int64.width // 8, byte_alignment=8)
     else:
         mbar_ptr = None
 
-    tWgW = thr_copy_W.partition_S(blkW)
-    tXgX = thr_copy_X_async.partition_S(blkX)
-    tXsX = thr_copy_X_async.partition_S(sX)
-    tXgO, tXrRstd = [thr_copy_O.partition_D(blk) for blk in (blkOut, blkRstd)]
-    tXcX = thr_copy_X.partition_S(blkCrd)[(0, None), None, None]
+    shape = mX.shape
+    idX = cute.make_identity_tensor(shape)
+    # slice for CTAs
+    gX, gO, gRstd, cX = [
+        cute.local_tile(mT, tiler_mn, (bidx, 0 if cluster_n == 1 else cluster_y))
+        for mT in (mX, mO, mRstd, idX)
+    ]
+    gW = cute.local_tile(mW, tiler_mn, (0, 0 if cluster_n == 1 else cluster_y))
+
+    # declare the atoms which will be used later for memory copy
+    copy_atom_load_X = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mX.element_type, num_bits_per_copy=128)
+    copy_atom_load_X_async = cute.make_copy_atom(cute.nvgpu.cpasync.CopyG2SOp(), mX.element_type, num_bits_per_copy=128)
+    copy_atom_load_W = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mW.element_type, num_bits_per_copy=128)
+    copy_atom_store_O = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mO.element_type, num_bits_per_copy=128)
+
+    thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
+    thr_copy_X_async = cute.make_tiled_copy(copy_atom_load_X_async, tv_layout, tiler_mn).get_slice(tidx)
+    thr_copy_W = cute.make_tiled_copy(copy_atom_load_W, tv_layout, tiler_mn).get_slice(tidx)
+    thr_copy_O = cute.make_tiled_copy(copy_atom_store_O, tv_layout, tiler_mn).get_slice(tidx)
+
+    tWgW = thr_copy_W.partition_S(gW)
+    tXgX = thr_copy_X_async.partition_S(gX)
+    tXsX = thr_copy_X_async.partition_D(sX)
+    tXgO, tXrRstd = [thr_copy_O.partition_D(g) for g in (gO, gRstd)]
+    tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
 
     # allocate fragments for gmem->rmem
     tWrW = cute.make_fragment_like(tWgW)
@@ -82,44 +84,33 @@ def rmsnorm_kernel(
         # Cluster arrive after barrier init
         cute.arch.cluster_arrive_relaxed()
 
-    tXpX = cute.make_fragment_like(tXgX[(0, None), None, None], cutlass.Boolean)
-    for i in range(cute.size(tXpX)):
-        tXpX[i] = cute.elem_less(tXcX[i][1], shape[1])
-    # tXrX.fill(0.0)
-    if tXcX[0][0] < shape[0]:
-        # cute.copy(copy_atom_load_X, tXgX, tXrX, pred=tXpX)
+    tXpX = utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
+    row = tXcX[0][0]
+    if row < shape[0]:
         cute.copy(copy_atom_load_X_async, tXgX, tXsX, pred=tXpX)
     cute.arch.cp_async_commit_group()
 
-    tWpW = cute.make_fragment_like(tWgW[(0, None), None, None], cutlass.Boolean)
-    tWcX = thr_copy_W.partition_S(blkCrd)[(0, None), None, None]
-    for i in range(cute.size(tWpW)):
-        tWpW[i] = cute.elem_less(tWcX[i][1], shape[1])
+    tWpW = utils.predicate_k(thr_copy_W.partition_S(cX), limit=shape[1])
     if not delay_w_load:
         cute.copy(copy_atom_load_W, tWgW, tWrW, pred=tWpW)
 
     cute.arch.cp_async_wait_group(0)
     cute.autovec_copy(tXsX, tXrX)
     x = tXrX.load().to(cute.Float32)
-    sum_sq_x = utils.warp_reduce(
-        (x * x).reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0),
-        operator.add,
-        width=utils.min_constexpr(tv_layout.shape[0][0], cute.arch.WARP_SIZE),
+    threads_per_row = tv_layout.shape[0][0]
+    sum_sq_x = utils.row_reduce(
+        x * x,
+        cute.ReductionOp.ADD,
+        threads_per_row,
+        reduction_buffer,
+        mbar_ptr,
+        init_val=0.0,
+        hook_fn=cute.arch.cluster_wait if cutlass.const_expr(cluster_n > 1) else None
     )
-    if cutlass.const_expr(cluster_n > 1):
-        cute.arch.cluster_wait()
-    if cutlass.const_expr(warps_per_row > 1 or cluster_n > 1):
-        sum_sq_x = utils.block_or_cluster_reduce(
-            sum_sq_x, operator.add, reduction_buffer, mbar_ptr, init_val=0.0
-        )
     rstd = utils.rsqrt(sum_sq_x / shape[1] + eps)
     # Only the thread corresponding to column 0 writes out the rstd to gmem
-    if tXcX[0][1] == 0 and tXcX[0][0] < shape[0]:
-        if cutlass.const_expr(cluster_n == 1):
-            tXrRstd[0] = rstd
-        else:
-            if cute.arch.block_idx_in_cluster() == 0:
-                tXrRstd[0] = rstd
+    if tXcX[0][1] == 0 and row < shape[0] and (cluster_n == 1 or cute.arch.block_idx_in_cluster() == 0):
+        tXrRstd[0] = rstd
     if delay_w_load:
         cute.copy(copy_atom_load_W, tWgW, tWrW, pred=tWpW)
     if reload_from == "smem":
@@ -132,20 +123,16 @@ def rmsnorm_kernel(
     w = tXrW.load().to(cute.Float32)
     y = x_hat * w
     tXrO.store(y.to(tXrO.element_type))
-    tOcX = thr_copy_O.partition_S(blkCrd)[(0, None), None, None]
-    tOpO = cute.make_fragment_like(tXgO[(0, None), None, None], cutlass.Boolean)
-    for i in range(cute.size(tOpO)):
-        tOpO[i] = cute.elem_less(tOcX[i][1], shape[1])
-    if tXcX[0][0] < shape[0]:
+    tOpO = utils.predicate_k(thr_copy_O.partition_S(cX), limit=shape[1])
+    if row < shape[0]:
         cute.copy(copy_atom_store_O, tXrO, tXgO, pred=tOpO)
 
 
 @cute.jit
 def rmsnorm_interface(
-    # mX_: cute.Tensor,
     mX: cute.Tensor,
     mW: cute.Tensor,
-    mOut: cute.Tensor,
+    mO: cute.Tensor,
     mRstd: cute.Tensor,
     stream: cuda.CUstream,
     N: cutlass.Constexpr,
@@ -180,21 +167,18 @@ def rmsnorm_interface(
     mW_expanded = cute.make_tensor(mW.iterator, mW_expanded_layout)
     mRstd_expanded_layout = cute.append(mRstd.layout, cute.make_layout((N,), stride=(0,)))
     mRstd_expanded = cute.make_tensor(mRstd.iterator, mRstd_expanded_layout)
-    idX = cute.make_identity_tensor(mX.shape)
-    gX, gW, gO, gRstd, cX = [cute.zipped_divide(mT, tiler_mn) for mT in (mX, mW_expanded, mOut, mRstd_expanded, idX)]  # ((TileM,TileN),(RestM,RestN))
 
     # reload_from = None if N <= 16384 else ("smem" if N <= 32768 else "gmem")
     reload_from = None if N <= 16384 else "smem"
     # delay_w_load = N > 64 * 1024
     delay_w_load = False
     N_rounded = tiler_mn[1]
-    rmsnorm_kernel(gX, gW, gO, gRstd, cX, eps, mX.shape, tv_layout, tiler_mn, cluster_n, reload_from).launch(
-        grid=[cute.size(gX, mode=[1, 0]), cluster_n, 1],
+    rmsnorm_kernel(mX, mW_expanded, mO, mRstd_expanded, eps, tv_layout, tiler_mn, cluster_n, reload_from).launch(
+        grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), cluster_n, 1],
         block=[cute.size(tv_layout, mode=[0]), 1, 1],
         # Launching with cluster=[1, 1, 1] instead of None slows down the kernel by ~8us
         cluster=[1, cluster_n, 1] if cluster_n > 1 else None,
-        # We don't want to use gX.layout[0] here since that has stride in N, not N_rounded, leading IMA on smem
-        smem=cute.size_in_bytes(mX.element_type, cute.make_layout(gX.shape[0])) + num_warps * cluster_n * (cutlass.Float32.width // 8) + (cutlass.Int64.width // 8),
+        smem=cute.size_in_bytes(mX.element_type, cute.make_layout(tiler_mn)) + num_warps * cluster_n * (cutlass.Float32.width // 8) + (cutlass.Int64.width // 8),
         stream=stream,
     )
 

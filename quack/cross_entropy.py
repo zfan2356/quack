@@ -33,7 +33,6 @@ def cross_entropy_kernel(
     # declare the atoms which will be used later for memory copy
     copy_atom_load_X = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type, num_bits_per_copy=128)
     copy_atom_load_X_async = cute.make_copy_atom(cute.nvgpu.cpasync.CopyG2SOp(), gX.element_type, num_bits_per_copy=128)
-    copy_atom_scalar = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type, num_bits_per_copy=gX.element_type.width)
 
     thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
     thr_copy_X_async = cute.make_tiled_copy(copy_atom_load_X_async, tv_layout, tiler_mn).get_slice(tidx)
@@ -41,13 +40,13 @@ def cross_entropy_kernel(
     smem = cutlass.utils.SmemAllocator()
 
     # Don't use blkX.layout here, because the stride is N, not N_rounded
-    sX = smem.allocate_tensor(gX.element_type, cute.make_ordered_layout(blkX.shape, order=(1, 0)), byte_alignment=16)
+    sX = smem.allocate_tensor(gX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16)
     num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
     warps_per_row = utils.max_constexpr(tv_layout.shape[0][0] // cute.arch.WARP_SIZE, 1)
 
     reduction_buffer_layout = cute.make_ordered_layout(
         # 2 stages: 1 for max, 1 for sum
-        (num_warps // warps_per_row, warps_per_row if cluster_n == 1 else (warps_per_row, cluster_n), 2),
+        (num_warps // warps_per_row, (warps_per_row, cluster_n), 2),
         order=(1, 0, 2)
     )
     reduction_buffer = smem.allocate_tensor(cutlass.Float32, reduction_buffer_layout, byte_alignment=4)
@@ -94,40 +93,32 @@ def cross_entropy_kernel(
     if row < shape[0] and tXcX[0][1] == 0:
         target_logit = cute.Float32(mX[row, target])
 
-    max_x = utils.warp_reduce(
-        x.reduce(cute.ReductionOp.MAX, init_val=float('-inf'), reduction_profile=0),
-        cute.arch.fmax,
-        width=utils.min_constexpr(tv_layout.shape[0][0], cute.arch.WARP_SIZE),
+    threads_per_row = tv_layout.shape[0][0]
+    max_x = utils.row_reduce(
+        x,
+        cute.ReductionOp.MAX,
+        threads_per_row,
+        reduction_buffer[None, None, 0],
+        mbar_ptr + 0 if cluster_n > 1 else None,
+        init_val=-cutlass.Float32.inf,
+        hook_fn=cute.arch.cluster_wait if cutlass.const_expr(cluster_n > 1) else None
     )
-    if cutlass.const_expr(cluster_n > 1):
-        cute.arch.cluster_wait()
-    if cutlass.const_expr(warps_per_row > 1 or cluster_n > 1):
-        max_mbar_ptr = mbar_ptr + 0 if cluster_n > 1 else None
-        max_x = utils.block_or_cluster_reduce(
-            max_x, cute.arch.fmax, reduction_buffer[None, None, 0], max_mbar_ptr, init_val=-cutlass.Float32.inf
-        )
     log2_e = math.log2(math.e)
     # exp_x = cute.math.exp2((x - max_x) * log2_e, fastmath=True)
     exp_x = utils.exp2f((x - max_x) * log2_e)  # a bit faster, idk why
-    denom = utils.warp_reduce(
-        exp_x.reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0),
-        operator.add,
-        width=utils.min_constexpr(tv_layout.shape[0][0], cute.arch.WARP_SIZE),
+    denom = utils.row_reduce(
+        exp_x,
+        cute.ReductionOp.ADD,
+        threads_per_row,
+        reduction_buffer[None, None, 1],
+        mbar_ptr + 1 if cluster_n > 1 else None,
+        init_val=0.0,
     )
-    if cutlass.const_expr(warps_per_row > 1 or cluster_n > 1):
-        sum_mbar_ptr = mbar_ptr + 1 if cluster_n > 1 else None
-        denom = utils.block_or_cluster_reduce(
-            denom, operator.add, reduction_buffer[None, None, 1], sum_mbar_ptr, init_val=0.0
-        )
 
-    if tXcX[0][1] == 0 and row < shape[0]:
+    if tXcX[0][1] == 0 and row < shape[0] and (cluster_n == 1 or cute.arch.block_idx_in_cluster() == 0):
         ln_2 = math.log(2.0)
         loss_val = -target_logit + max_x + utils.log2f(denom) * ln_2
-        if cutlass.const_expr(cluster_n == 1):
-            mLoss[row] = loss_val.to(mLoss.element_type)
-        else:
-            if cute.arch.block_idx_in_cluster() == 0:
-                mLoss[row] = loss_val.to(mLoss.element_type)
+        mLoss[row] = loss_val.to(mLoss.element_type)
 
 
 @cute.jit
