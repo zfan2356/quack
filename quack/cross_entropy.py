@@ -23,27 +23,19 @@ def cross_entropy_kernel(
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, cluster_y, _ = cute.arch.block_idx()
-    gdim, _, _ = cute.arch.grid_dim()
 
     shape: cute.Shape = mX.shape
-    idX = cute.make_identity_tensor(mX.shape)
-    gX, cX = [cute.zipped_divide(mT, tiler_mn) for mT in (mX, idX)]
-    blkX, blkCrd = [gT[(None, None), bidx if cluster_n == 1 else (bidx, cluster_y)] for gT in (gX, cX)]
-
-    # declare the atoms which will be used later for memory copy
-    copy_atom_load_X = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type, num_bits_per_copy=128)
-    copy_atom_load_X_async = cute.make_copy_atom(cute.nvgpu.cpasync.CopyG2SOp(), gX.element_type, num_bits_per_copy=128)
-
-    thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
-    thr_copy_X_async = cute.make_tiled_copy(copy_atom_load_X_async, tv_layout, tiler_mn).get_slice(tidx)
+    idX = cute.make_identity_tensor(shape)
+    # slice for CTAs
+    gX, cX = [
+        cute.local_tile(mT, tiler_mn, (bidx, 0 if cluster_n == 1 else cluster_y))
+        for mT in (mX, idX)
+    ]
 
     smem = cutlass.utils.SmemAllocator()
-
-    # Don't use blkX.layout here, because the stride is N, not N_rounded
-    sX = smem.allocate_tensor(gX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16)
+    sX = smem.allocate_tensor(mX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16)
     num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
     warps_per_row = utils.max_constexpr(tv_layout.shape[0][0] // cute.arch.WARP_SIZE, 1)
-
     reduction_buffer_layout = cute.make_ordered_layout(
         # 2 stages: 1 for max, 1 for sum
         (num_warps // warps_per_row, (warps_per_row, cluster_n), 2),
@@ -56,11 +48,17 @@ def cross_entropy_kernel(
     else:
         mbar_ptr = None
 
-    #### Thread View
-    tXgX = thr_copy_X_async.partition_S(blkX)
-    tXsX = thr_copy_X_async.partition_S(sX)
+    # declare the atoms which will be used later for memory copy
+    copy_atom_load_X = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gX.element_type, num_bits_per_copy=128)
+    copy_atom_load_X_async = cute.make_copy_atom(cute.nvgpu.cpasync.CopyG2SOp(), gX.element_type, num_bits_per_copy=128)
 
-    tXcX = thr_copy_X.partition_S(blkCrd)[(0, None), None, None]
+    thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
+    thr_copy_X_async = cute.make_tiled_copy(copy_atom_load_X_async, tv_layout, tiler_mn).get_slice(tidx)
+
+    #### Thread View
+    tXgX = thr_copy_X_async.partition_S(gX)
+    tXsX = thr_copy_X_async.partition_S(sX)
+    tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
 
     # allocate fragments for gmem->rmem
     tXrX = cute.make_fragment_like(tXgX)  # only logits fragment needed
@@ -79,9 +77,7 @@ def cross_entropy_kernel(
     if row < shape[0] and tXcX[0][1] == 0:
         target = cute.Int32(mTarget[row])
 
-    tXpX = cute.make_fragment_like(tXgX[(0, None), None, None], cutlass.Boolean)
-    for i in range(cute.size(tXpX)):
-        tXpX[i] = cute.elem_less(tXcX[i][1], shape[1])
+    tXpX = utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
     if row < shape[0]:
         cute.copy(copy_atom_load_X_async, tXgX, tXsX, pred=tXpX)
     cute.arch.cp_async_commit_group()

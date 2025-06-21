@@ -67,7 +67,7 @@ def rmsnorm_kernel(
     tWgW = thr_copy_W.partition_S(gW)
     tXgX = thr_copy_X_async.partition_S(gX)
     tXsX = thr_copy_X_async.partition_D(sX)
-    tXgO, tXrRstd = [thr_copy_O.partition_D(g) for g in (gO, gRstd)]
+    tXgO, tXrRstd = [thr_copy_O.partition_D(gT) for gT in (gO, gRstd)]
     tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
 
     # allocate fragments for gmem->rmem
