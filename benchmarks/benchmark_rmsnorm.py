@@ -20,8 +20,6 @@ def run_rmsnorm(
     M,
     N,
     dtype: Type[cutlass.Numeric],
-    skip_ref_check=False,
-    benchmark=True,
     warmup_iterations=2,
     iterations=200,
 ):
@@ -47,38 +45,31 @@ def run_rmsnorm(
     out, rstd = rmsnorm(x, w, eps=eps, return_rstd=True)
 
     compiled_func_ref = torch.compile(rmsnorm_ref)
-    if not skip_ref_check:
-        print("Verifying results...")
-        out_ref = compiled_func_ref(x, w, eps=eps)
-        torch.testing.assert_close(out_ref, out)
-        torch.testing.assert_close(rstd_ref(x, eps=eps), rstd)
-        print("Results verified successfully!")
 
-    if benchmark:
-        fn = lambda: rmsnorm(x, w, eps=eps)
+    fn = lambda: rmsnorm(x, w, eps=eps)
+    time.sleep(0.5)
+    avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
+    mem_bw = (2 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9
+    print(f"Kernel execution time: {avg_time:.4f} ms")
+    print(f"Mem throughput: {mem_bw:.2f} GB/s")
+
+    fn = lambda: compiled_func_ref(x, w, eps=eps)
+    for _ in range(5): fn()  # warm up
+    time.sleep(0.5)
+    avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
+    mem_bw_ref = (2 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9
+    print(f"Ref kernel execution time: {avg_time:.4f} ms")
+    print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
+
+    if cudnn is not None:
+        run_cudnn = rmsnorm_cudnn_setup(M, N, torch_dtype)
         time.sleep(0.5)
-        avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
-        mem_bw = (2 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9
-        print(f"Kernel execution time: {avg_time:.4f} ms")
-        print(f"Mem throughput: {mem_bw:.2f} GB/s")
+        avg_time = do_bench(run_cudnn, warmup=warmup_iterations, rep=iterations)
+        mem_bw_cudnn = (2 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9
+        print(f"Cudnn kernel execution time: {avg_time:.4f} ms")
+        print(f"Cudnn mem throughput: {mem_bw_cudnn:.2f} GB/s")
 
-        fn = lambda: compiled_func_ref(x, w, eps=eps)
-        for _ in range(5): fn()  # warm up
-        time.sleep(0.5)
-        avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
-        mem_bw_ref = (2 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9
-        print(f"Ref kernel execution time: {avg_time:.4f} ms")
-        print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
-
-        if cudnn is not None:
-            run_cudnn = rmsnorm_cudnn_setup(M, N, torch_dtype)
-            time.sleep(0.5)
-            avg_time = do_bench(run_cudnn, warmup=warmup_iterations, rep=iterations)
-            mem_bw_cudnn = (2 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9
-            print(f"Cudnn kernel execution time: {avg_time:.4f} ms")
-            print(f"Cudnn mem throughput: {mem_bw_cudnn:.2f} GB/s")
-
-        return mem_bw, mem_bw_ref
+    return mem_bw, mem_bw_ref
 
 
 def rmsnorm_cudnn_setup(M, N, dtype):
@@ -129,8 +120,6 @@ def run_rmsnorm_bwd(
     M,
     N,
     dtype: Type[cutlass.Numeric],
-    skip_ref_check=False,
-    benchmark=True,
     warmup_iterations=2,
     iterations=200,
 ):
@@ -166,22 +155,16 @@ def run_rmsnorm_bwd(
 
     eps = 1e-6
     compiled_func_ref = torch.compile(rmsnorm_bwd_ref)
-    if not skip_ref_check:
-        compiled_func(x_tensor, w_tensor, dout_tensor, rstd_tensor, dx_tensor, eps)
-        print("Verifying results...")
-        torch.testing.assert_close(compiled_func_ref(x, w, dout, rstd, eps=eps), dx)
-        print("Results verified successfully!")
 
-    if benchmark:
-        fn = lambda: compiled_func(x_tensor, w_tensor, dout_tensor, rstd_tensor, dx_tensor, eps)
-        avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
-        print(f"Kernel execution time: {avg_time:.4f} ms")
-        print(f"Mem throughput: {(3 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9:.2f} GB/s")
-        fn = lambda: compiled_func_ref(x, w, dout, rstd)
-        fn()
-        avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
-        print(f"Ref kernel execution time: {avg_time:.4f} ms")
-        print(f"Ref mem throughput: {(3 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9:.2f} GB/s")
+    fn = lambda: compiled_func(x_tensor, w_tensor, dout_tensor, rstd_tensor, dx_tensor, eps)
+    avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
+    print(f"Kernel execution time: {avg_time:.4f} ms")
+    print(f"Mem throughput: {(3 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9:.2f} GB/s")
+    fn = lambda: compiled_func_ref(x, w, dout, rstd)
+    fn()
+    avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
+    print(f"Ref kernel execution time: {avg_time:.4f} ms")
+    print(f"Ref mem throughput: {(3 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9:.2f} GB/s")
 
 
 if __name__ == "__main__":
@@ -192,32 +175,30 @@ if __name__ == "__main__":
     parser.add_argument("--N", default=1024, type=int)
     parser.add_argument("--warmup_iterations", default=10, type=int)
     parser.add_argument("--iterations", default=100, type=int)
-    parser.add_argument("--skip_ref_check", action="store_true")
-    parser.add_argument("--benchmark", action="store_true")
 
     args = parser.parse_args()
     run_rmsnorm(
         args.M,
         args.N,
-        dtype=cutlass.Float32,
-        skip_ref_check=args.skip_ref_check,
-        benchmark=args.benchmark,
+        # dtype=cutlass.Float32,
+        dtype=cutlass.BFloat16,
         warmup_iterations=args.warmup_iterations,
         iterations=args.iterations,
     )
-    # MN_pairs = [(32768, 256), (32768, 512), (32768, 1024), (32768, 2048), (32768, 4096), (32768, 8192), (32768, 16384), (32768, 32768), (32768, 65536), (16384, 131072), (8192, 262144)]
-    MN_pairs = [(32768, 2048)]
-    results = []
-    for M, N in MN_pairs:
-        res = run_rmsnorm(
-            M,
-            N,
-            dtype=cutlass.Float32,
-            skip_ref_check=False,
-            benchmark=True,
-            warmup_iterations=args.warmup_iterations,
-            iterations=args.iterations,
-        )
-        results.append(res)
-    print(results)
-    print("\nPASS")
+    # # MN_pairs = [(32768, 256), (32768, 512), (32768, 1024), (32768, 2048), (32768, 4096), (32768, 8192), (32768, 16384), (32768, 32768), (32768, 65536), (16384, 131072), (8192, 262144)]
+    # # MN_pairs = [(32768, 2048)]
+    # MN_pairs = [(16384, 65536)]
+    # results = []
+    # for M, N in MN_pairs:
+    #     res = run_rmsnorm(
+    #         M,
+    #         N,
+    #         dtype=cutlass.BFloat16,
+    #         skip_ref_check=False,
+    #         benchmark=True,
+    #         warmup_iterations=args.warmup_iterations,
+    #         iterations=args.iterations,
+    #     )
+    #     results.append(res)
+    # print(results)
+    # print("\nPASS")

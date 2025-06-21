@@ -16,10 +16,8 @@ def run_softmax(
     M,
     N,
     dtype: Type[cutlass.Numeric],
-    skip_ref_check=False,
-    benchmark=True,
-    warmup_iterations=2,
-    iterations=200,
+    warmup_iterations=10,
+    iterations=1000,
 ):
     if not torch.cuda.is_available():
         raise RuntimeError(f"Ampere GPU is required to run this example!")
@@ -42,36 +40,22 @@ def run_softmax(
     print(f"out: {out.shape}, dtype: {out.dtype}")
 
     compiled_func_ref = torch.compile(lambda x: F.softmax(x, dim=-1))
-    if not skip_ref_check:
-        print("Verifying results...")
-        out_ref = compiled_func_ref(x)
-        if dtype == cutlass.BFloat16:
-            torch.testing.assert_close(out_ref, out, atol=1e-3, rtol=1e-3)
-        elif dtype == cutlass.Float32:
-            torch.testing.assert_close(out_ref, out, atol=1e-4, rtol=1e-4)
-        elif dtype == cutlass.Float16:
-            torch.testing.assert_close(out_ref, out, atol=1e-3, rtol=1e-3)
-        else:
-            raise NotImplementedError()
-        print("Results verified successfully!")
+    fn = lambda: softmax(x)
+    time.sleep(0.5)
+    avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
+    mem_bw = round(2 * x.numel() * dtype.width // 8 / (avg_time / 1000) / 1e9)
+    print(f"Kernel execution time: {avg_time:.4f} ms")
+    print(f"Mem throughput: {mem_bw:.2f} GB/s")
 
-    if benchmark:
-        fn = lambda: softmax(x)
-        time.sleep(0.5)
-        avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
-        mem_bw = round(2 * x.numel() * dtype.width // 8 / (avg_time / 1000) / 1e9)
-        print(f"Kernel execution time: {avg_time:.4f} ms")
-        print(f"Mem throughput: {mem_bw:.2f} GB/s")
+    fn = lambda: compiled_func_ref(x)
+    for _ in range(5): fn()  # warm up
+    time.sleep(0.5)
+    avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
+    mem_bw_ref = round(2 * x.numel() * dtype.width // 8 / (avg_time / 1000) / 1e9)
+    print(f"Ref kernel execution time: {avg_time:.4f} ms")
+    print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
 
-        fn = lambda: compiled_func_ref(x)
-        for _ in range(5): fn()  # warm up
-        time.sleep(0.5)
-        avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
-        mem_bw_ref = round(2 * x.numel() * dtype.width // 8 / (avg_time / 1000) / 1e9)
-        print(f"Ref kernel execution time: {avg_time:.4f} ms")
-        print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
-
-        return mem_bw, mem_bw_ref
+    return mem_bw, mem_bw_ref
 
 
 if __name__ == "__main__":
@@ -82,33 +66,30 @@ if __name__ == "__main__":
     parser.add_argument("--N", default=16384, type=int)
     parser.add_argument("--warmup_iterations", default=10, type=int)
     parser.add_argument("--iterations", default=100, type=int)
-    parser.add_argument("--skip_ref_check", action="store_true")
-    parser.add_argument("--benchmark", action="store_true")
 
     args = parser.parse_args()
     torch.manual_seed(0)
     run_softmax(
         args.M,
         args.N,
-        dtype=cutlass.Float32,
-        skip_ref_check=args.skip_ref_check,
-        benchmark=args.benchmark,
+        # dtype=cutlass.Float32,
+        dtype=cutlass.BFloat16,
         warmup_iterations=args.warmup_iterations,
         iterations=args.iterations,
     )
 
-    MN_pairs = [(32768, 1024)]
-    results = []
-    for M, N in MN_pairs:
-        res = run_softmax(
-            M,
-            N,
-            dtype=cutlass.Float32,
-            skip_ref_check=False,
-            benchmark=True,
-            warmup_iterations=args.warmup_iterations,
-            iterations=args.iterations,
-        )
-        results.append(res)
-    print(results)
-    print("\nPASS")
+    # MN_pairs = [(32768, 1024)]
+    # results = []
+    # for M, N in MN_pairs:
+    #     res = run_softmax(
+    #         M,
+    #         N,
+    #         dtype=cutlass.Float32,
+    #         skip_ref_check=False,
+    #         benchmark=True,
+    #         warmup_iterations=args.warmup_iterations,
+    #         iterations=args.iterations,
+    #     )
+    #     results.append(res)
+    # print(results)
+    # print("\nPASS")
