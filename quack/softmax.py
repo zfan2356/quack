@@ -49,16 +49,14 @@ def softmax_kernel(
         mbar_ptr = None
 
     # declare the atoms which will be used later for memory copy
-    copy_atom_load_X = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mX.element_type, num_bits_per_copy=128)
-    copy_atom_load_X_async = cute.make_copy_atom(cute.nvgpu.cpasync.CopyG2SOp(), mX.element_type, num_bits_per_copy=128)
+    copy_atom_load_X = cute.make_copy_atom(cute.nvgpu.cpasync.CopyG2SOp(), mX.element_type, num_bits_per_copy=128)
     copy_atom_store_O = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), gO.element_type, num_bits_per_copy=128)
 
     thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
-    thr_copy_X_async = cute.make_tiled_copy(copy_atom_load_X_async, tv_layout, tiler_mn).get_slice(tidx)
     thr_copy_O = cute.make_tiled_copy(copy_atom_store_O, tv_layout, tiler_mn).get_slice(tidx)
 
-    tXgX = thr_copy_X_async.partition_S(gX)
-    tXsX = thr_copy_X_async.partition_S(sX)
+    tXgX = thr_copy_X.partition_S(gX)
+    tXsX = thr_copy_X.partition_D(sX)
     tXgO = thr_copy_O.partition_D(gO)
     tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
 
@@ -77,7 +75,7 @@ def softmax_kernel(
     is_even_N = cutlass.const_expr(shape[1] == tiler_mn[1] * cluster_n)
     tXpX = utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1]) if not is_even_N else None
     if tXcX[0][0] < shape[0]:
-        cute.copy(copy_atom_load_X_async, tXgX, tXsX, pred=tXpX)
+        cute.copy(copy_atom_load_X, tXgX, tXsX, pred=tXpX)
     cute.arch.cp_async_commit_group()
     cute.arch.cp_async_wait_group(0)
 

@@ -53,12 +53,12 @@ def test_cross_entropy_extreme_values(input_dtype):
     loss_large = cross_entropy(x_large, target)
     # Should be around log(N) since all logits are equal
     expected_large = torch.full_like(loss_large, torch.log(torch.tensor(N, dtype=torch.float32)))
-    torch.testing.assert_close(loss_large, expected_large.to(input_dtype), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(loss_large, expected_large, atol=1e-2, rtol=1e-2)
     # Test with large negative values
     x_small = torch.full((M, N), -10.0, device=device, dtype=input_dtype)
     loss_small = cross_entropy(x_small, target)
     # Should also be around log(N)
-    torch.testing.assert_close(loss_small, expected_large.to(input_dtype), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(loss_small, expected_large, atol=1e-2, rtol=1e-2)
     # Test with one-hot like scenario (one large value, rest small)
     x_onehot = torch.full((M, N), -10.0, device=device, dtype=input_dtype)
     # Set the target class to have large logit

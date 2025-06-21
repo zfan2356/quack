@@ -59,14 +59,13 @@ def rmsnorm_kernel(
     copy_atom_load_W = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mW.element_type, num_bits_per_copy=128)
     copy_atom_store_O = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mO.element_type, num_bits_per_copy=128)
 
-    thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
-    thr_copy_X_async = cute.make_tiled_copy(copy_atom_load_X_async, tv_layout, tiler_mn).get_slice(tidx)
+    thr_copy_X = cute.make_tiled_copy(copy_atom_load_X_async, tv_layout, tiler_mn).get_slice(tidx)
     thr_copy_W = cute.make_tiled_copy(copy_atom_load_W, tv_layout, tiler_mn).get_slice(tidx)
     thr_copy_O = cute.make_tiled_copy(copy_atom_store_O, tv_layout, tiler_mn).get_slice(tidx)
 
     tWgW = thr_copy_W.partition_S(gW)
-    tXgX = thr_copy_X_async.partition_S(gX)
-    tXsX = thr_copy_X_async.partition_D(sX)
+    tXgX = thr_copy_X.partition_S(gX)
+    tXsX = thr_copy_X.partition_D(sX)
     tXgO, tXrRstd = [thr_copy_O.partition_D(gT) for gT in (gO, gRstd)]
     tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
 
