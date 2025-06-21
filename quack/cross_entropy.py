@@ -1,7 +1,6 @@
 import math
 import torch
-import operator
-from typing import Callable, Union, Optional
+from typing import Optional
 
 import cuda.bindings.driver as cuda
 
@@ -15,9 +14,9 @@ import quack.utils as utils
 @cute.kernel
 def cross_entropy_kernel(
     mX: cute.Tensor,  # (M, N)
-    mTarget: cute.Tensor, # (M,)
-    mLoss: cute.Tensor, # (M,)
-    mLSE: Optional[cute.Tensor], # (M,)
+    mTarget: cute.Tensor,  # (M,)
+    mLoss: cute.Tensor,  # (M,)
+    mLSE: Optional[cute.Tensor],  # (M,)
     tv_layout: cute.Layout,
     tiler_mn: cute.Shape,
     cluster_n: cutlass.Constexpr = 1,
@@ -34,15 +33,19 @@ def cross_entropy_kernel(
     ]
 
     smem = cutlass.utils.SmemAllocator()
-    sX = smem.allocate_tensor(mX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16)
+    sX = smem.allocate_tensor(
+        mX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16
+    )
     num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
     warps_per_row = utils.max_constexpr(tv_layout.shape[0][0] // cute.arch.WARP_SIZE, 1)
     reduction_buffer_layout = cute.make_ordered_layout(
         # 2 stages: 1 for max, 1 for sum
         (num_warps // warps_per_row, (warps_per_row, cluster_n), 2),
-        order=(1, 0, 2)
+        order=(1, 0, 2),
     )
-    reduction_buffer = smem.allocate_tensor(cutlass.Float32, reduction_buffer_layout, byte_alignment=4)
+    reduction_buffer = smem.allocate_tensor(
+        cutlass.Float32, reduction_buffer_layout, byte_alignment=4
+    )
     if cutlass.const_expr(cluster_n > 1):
         # 1 mbar for max reduction, 1 mbar for sum reduction
         mbar_ptr = smem.allocate_array(cutlass.Int64, num_elems=2)
@@ -50,7 +53,9 @@ def cross_entropy_kernel(
         mbar_ptr = None
 
     # declare the atoms which will be used later for memory copy
-    copy_atom_load_X = cute.make_copy_atom(cute.nvgpu.cpasync.CopyG2SOp(), gX.element_type, num_bits_per_copy=128)
+    copy_atom_load_X = cute.make_copy_atom(
+        cute.nvgpu.cpasync.CopyG2SOp(), gX.element_type, num_bits_per_copy=128
+    )
     thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
 
     #### Thread View
@@ -64,7 +69,9 @@ def cross_entropy_kernel(
             cute.arch.mbarrier_init_arrive_cnt(mbar_ptr + tidx, 1)
         cute.arch.mbarrier_init_fence()
         if tidx < 2:
-            cute.arch.mbarrier_init_tx_bytes(mbar_ptr + tidx, num_warps * cluster_n * cutlass.Float32.width // 8)
+            cute.arch.mbarrier_init_tx_bytes(
+                mbar_ptr + tidx, num_warps * cluster_n * cutlass.Float32.width // 8
+            )
         # Cluster arrive after barrier init
         cute.arch.cluster_arrive_relaxed()
 
@@ -103,7 +110,7 @@ def cross_entropy_kernel(
         reduction_buffer[None, None, 0],
         mbar_ptr + 0 if cluster_n > 1 else None,
         init_val=-cutlass.Float32.inf,
-        hook_fn=cute.arch.cluster_wait if cutlass.const_expr(cluster_n > 1) else None
+        hook_fn=cute.arch.cluster_wait if cutlass.const_expr(cluster_n > 1) else None,
     )
     log2_e = math.log2(math.e)
     # exp_x = cute.math.exp2((x - max_x) * log2_e, fastmath=True)
@@ -117,7 +124,11 @@ def cross_entropy_kernel(
         init_val=0.0,
     )
 
-    if tXcX[0][1] == 0 and row < shape[0] and (cluster_n == 1 or cute.arch.block_idx_in_cluster() == 0):
+    if (
+        tXcX[0][1] == 0
+        and row < shape[0]
+        and (cluster_n == 1 or cute.arch.block_idx_in_cluster() == 0)
+    ):
         ln_2 = math.log(2.0)
         lse = max_x + utils.log2f(denom) * ln_2
         loss_val = lse - target_logit
@@ -134,7 +145,7 @@ def cross_entropy_interface(
     mLSE: Optional[cute.Tensor],
     stream: cuda.CUstream,
     N: cutlass.Constexpr,
-    copy_bits: cutlass.Constexpr = 128
+    copy_bits: cutlass.Constexpr = 128,
 ):
     vecsize = copy_bits // mX.element_type.width
     assert N % vecsize == 0, f"Input N {N} is not divisible by vector size {vecsize}"
@@ -142,22 +153,45 @@ def cross_entropy_interface(
 
     num_warps = num_threads // cute.arch.WARP_SIZE
     assert num_threads % cute.arch.WARP_SIZE == 0
-    threads_per_row = 8 if N <= 64 else (16 if N <= 128 else (32 if N <= 3072 else (64 if N <= 6144 else (128 if N <= 16384 else 256))))
+    threads_per_row = (
+        8
+        if N <= 64
+        else (
+            16
+            if N <= 128
+            else (32 if N <= 3072 else (64 if N <= 6144 else (128 if N <= 16384 else 256)))
+        )
+    )
 
     if cutlass.const_expr(mX.element_type.width == 16):
-        cluster_n = 1 if N <= 16 * 1024 else (2 if N <= 32 * 1024 else (4 if N <= 64 * 1024 else (8 if N <= 128 * 1024 else 16)))
+        cluster_n = (
+            1
+            if N <= 16 * 1024
+            else (
+                2 if N <= 32 * 1024 else (4 if N <= 64 * 1024 else (8 if N <= 128 * 1024 else 16))
+            )
+        )
     else:  # fp32
-        cluster_n = 1 if N <= 16 * 1024 else (2 if N <= 64 * 1024 else (4 if N <= 128 * 1024 else 8))
+        cluster_n = (
+            1 if N <= 16 * 1024 else (2 if N <= 64 * 1024 else (4 if N <= 128 * 1024 else 8))
+        )
 
     num_blocks_N = cute.ceil_div(N // vecsize, threads_per_row * cluster_n)
     cols_per_block = num_threads // threads_per_row
     tiler_mn = (cols_per_block, vecsize * num_blocks_N * threads_per_row)  # This rounds up N
     tv_layout = cute.make_layout(
         ((threads_per_row, cols_per_block), (vecsize, num_blocks_N)),
-        stride=((vecsize * cols_per_block, 1), (cols_per_block, cols_per_block * vecsize * threads_per_row))
+        stride=(
+            (vecsize * cols_per_block, 1),
+            (cols_per_block, cols_per_block * vecsize * threads_per_row),
+        ),
     )
 
-    smem_allocated = cute.size_in_bytes(mX.element_type, cute.make_layout(tiler_mn)) + 2 * num_warps * cluster_n * (cutlass.Float32.width // 8) + 2 * (cutlass.Int64.width // 8)
+    smem_allocated = (
+        cute.size_in_bytes(mX.element_type, cute.make_layout(tiler_mn))
+        + 2 * num_warps * cluster_n * (cutlass.Float32.width // 8)
+        + 2 * (cutlass.Int64.width // 8)
+    )
     cross_entropy_kernel(mX, mTarget, mLoss, mLSE, tv_layout, tiler_mn, cluster_n).launch(
         grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), cluster_n, 1],
         block=[cute.size(tv_layout, mode=[0]), 1, 1],
@@ -201,12 +235,17 @@ def cross_entropy(
     lse = torch.empty(M, device=device, dtype=torch.float32) if return_lse else None
     dtype = torch2cute_dtype_map[x.dtype]
     convert_from_dlpack = lambda tensor: (
-        from_dlpack(tensor.detach(), assumed_align=16)
-        .mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
+        from_dlpack(tensor.detach(), assumed_align=16).mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1)
+        )
     )
-    x_tensor, = [convert_from_dlpack(tensor) for tensor in (x,)]
+    x_tensor = convert_from_dlpack(x)
     loss_tensor = from_dlpack(loss.detach(), assumed_align=4).mark_compact_shape_dynamic(mode=0)
-    lse_tensor = from_dlpack(loss.detach(), assumed_align=4).mark_compact_shape_dynamic(mode=0) if lse is not None else None
+    lse_tensor = (
+        from_dlpack(loss.detach(), assumed_align=4).mark_compact_shape_dynamic(mode=0)
+        if lse is not None
+        else None
+    )
     target_tensor = from_dlpack(target.detach(), assumed_align=8).mark_compact_shape_dynamic(mode=0)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     compile_key = (dtype, N, lse_tensor is not None)
@@ -214,7 +253,9 @@ def cross_entropy(
         cross_entropy.compile_cache[compile_key] = cute.compile(
             cross_entropy_interface, x_tensor, target_tensor, loss_tensor, lse_tensor, stream, N
         )
-    cross_entropy.compile_cache[compile_key](x_tensor, target_tensor, loss_tensor, lse_tensor, stream)
+    cross_entropy.compile_cache[compile_key](
+        x_tensor, target_tensor, loss_tensor, lse_tensor, stream
+    )
     return loss if not return_lse else (loss, lse)
 
 

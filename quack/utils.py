@@ -2,13 +2,13 @@
 
 import operator
 import math
-from typing import Type, Callable, Optional
+from typing import Callable, Optional
 
 import cutlass
 import cutlass.cute as cute
 
 from cutlass.cutlass_dsl import T, dsl_user_op
-from cutlass._mlir.dialects import nvvm, llvm
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
 
 
@@ -39,7 +39,7 @@ def min_constexpr(
 def warp_reduce(
     val: cute.TensorSSA | cute.Numeric,
     op: Callable,
-    width: cutlass.Constexpr[int] = cute.arch.WARP_SIZE
+    width: cutlass.Constexpr[int] = cute.arch.WARP_SIZE,
 ) -> cute.TensorSSA | cute.Numeric:
     if isinstance(val, cute.TensorSSA):
         res = cute.make_fragment(val.shape, val.dtype)
@@ -54,9 +54,10 @@ def warp_reduce(
 
 
 @cute.jit
-def block_reduce(val: cute.Numeric, op: Callable, reduction_buffer: cute.Tensor, init_val: cute.Numeric = 0.0) -> cute.Numeric:
-    """reduction_buffer has shape (num_warps / warp_per_row, warps_per_row)
-    """
+def block_reduce(
+    val: cute.Numeric, op: Callable, reduction_buffer: cute.Tensor, init_val: cute.Numeric = 0.0
+) -> cute.Numeric:
+    """reduction_buffer has shape (num_warps / warp_per_row, warps_per_row)"""
     lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
     warps_per_row = cute.size(reduction_buffer.shape[1])
     row_idx, col_idx = warp_idx // warps_per_row, warp_idx % warps_per_row
@@ -75,9 +76,10 @@ def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cut
 
 
 @dsl_user_op
-def set_block_rank(smem_ptr: cute.Pointer, peer_cta_rank_in_cluster: cute.Int32, *, loc=None, ip=None) -> cutlass.Int32:
-    """Map the given smem pointer to the address at another CTA rank in the cluster.
-    """
+def set_block_rank(
+    smem_ptr: cute.Pointer, peer_cta_rank_in_cluster: cute.Int32, *, loc=None, ip=None
+) -> cutlass.Int32:
+    """Map the given smem pointer to the address at another CTA rank in the cluster."""
     smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
     return cutlass.Int32(
         llvm.inline_asm(
@@ -94,11 +96,20 @@ def set_block_rank(smem_ptr: cute.Pointer, peer_cta_rank_in_cluster: cute.Int32,
 
 @dsl_user_op
 def store_shared_remote(
-    val: float | cute.Float32, smem_ptr: cute.Pointer, mbar_ptr: cute.Pointer,
-    peer_cta_rank_in_cluster: cute.typing.Int, *, loc=None, ip=None
+    val: float | cute.Float32,
+    smem_ptr: cute.Pointer,
+    mbar_ptr: cute.Pointer,
+    peer_cta_rank_in_cluster: cute.typing.Int,
+    *,
+    loc=None,
+    ip=None,
 ) -> None:
-    remote_smem_ptr_i32 = set_block_rank(smem_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value()
-    remote_mbar_ptr_i32 = set_block_rank(mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value()
+    remote_smem_ptr_i32 = set_block_rank(
+        smem_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
+    ).ir_value()
+    remote_mbar_ptr_i32 = set_block_rank(
+        mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
+    ).ir_value()
     llvm.inline_asm(
         None,
         [remote_smem_ptr_i32, cute.Float32(val).ir_value(loc=loc, ip=ip), remote_mbar_ptr_i32],
@@ -111,17 +122,24 @@ def store_shared_remote(
 
 
 @cute.jit
-def cluster_reduce(val: cute.Numeric, op: Callable, reduction_buffer: cute.Tensor, mbar_ptr: cute.Pointer, init_val: cute.Numeric = 0.0) -> cute.Numeric:
-    """reduction_buffer has shape (num_warps / warps_per_row, (warps_per_row, cluster_n))
-    """
+def cluster_reduce(
+    val: cute.Numeric,
+    op: Callable,
+    reduction_buffer: cute.Tensor,
+    mbar_ptr: cute.Pointer,
+    init_val: cute.Numeric = 0.0,
+) -> cute.Numeric:
+    """reduction_buffer has shape (num_warps / warps_per_row, (warps_per_row, cluster_n))"""
     cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
     lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
     warps_per_row, cluster_n = reduction_buffer.shape[1]
     row_idx, col_idx = warp_idx // warps_per_row, warp_idx % warps_per_row
     if lane_idx < cluster_n:
         store_shared_remote(
-            val, elem_pointer(reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster))),
-            mbar_ptr, peer_cta_rank_in_cluster=lane_idx
+            val,
+            elem_pointer(reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster))),
+            mbar_ptr,
+            peer_cta_rank_in_cluster=lane_idx,
         )
     cute.arch.mbarrier_wait(mbar_ptr, phase=0)
     block_reduce_val = init_val
@@ -134,9 +152,14 @@ def cluster_reduce(val: cute.Numeric, op: Callable, reduction_buffer: cute.Tenso
 
 
 @cute.jit
-def block_or_cluster_reduce(val: cute.Numeric, op: Callable, reduction_buffer: cute.Tensor, mbar_ptr: Optional[cute.Pointer], init_val: cute.Numeric = 0.0) -> cute.Numeric:
-    """Perform either block or cluster reduction based on whether mbar_ptr is provided.
-    """
+def block_or_cluster_reduce(
+    val: cute.Numeric,
+    op: Callable,
+    reduction_buffer: cute.Tensor,
+    mbar_ptr: Optional[cute.Pointer],
+    init_val: cute.Numeric = 0.0,
+) -> cute.Numeric:
+    """Perform either block or cluster reduction based on whether mbar_ptr is provided."""
     if cutlass.const_expr(mbar_ptr is None):
         return block_reduce(val, op, reduction_buffer, init_val=init_val)
     else:
@@ -153,15 +176,16 @@ def row_reduce(
     init_val: cute.Numeric = 0.0,
     hook_fn: Optional[Callable] = None,
 ) -> cute.Numeric:
-    """reduction_buffer must have shape (num_warps / warps_per_row, (warps_per_row, cluster_n))
-    """
+    """reduction_buffer must have shape (num_warps / warps_per_row, (warps_per_row, cluster_n))"""
     if cutlass.const_expr(isinstance(x, cute.TensorSSA)):
         val = x.reduce(op, init_val=init_val, reduction_profile=0)
     else:
         val = x
     warp_op = {
         cute.ReductionOp.ADD: operator.add,
-        cute.ReductionOp.MAX: cute.arch.fmax if cutlass.const_expr(x.dtype == cute.Float32) else max,
+        cute.ReductionOp.MAX: cute.arch.fmax
+        if cutlass.const_expr(x.dtype == cute.Float32)
+        else max,
         cute.ReductionOp.MIN: min,
         cute.ReductionOp.MUL: operator.mul,
     }[op]
@@ -174,13 +198,14 @@ def row_reduce(
         hook_fn()
     if cutlass.const_expr(reduction_buffer is not None):
         warps_per_row, cluster_n = reduction_buffer.shape[1]
-        assert cluster_n == 1 or mbar_ptr is not None, "mbar_ptr must be provided for cluster reduction"
+        assert (
+            cluster_n == 1 or mbar_ptr is not None
+        ), "mbar_ptr must be provided for cluster reduction"
         if cutlass.const_expr(warps_per_row > 1 or cluster_n > 1):
             val = block_or_cluster_reduce(
                 val, warp_op, reduction_buffer, mbar_ptr, init_val=init_val
             )
     return val
-
 
 
 def exp2f(x: cute.TensorSSA | cutlass.Float32) -> cute.TensorSSA | cutlass.Float32:

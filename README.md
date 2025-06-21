@@ -26,3 +26,12 @@ pip install quack-kernels
 ```
 from quack import rmsnorm, softmax, cross_entropy
 ```
+
+## Development
+
+To set up the development environment:
+
+```bash
+pip install -e .[dev]
+pre-commit install
+```
