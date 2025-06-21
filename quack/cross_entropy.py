@@ -16,6 +16,7 @@ class CrossEntropy(ReductionBase):
     def __init__(self, dtype: Type[cutlass.Numeric], N: int):
         # 2 stages: 1 for max, 1 for sum
         super().__init__(dtype, N, stage=2)
+        self.reload_from = None if N <= 16384 else "smem"
 
     def _calculate_threads_per_row(self):
         N = self.N
@@ -43,7 +44,13 @@ class CrossEntropy(ReductionBase):
             )
         else:  # fp32
             cluster_n = (
-                1 if N <= 16 * 1024 else (2 if N <= 64 * 1024 else (4 if N <= 128 * 1024 else 8))
+                1
+                if N <= 16 * 1024
+                else (
+                    2
+                    if N <= 64 * 1024
+                    else (4 if N <= 128 * 1024 else (8 if N <= 256 * 1024 else 16))
+                )
             )
         self.cluster_n = cluster_n
 
@@ -124,17 +131,16 @@ class CrossEntropy(ReductionBase):
             cute.copy(copy_atom_load_X, tXgX, tXsX, pred=tXpX)
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
-        cute.autovec_copy(tXsX, tXrX)
-        x = tXrX.load().to(cute.Float32)
         # Fill OOB values with -inf
         if cutlass.const_expr(not is_even_N):
-            tXrX_fp32 = cute.make_fragment_like(tXrX, cutlass.Float32)
-            tXrX_fp32.store(x)
+            tXrX_inf = cute.make_fragment_like(tXrX[(None, 0), 0, 0])
+            tXrX_inf.fill(-tXrX_inf.element_type.inf)
             for rest_v in range(tXpX.shape[0]):
                 for rest_k in range(tXpX.shape[2]):
                     if not tXpX[rest_v, 0, rest_k]:
-                        tXrX_fp32[(None, rest_v), None, rest_k].fill(-cutlass.Float32.inf)
-            x = tXrX_fp32.load()
+                        cute.autovec_copy(tXrX_inf, tXsX[(None, rest_v), None, rest_k])
+        cute.autovec_copy(tXsX, tXrX)
+        x = tXrX.load().to(cute.Float32)
 
         target_logit = cute.Float32.zero
         if row < shape[0] and tXcX[0][1] == 0:
@@ -150,9 +156,15 @@ class CrossEntropy(ReductionBase):
             init_val=-cutlass.Float32.inf,
             hook_fn=cute.arch.cluster_wait if cutlass.const_expr(self.cluster_n > 1) else None,
         )
+        if cutlass.const_expr(self.reload_from == "smem"):
+            cute.autovec_copy(tXsX, tXrX)
+            x = tXrX.load().to(cute.Float32)
         log2_e = math.log2(math.e)
         # exp_x = cute.math.exp2((x - max_x) * log2_e, fastmath=True)
-        exp_x = utils.exp2f((x - max_x) * log2_e)  # a bit faster, idk why
+        # a bit faster, probably because it's calling ex2.approx.ftz instead of ex2.approx?
+        # exp_x = utils.exp2f((x - max_x) * log2_e)
+        # This would use ffma instead of fadd then fmul
+        exp_x = utils.exp2f(x * log2_e - (max_x * log2_e))
         denom = utils.row_reduce(
             exp_x,
             cute.ReductionOp.ADD,

@@ -11,7 +11,7 @@ from quack.cross_entropy import cross_entropy
 # @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize(
     "N",
-    [192, 256, 512, 760, 1024, 1128, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
+    [192, 256, 512, 760, 1024, 1128, 2048, 4096, 8192, 16384, 32768, 65536, 128256, 131072, 256128, 262144]
     # [256]
 )
 @pytest.mark.parametrize("M", [1, 77, 289])

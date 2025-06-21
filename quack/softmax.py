@@ -129,18 +129,17 @@ class Softmax(ReductionBase):
             cute.copy(copy_atom_load_X, tXgX, tXsX, pred=tXpX)
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
-
-        cute.autovec_copy(tXsX, tXrX)
-        x = tXrX.load().to(cute.Float32)
         # Fill OOB values with -inf
         if cutlass.const_expr(not is_even_N):
-            tXrX_fp32 = cute.make_fragment_like(tXrX, cutlass.Float32)
-            tXrX_fp32.store(x)
+            tXrX_inf = cute.make_fragment_like(tXrX[(None, 0), 0, 0])
+            tXrX_inf.fill(-tXrX_inf.element_type.inf)
             for rest_v in range(tXpX.shape[0]):
                 for rest_k in range(tXpX.shape[2]):
                     if not tXpX[rest_v, 0, rest_k]:
-                        tXrX_fp32[(None, rest_v), None, rest_k].fill(-cutlass.Float32.inf)
-            x = tXrX_fp32.load()
+                        cute.autovec_copy(tXrX_inf, tXsX[(None, rest_v), None, rest_k])
+
+        cute.autovec_copy(tXsX, tXrX)
+        x = tXrX.load().to(cute.Float32)
         threads_per_row = tv_layout.shape[0][0]
         max_x = utils.row_reduce(
             x,

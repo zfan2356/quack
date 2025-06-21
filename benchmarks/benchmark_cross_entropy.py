@@ -69,28 +69,32 @@ if __name__ == "__main__":
     )
     parser.add_argument("--M", default=8192, type=int)
     parser.add_argument("--N", default=16384, type=int)
+    parser.add_argument("--dtype", type=cutlass.dtype, choices=[cutlass.BFloat16, cutlass.Float16, cutlass.Float32], default=cutlass.BFloat16)
     parser.add_argument("--warmup_iterations", default=10, type=int)
     parser.add_argument("--iterations", default=100, type=int)
 
     args = parser.parse_args()
     torch.manual_seed(0)
+
     run_cross_entropy(
         args.M,
         args.N,
-        dtype=cutlass.BFloat16,
+        dtype=args.dtype,
         warmup_iterations=args.warmup_iterations,
         iterations=args.iterations,
     )
 
-    # MN_pairs = [(32768, 1024)]
+    # MN_pairs = [(32768, 256), (32768, 512), (32768, 1024), (32768, 2048), (32768, 4096), (32768, 8192), (32768, 16384), (32768, 32768), (32768, 65536), (16384, 131072), (8192, 262144)]
+    # # MN_pairs = [(32768, 1024)]
     # results = []
     # for M, N in MN_pairs:
     #     res = run_cross_entropy(
     #         M,
     #         N,
-    #         dtype=cutlass.Float32,
+    #         dtype=args.dtype,
     #         warmup_iterations=args.warmup_iterations,
     #         iterations=args.iterations,
     #     )
     #     results.append(res)
-    # print(results)
+    # # print(results)
+    # print([x for x, _ in results])
