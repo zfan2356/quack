@@ -17,10 +17,13 @@ torch2cute_dtype_map = {
 
 
 class ReductionBase:
-    def __init__(self, dtype: Type[cutlass.Numeric], N: int, stage: int):
+    def __init__(
+        self, dtype: Type[cutlass.Numeric], N: int, stage: int, reduction_dtype=cutlass.Float32
+    ):
         self.dtype = dtype
         self.N = N
         self.stage = stage
+        self.reduction_dtype = reduction_dtype
 
     def _calculate_threads_per_row(self):
         raise NotImplementedError()
@@ -52,7 +55,7 @@ class ReductionBase:
     def _smem_size_in_bytes(self, tiler_mn, num_warps):
         return (
             cute.size_in_bytes(self.dtype, cute.make_layout(tiler_mn))
-            + self.stage * num_warps * self.cluster_n * (cutlass.Float32.width // 8)
+            + self.stage * num_warps * self.cluster_n * (self.reduction_dtype.width // 8)
             + self.stage * (cutlass.Int64.width // 8)
         )
 
@@ -68,7 +71,7 @@ class ReductionBase:
         self, smem: cutlass.utils.SmemAllocator, tv_layout: cute.Layout
     ) -> Tuple[cute.Tensor, Optional[cute.Pointer]]:
         reduction_buffer = smem.allocate_tensor(
-            cutlass.Float32,
+            self.reduction_dtype,
             self._get_reduction_buffer_layout(tv_layout, self.cluster_n),
             byte_alignment=4,
         )
@@ -86,7 +89,7 @@ class ReductionBase:
             cute.arch.mbarrier_init_fence()
             if tidx < self.stage:
                 cute.arch.mbarrier_init_tx_bytes(
-                    mbar_ptr + tidx, num_warps * self.cluster_n * cutlass.Float32.width // 8
+                    mbar_ptr + tidx, num_warps * self.cluster_n * self.reduction_dtype.width // 8
                 )
             # Cluster arrive after barrier init
             cute.arch.cluster_arrive_relaxed()

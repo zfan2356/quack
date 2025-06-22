@@ -64,6 +64,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--M", default=8192, type=int)
     parser.add_argument("--N", default=16384, type=int)
+    parser.add_argument("--dtype", type=cutlass.dtype, choices=[cutlass.BFloat16, cutlass.Float16, cutlass.Float32], default=cutlass.BFloat16)
     parser.add_argument("--warmup_iterations", default=10, type=int)
     parser.add_argument("--iterations", default=100, type=int)
 
@@ -72,8 +73,7 @@ if __name__ == "__main__":
     run_softmax(
         args.M,
         args.N,
-        # dtype=cutlass.Float32,
-        dtype=cutlass.BFloat16,
+        dtype=args.dtype,
         warmup_iterations=args.warmup_iterations,
         iterations=args.iterations,
     )

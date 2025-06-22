@@ -2,13 +2,14 @@
 
 import operator
 import math
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
 
+from cutlass import Float32
 from cutlass.cutlass_dsl import T, dsl_user_op
-from cutlass._mlir.dialects import llvm
+from cutlass._mlir.dialects import llvm, vector
 from cutlass.cute.runtime import from_dlpack
 
 
@@ -96,7 +97,7 @@ def set_block_rank(
 
 @dsl_user_op
 def store_shared_remote(
-    val: float | cute.Float32,
+    val: float | Float32 | cutlass.Int64,
     smem_ptr: cute.Pointer,
     mbar_ptr: cute.Pointer,
     peer_cta_rank_in_cluster: cute.typing.Int,
@@ -110,11 +111,15 @@ def store_shared_remote(
     remote_mbar_ptr_i32 = set_block_rank(
         mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
     ).ir_value()
+    if isinstance(val, float):
+        val = Float32(val)
+    assert isinstance(val, (Float32, cutlass.Int64)), "val must be Float32 or Int64"
+    suffix = "f32" if isinstance(val, Float32) else "s64"
     llvm.inline_asm(
         None,
-        [remote_smem_ptr_i32, cute.Float32(val).ir_value(loc=loc, ip=ip), remote_mbar_ptr_i32],
-        "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [$0], $1, [$2];",
-        "r,f,r",
+        [remote_smem_ptr_i32, val.ir_value(loc=loc, ip=ip), remote_mbar_ptr_i32],
+        f"st.async.shared::cluster.mbarrier::complete_tx::bytes.{suffix} [$0], $1, [$2];",
+        f"r,{'f' if isinstance(val, Float32) else 'l'},r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -183,9 +188,7 @@ def row_reduce(
         val = x
     warp_op = {
         cute.ReductionOp.ADD: operator.add,
-        cute.ReductionOp.MAX: cute.arch.fmax
-        if cutlass.const_expr(x.dtype == cute.Float32)
-        else max,
+        cute.ReductionOp.MAX: cute.arch.fmax if cutlass.const_expr(x.dtype == Float32) else max,
         cute.ReductionOp.MIN: min,
         cute.ReductionOp.MUL: operator.mul,
     }[op]
@@ -216,11 +219,11 @@ def online_softmax_reduce(
     mbar_ptr: Optional[cute.Pointer] = None,
     hook_fn: Optional[Callable] = None,
     return_exp_x: bool = False,
-) -> [cute.Float32, cute.Float32, Optional[cute.TensorSSA]]:
-    assert x.dtype == cute.Float32, "x must be of type cute.Float32"
+) -> [Float32, Float32, Optional[cute.TensorSSA]]:
+    assert x.dtype == Float32, "x must be of type Float32"
     """reduction_buffer must have shape (num_warps / warps_per_row, (warps_per_row, cluster_n), 2)"""
     max_x = warp_reduce(
-        x.reduce(cute.ReductionOp.MAX, init_val=-cutlass.Float32.inf, reduction_profile=0),
+        x.reduce(cute.ReductionOp.MAX, init_val=-Float32.inf, reduction_profile=0),
         cute.arch.fmax,
         width=min_constexpr(threads_per_row, cute.arch.WARP_SIZE),
     )
@@ -241,20 +244,18 @@ def online_softmax_reduce(
         ), "mbar_ptr must be provided for cluster reduction"
         if cutlass.const_expr(warps_per_row > 1 or cluster_n > 1):
             assert (
-                reduction_buffer.shape[2] == 2
-            ), "reduction_buffer must have shape (num_warps / warps_per_row, (warps_per_row, cluster_n), 2)"
+                reduction_buffer.element_type == cutlass.Int64
+            ), "reduction_buffer must be of type cute.Int64"
             lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
             row_idx, col_idx = warp_idx // warps_per_row, warp_idx % warps_per_row
             if cutlass.const_expr(mbar_ptr is None):
                 if lane_idx == 0:
-                    reduction_buffer[row_idx, col_idx, 0] = max_x
-                    reduction_buffer[row_idx, col_idx, 1] = sum_exp_x
+                    reduction_buffer[row_idx, col_idx] = f32x2_to_i64(max_x, sum_exp_x)
                 cute.arch.barrier()
-                max_x_single_warp = -cutlass.Float32.inf
+                max_x_single_warp = -Float32.inf
                 sum_exp_x = 0.0
                 if lane_idx < warps_per_row:
-                    max_x_single_warp = reduction_buffer[row_idx, lane_idx, 0]
-                    sum_exp_x = reduction_buffer[row_idx, lane_idx, 1]
+                    max_x_single_warp, sum_exp_x = i64_to_f32x2(reduction_buffer[row_idx, lane_idx])
                 max_x_final = warp_reduce(max_x_single_warp, cute.arch.fmax)
                 sum_exp_x *= exp2f((max_x_single_warp - max_x_final) * log2_e)
                 sum_exp_x = warp_reduce(sum_exp_x, operator.add)
@@ -265,43 +266,32 @@ def online_softmax_reduce(
                 cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
                 if lane_idx < cluster_n:
                     store_shared_remote(
-                        max_x,
-                        elem_pointer(
-                            reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster), 0)
-                        ),
+                        f32x2_to_i64(max_x, sum_exp_x),
+                        elem_pointer(reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster))),
                         mbar_ptr,
-                        peer_cta_rank_in_cluster=lane_idx,
-                    )
-                    store_shared_remote(
-                        sum_exp_x,
-                        elem_pointer(
-                            reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster), 1)
-                        ),
-                        mbar_ptr + 1,  # TODO: use the same mbar
                         peer_cta_rank_in_cluster=lane_idx,
                     )
                 cute.arch.mbarrier_wait(mbar_ptr, phase=0)
                 num_iter = cute.ceil_div(warps_per_row * cluster_n, cute.arch.WARP_SIZE)
-                max_x_single_warp = cute.make_fragment(num_iter, cute.Float32)
-                max_x_single_warp.fill(-cutlass.Float32.inf)
+                max_x_single_warp = cute.make_fragment(num_iter, Float32)
+                max_x_single_warp.fill(-Float32.inf)
+                sum_exp_x_single_warp = cute.make_fragment(num_iter, Float32)
+                sum_exp_x_single_warp.fill(0.0)
                 for i in cutlass.range_constexpr(num_iter):
                     idx = lane_idx + i * cute.arch.WARP_SIZE
                     if idx < cute.size(reduction_buffer, mode=[1]):
-                        max_x_single_warp[i] = reduction_buffer[row_idx, idx, 0]
+                        max_x_single_warp[i], sum_exp_x_single_warp[i] = i64_to_f32x2(
+                            reduction_buffer[row_idx, idx]
+                        )
                 max_x_final = max_x_single_warp.load().reduce(
-                    cute.ReductionOp.MAX, init_val=-cutlass.Float32.inf, reduction_profile=0
+                    cute.ReductionOp.MAX, init_val=-Float32.inf, reduction_profile=0
                 )
                 max_x_final = warp_reduce(max_x_final, cute.arch.fmax)
-                cute.arch.mbarrier_wait(mbar_ptr + 1, phase=0)
                 sum_exp_x = 0.0
                 for i in cutlass.range_constexpr(num_iter):
-                    idx = lane_idx + i * cute.arch.WARP_SIZE
-                    if idx < cute.size(reduction_buffer, mode=[1]):
-                        sum_exp_x_single_warp = reduction_buffer[row_idx, idx, 1]
-                        sum_exp_x_single_warp *= exp2f(
-                            (max_x_single_warp[i] - max_x_final) * log2_e
-                        )
-                        sum_exp_x += sum_exp_x_single_warp
+                    sum_exp_x += sum_exp_x_single_warp[i] * exp2f(
+                        (max_x_single_warp[i] - max_x_final) * log2_e
+                    )
                 sum_exp_x = warp_reduce(sum_exp_x, operator.add)
                 if cutlass.const_expr(return_exp_x):
                     exp_x *= exp2f((max_x - max_x_final) * log2_e)
@@ -309,16 +299,16 @@ def online_softmax_reduce(
     return max_x, sum_exp_x, (exp_x if cutlass.const_expr(return_exp_x) else None)
 
 
-def exp2f(x: cute.TensorSSA | cutlass.Float32) -> cute.TensorSSA | cutlass.Float32:
+def exp2f(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
     """exp2f calculation for both vector and scalar.
 
     :param x: input value
-    :type x: cute.TensorSSA or cutlass.Float32
+    :type x: cute.TensorSSA or Float32
     :return: exp2 value
-    :rtype: cute.TensorSSA or cutlass.Float32
+    :rtype: cute.TensorSSA or Float32
     """
     if isinstance(x, cute.TensorSSA):
-        res = cute.make_fragment(x.shape, cutlass.Float32)
+        res = cute.make_fragment(x.shape, Float32)
         res.store(x)
         for i in range(cute.size(x.shape)):
             res[i] = cute.arch.exp2(res[i])
@@ -328,11 +318,11 @@ def exp2f(x: cute.TensorSSA | cutlass.Float32) -> cute.TensorSSA | cutlass.Float
 
 
 @dsl_user_op
-def log2f(a: float | cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
-    return cutlass.Float32(
+def log2f(a: float | Float32, *, loc=None, ip=None) -> Float32:
+    return Float32(
         llvm.inline_asm(
             T.f32(),
-            [cutlass.Float32(a).ir_value(loc=loc, ip=ip)],
+            [Float32(a).ir_value(loc=loc, ip=ip)],
             "lg2.approx.ftz.f32 $0, $1;",
             "=f,f",
             has_side_effects=False,
@@ -343,11 +333,11 @@ def log2f(a: float | cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
 
 
 @dsl_user_op
-def rsqrt(a: float | cute.Float32, *, loc=None, ip=None) -> cute.Float32:
-    return cute.Float32(
+def rsqrt(a: float | Float32, *, loc=None, ip=None) -> Float32:
+    return Float32(
         llvm.inline_asm(
             T.f32(),
-            [cute.Float32(a).ir_value(loc=loc, ip=ip)],
+            [Float32(a).ir_value(loc=loc, ip=ip)],
             "rsqrt.approx.ftz.f32 $0, $1;",
             "=f,f",
             has_side_effects=False,
@@ -370,3 +360,28 @@ def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
         for rest_k in range(tApA.shape[2]):
             tApA[rest_v, 0, rest_k] = cute.elem_less(tAcA[(0, rest_v), 0, rest_k][1], limit)
     return tApA
+
+
+@dsl_user_op
+def f32x2_to_i64(a: Float32, b: Float32, *, loc=None, ip=None) -> cutlass.Int64:
+    vec_f32x2 = vector.from_elements(
+        T.vector(2, T.f32()), (a.ir_value(), b.ir_value()), loc=loc, ip=ip
+    )
+    vec_i64x1 = vector.bitcast(T.vector(1, T.i64()), vec_f32x2)
+    res = cutlass.Int64(
+        vector.extract(vec_i64x1, dynamic_position=[], static_position=[0], loc=loc, ip=ip)
+    )
+    return res
+
+
+@dsl_user_op
+def i64_to_f32x2(c: cutlass.Int64, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
+    vec_i64x1 = vector.from_elements(T.vector(1, T.i64()), (c.ir_value(),), loc=loc, ip=ip)
+    vec_f32x2 = vector.bitcast(T.vector(2, T.f32()), vec_i64x1)
+    res0 = Float32(
+        vector.extract(vec_f32x2, dynamic_position=[], static_position=[0], loc=loc, ip=ip)
+    )
+    res1 = Float32(
+        vector.extract(vec_f32x2, dynamic_position=[], static_position=[1], loc=loc, ip=ip)
+    )
+    return res0, res1

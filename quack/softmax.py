@@ -15,7 +15,12 @@ from quack.reduction_base import ReductionBase, torch2cute_dtype_map
 class Softmax(ReductionBase):
     def __init__(self, dtype: Type[cutlass.Numeric], N: int, online_softmax: bool = True):
         # 2 stages: 1 for max, 1 for sum
-        super().__init__(dtype, N, stage=2)
+        super().__init__(
+            dtype,
+            N,
+            stage=2 if not online_softmax else 1,
+            reduction_dtype=cutlass.Float32 if not online_softmax else cutlass.Int64,
+        )
         self.online_softmax = online_softmax
 
     def _calculate_threads_per_row(self):
@@ -166,7 +171,7 @@ class Softmax(ReductionBase):
             max_x, denom, exp_x = utils.online_softmax_reduce(
                 x,
                 threads_per_row,
-                reduction_buffer,
+                reduction_buffer[None, None, 0],
                 mbar_ptr,
                 hook_fn=cute.arch.cluster_wait if cutlass.const_expr(self.cluster_n > 1) else None,
                 return_exp_x=True,
