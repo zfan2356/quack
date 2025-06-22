@@ -13,9 +13,10 @@ from quack.reduction_base import ReductionBase, torch2cute_dtype_map
 
 
 class Softmax(ReductionBase):
-    def __init__(self, dtype: Type[cutlass.Numeric], N: int):
+    def __init__(self, dtype: Type[cutlass.Numeric], N: int, online_softmax: bool = True):
         # 2 stages: 1 for max, 1 for sum
         super().__init__(dtype, N, stage=2)
+        self.online_softmax = online_softmax
 
     def _calculate_threads_per_row(self):
         N = self.N
@@ -141,25 +142,35 @@ class Softmax(ReductionBase):
         cute.autovec_copy(tXsX, tXrX)
         x = tXrX.load().to(cute.Float32)
         threads_per_row = tv_layout.shape[0][0]
-        max_x = utils.row_reduce(
-            x,
-            cute.ReductionOp.MAX,
-            threads_per_row,
-            reduction_buffer[None, None, 0],
-            mbar_ptr + 0 if self.cluster_n > 1 else None,
-            init_val=-cutlass.Float32.inf,
-            hook_fn=cute.arch.cluster_wait if cutlass.const_expr(self.cluster_n > 1) else None,
-        )
-        log2_e = math.log2(math.e)
-        exp_x = cute.math.exp2((x - max_x) * log2_e, fastmath=True)
-        denom = utils.row_reduce(
-            exp_x,
-            cute.ReductionOp.ADD,
-            threads_per_row,
-            reduction_buffer[None, None, 1],
-            mbar_ptr + 1 if self.cluster_n > 1 else None,
-            init_val=0.0,
-        )
+        if cutlass.const_expr(not self.online_softmax):
+            max_x = utils.row_reduce(
+                x,
+                cute.ReductionOp.MAX,
+                threads_per_row,
+                reduction_buffer[None, None, 0],
+                mbar_ptr + 0 if self.cluster_n > 1 else None,
+                init_val=-cutlass.Float32.inf,
+                hook_fn=cute.arch.cluster_wait if cutlass.const_expr(self.cluster_n > 1) else None,
+            )
+            log2_e = math.log2(math.e)
+            exp_x = cute.math.exp2((x - max_x) * log2_e, fastmath=True)
+            denom = utils.row_reduce(
+                exp_x,
+                cute.ReductionOp.ADD,
+                threads_per_row,
+                reduction_buffer[None, None, 1],
+                mbar_ptr + 1 if self.cluster_n > 1 else None,
+                init_val=0.0,
+            )
+        else:
+            max_x, denom, exp_x = utils.online_softmax_reduce(
+                x,
+                threads_per_row,
+                reduction_buffer,
+                mbar_ptr,
+                hook_fn=cute.arch.cluster_wait if cutlass.const_expr(self.cluster_n > 1) else None,
+                return_exp_x=True,
+            )
         y = exp_x * (1.0 / denom)
         tXrO.store(y.to(tXrO.element_type))
         tOpO = (

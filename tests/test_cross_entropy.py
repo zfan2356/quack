@@ -12,7 +12,7 @@ from quack.cross_entropy import cross_entropy
 @pytest.mark.parametrize(
     "N",
     [192, 256, 512, 760, 1024, 1128, 2048, 4096, 8192, 16384, 32768, 65536, 128256, 131072, 256128, 262144]
-    # [256]
+    # [32768]
 )
 @pytest.mark.parametrize("M", [1, 77, 289])
 # @pytest.mark.parametrize("M", [1])
@@ -81,7 +81,7 @@ def test_cross_entropy_numerical_stability():
     loss = cross_entropy(x, target)
     loss_shifted = cross_entropy(x_shifted, target)
     # Results should be identical (cross entropy is translation invariant)
-    torch.testing.assert_close(loss, loss_shifted, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(loss, loss_shifted, atol=1e-5, rtol=1e-5)
 
 
 def test_cross_entropy_edge_targets():

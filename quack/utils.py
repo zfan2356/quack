@@ -208,6 +208,107 @@ def row_reduce(
     return val
 
 
+@cute.jit
+def online_softmax_reduce(
+    x: cute.TensorSSA,
+    threads_per_row: cutlass.Constexpr[int],
+    reduction_buffer: Optional[cute.Tensor] = None,
+    mbar_ptr: Optional[cute.Pointer] = None,
+    hook_fn: Optional[Callable] = None,
+    return_exp_x: bool = False,
+) -> [cute.Float32, cute.Float32, Optional[cute.TensorSSA]]:
+    assert x.dtype == cute.Float32, "x must be of type cute.Float32"
+    """reduction_buffer must have shape (num_warps / warps_per_row, (warps_per_row, cluster_n), 2)"""
+    max_x = warp_reduce(
+        x.reduce(cute.ReductionOp.MAX, init_val=-cutlass.Float32.inf, reduction_profile=0),
+        cute.arch.fmax,
+        width=min_constexpr(threads_per_row, cute.arch.WARP_SIZE),
+    )
+    log2_e = math.log2(math.e)
+    exp_x = exp2f(x * log2_e - (max_x * log2_e))
+    # exp_x = exp2f((x - max_x) * log2_e)
+    sum_exp_x = warp_reduce(
+        exp_x.reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0),
+        operator.add,
+        width=min_constexpr(threads_per_row, cute.arch.WARP_SIZE),
+    )
+    if cutlass.const_expr(hook_fn is not None):
+        hook_fn()
+    if cutlass.const_expr(reduction_buffer is not None):
+        warps_per_row, cluster_n = reduction_buffer.shape[1]
+        assert (
+            cluster_n == 1 or mbar_ptr is not None
+        ), "mbar_ptr must be provided for cluster reduction"
+        if cutlass.const_expr(warps_per_row > 1 or cluster_n > 1):
+            assert (
+                reduction_buffer.shape[2] == 2
+            ), "reduction_buffer must have shape (num_warps / warps_per_row, (warps_per_row, cluster_n), 2)"
+            lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
+            row_idx, col_idx = warp_idx // warps_per_row, warp_idx % warps_per_row
+            if cutlass.const_expr(mbar_ptr is None):
+                if lane_idx == 0:
+                    reduction_buffer[row_idx, col_idx, 0] = max_x
+                    reduction_buffer[row_idx, col_idx, 1] = sum_exp_x
+                cute.arch.barrier()
+                max_x_single_warp = -cutlass.Float32.inf
+                sum_exp_x = 0.0
+                if lane_idx < warps_per_row:
+                    max_x_single_warp = reduction_buffer[row_idx, lane_idx, 0]
+                    sum_exp_x = reduction_buffer[row_idx, lane_idx, 1]
+                max_x_final = warp_reduce(max_x_single_warp, cute.arch.fmax)
+                sum_exp_x *= exp2f((max_x_single_warp - max_x_final) * log2_e)
+                sum_exp_x = warp_reduce(sum_exp_x, operator.add)
+                if cutlass.const_expr(return_exp_x):
+                    exp_x *= exp2f((max_x - max_x_final) * log2_e)
+                max_x = max_x_final
+            else:
+                cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
+                if lane_idx < cluster_n:
+                    store_shared_remote(
+                        max_x,
+                        elem_pointer(
+                            reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster), 0)
+                        ),
+                        mbar_ptr,
+                        peer_cta_rank_in_cluster=lane_idx,
+                    )
+                    store_shared_remote(
+                        sum_exp_x,
+                        elem_pointer(
+                            reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster), 1)
+                        ),
+                        mbar_ptr + 1,  # TODO: use the same mbar
+                        peer_cta_rank_in_cluster=lane_idx,
+                    )
+                cute.arch.mbarrier_wait(mbar_ptr, phase=0)
+                num_iter = cute.ceil_div(warps_per_row * cluster_n, cute.arch.WARP_SIZE)
+                max_x_single_warp = cute.make_fragment(num_iter, cute.Float32)
+                max_x_single_warp.fill(-cutlass.Float32.inf)
+                for i in cutlass.range_constexpr(num_iter):
+                    idx = lane_idx + i * cute.arch.WARP_SIZE
+                    if idx < cute.size(reduction_buffer, mode=[1]):
+                        max_x_single_warp[i] = reduction_buffer[row_idx, idx, 0]
+                max_x_final = max_x_single_warp.load().reduce(
+                    cute.ReductionOp.MAX, init_val=-cutlass.Float32.inf, reduction_profile=0
+                )
+                max_x_final = warp_reduce(max_x_final, cute.arch.fmax)
+                cute.arch.mbarrier_wait(mbar_ptr + 1, phase=0)
+                sum_exp_x = 0.0
+                for i in cutlass.range_constexpr(num_iter):
+                    idx = lane_idx + i * cute.arch.WARP_SIZE
+                    if idx < cute.size(reduction_buffer, mode=[1]):
+                        sum_exp_x_single_warp = reduction_buffer[row_idx, idx, 1]
+                        sum_exp_x_single_warp *= exp2f(
+                            (max_x_single_warp[i] - max_x_final) * log2_e
+                        )
+                        sum_exp_x += sum_exp_x_single_warp
+                sum_exp_x = warp_reduce(sum_exp_x, operator.add)
+                if cutlass.const_expr(return_exp_x):
+                    exp_x *= exp2f((max_x - max_x_final) * log2_e)
+                max_x = max_x_final
+    return max_x, sum_exp_x, (exp_x if cutlass.const_expr(return_exp_x) else None)
+
+
 def exp2f(x: cute.TensorSSA | cutlass.Float32) -> cute.TensorSSA | cutlass.Float32:
     """exp2f calculation for both vector and scalar.
 
