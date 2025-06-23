@@ -362,6 +362,23 @@ def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
     return tApA
 
 
+@cute.jit
+def fill_oob(tXsX: cute.Tensor, tXpX: cute.Tensor, fill_value: cute.Numeric) -> None:
+    """Fill out-of-bounds values in shared memory tensor.
+
+    Args:
+        tXsX: Shared memory tensor to fill
+        tXpX: Predicate tensor indicating valid elements
+        fill_value: Value to fill OOB locations with
+    """
+    tXrX_fill = cute.make_fragment_like(tXsX[(None, 0), 0, 0])
+    tXrX_fill.fill(fill_value)
+    for rest_v in range(tXpX.shape[0]):
+        for rest_k in range(tXpX.shape[2]):
+            if not tXpX[rest_v, 0, rest_k]:
+                cute.autovec_copy(tXrX_fill, tXsX[(None, rest_v), None, rest_k])
+
+
 @dsl_user_op
 def f32x2_to_i64(a: Float32, b: Float32, *, loc=None, ip=None) -> cutlass.Int64:
     vec_f32x2 = vector.from_elements(

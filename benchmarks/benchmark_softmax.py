@@ -32,13 +32,7 @@ def run_softmax(
 
     print(f"Input tensor shapes:")
     print(f"x: {x.shape}, dtype: {x.dtype}")
-
-    print("Executing kernel...")
     out = softmax(x)
-
-    print(f"Output tensor shapes:")
-    print(f"out: {out.shape}, dtype: {out.dtype}")
-
     compiled_func_ref = torch.compile(lambda x: F.softmax(x, dim=-1))
     fn = lambda: softmax(x)
     time.sleep(0.5)
@@ -70,6 +64,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     torch.manual_seed(0)
+
     run_softmax(
         args.M,
         args.N,
@@ -78,18 +73,17 @@ if __name__ == "__main__":
         iterations=args.iterations,
     )
 
-    # MN_pairs = [(32768, 1024)]
+    # MN_pairs = [(32768, 256), (32768, 512), (32768, 1024), (32768, 2048), (32768, 4096), (32768, 8192), (32768, 16384), (32768, 32768), (32768, 65536), (16384, 131072), (8192, 262144)]
+    # # MN_pairs = [(32768, 1024)]
     # results = []
     # for M, N in MN_pairs:
     #     res = run_softmax(
     #         M,
     #         N,
-    #         dtype=cutlass.Float32,
-    #         skip_ref_check=False,
-    #         benchmark=True,
+    #         dtype=args.dtype,
     #         warmup_iterations=args.warmup_iterations,
     #         iterations=args.iterations,
     #     )
     #     results.append(res)
-    # print(results)
-    # print("\nPASS")
+    # # print(results)
+    # print([x for x, _ in results])

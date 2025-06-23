@@ -31,15 +31,7 @@ def run_cross_entropy(
     x = 0.1 * torch.randn(M, N, device=device, dtype=torch_dtype)
     target = torch.randint(0, N, (M,), device=device, dtype=torch.int64)
 
-    print(f"Input tensor shapes:")
-    print(f"x: {x.shape}, dtype: {x.dtype}")
-    print(f"target: {target.shape}, dtype: {target.dtype}")
-
-    print("Executing kernel...")
     loss = cross_entropy(x, target)
-
-    print(f"Output tensor shapes:")
-    print(f"loss: {loss.shape}, dtype: {loss.dtype}")
 
     compiled_func_ref = torch.compile(lambda x, target: F.cross_entropy(x, target, reduction='none'))
 

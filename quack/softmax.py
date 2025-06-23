@@ -137,12 +137,7 @@ class Softmax(ReductionBase):
         cute.arch.cp_async_wait_group(0)
         # Fill OOB values with -inf
         if cutlass.const_expr(not is_even_N):
-            tXrX_inf = cute.make_fragment_like(tXrX[(None, 0), 0, 0])
-            tXrX_inf.fill(-tXrX_inf.element_type.inf)
-            for rest_v in range(tXpX.shape[0]):
-                for rest_k in range(tXpX.shape[2]):
-                    if not tXpX[rest_v, 0, rest_k]:
-                        cute.autovec_copy(tXrX_inf, tXsX[(None, rest_v), None, rest_k])
+            utils.fill_oob(tXsX, tXpX, -tXsX.element_type.inf)
 
         cute.autovec_copy(tXsX, tXrX)
         x = tXrX.load().to(cute.Float32)
