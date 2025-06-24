@@ -17,7 +17,7 @@ pip install quack-kernels
 ## Kernels 🐥
 
 - 🦆 RMSNorm forward
-- 🦆 Softmax forward
+- 🦆 Softmax forward and backward
 - 🦆 Cross entropy forward
 
 

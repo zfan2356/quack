@@ -9,7 +9,7 @@ from triton.testing import do_bench
 import cutlass
 import cutlass.torch as cutlass_torch
 
-from quack.softmax import softmax, softmax_backward
+from quack.softmax import softmax
 
 
 def run_softmax(
@@ -69,42 +69,31 @@ def run_softmax_backward(
 
     device = "cuda"
     x = 0.1 * torch.randn(M, N, device=device, dtype=torch_dtype, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_()
 
     print(f"Input tensor shapes:")
     print(f"x: {x.shape}, dtype: {x.dtype}")
 
-    # Generate softmax output and upstream gradients
-    y = F.softmax(x, dim=-1).detach()
+    y = softmax(x)
     dy = torch.randn_like(y)
 
-    # Test our implementation
-    dx = softmax_backward(dy, y)
+    # Reference implementation
+    y_ref = F.softmax(x_ref, dim=-1)
 
-    # Reference implementation using autograd
-    def ref_softmax_backward(dy, y):
-        # Recreate input with gradients for autograd
-        x_temp = torch.randn_like(y, requires_grad=True)
-        y_temp = F.softmax(x_temp, dim=-1)
-        y_temp.backward(dy, retain_graph=True)
-        return x_temp.grad
+    compiled_func_ref = torch.compile(lambda: torch.autograd.grad(y_ref, x_ref, grad_outputs=dy, retain_graph=True))
 
-    compiled_func_ref = torch.compile(ref_softmax_backward)
-
-    # Benchmark our implementation
-    fn = lambda: softmax_backward(dy, y)
     time.sleep(0.5)
+    fn = lambda: torch.autograd.grad(y, x, grad_outputs=dy, retain_graph=True)
     avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
-    # Memory: read dy and y, write dx (3 tensors total)
-    mem_bw = round(3 * y.numel() * dtype.width // 8 / (avg_time / 1000) / 1e9)
+    # Memory: read dy and y, write ax backward
+    mem_bw = round(3 * x.numel() * dtype.width // 8 / (avg_time / 1000) / 1e9)
     print(f"Kernel execution time: {avg_time:.4f} ms")
     print(f"Mem throughput: {mem_bw:.2f} GB/s")
 
-    # Benchmark reference implementation
-    fn_ref = lambda: ref_softmax_backward(dy, y)
-    for _ in range(5): fn_ref()  # warm up
+    for _ in range(5): compiled_func_ref()  # warm up
     time.sleep(0.5)
-    avg_time_ref = do_bench(fn_ref, warmup=warmup_iterations, rep=iterations)
-    mem_bw_ref = round(3 * y.numel() * dtype.width // 8 / (avg_time_ref / 1000) / 1e9)
+    avg_time_ref = do_bench(compiled_func_ref, warmup=warmup_iterations, rep=iterations)
+    mem_bw_ref = round(3 * x.numel() * dtype.width // 8 / (avg_time_ref / 1000) / 1e9)
     print(f"Ref kernel execution time: {avg_time_ref:.4f} ms")
     print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
 
