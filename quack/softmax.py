@@ -211,3 +211,208 @@ def softmax(x: torch.Tensor) -> torch.Tensor:
 
 
 softmax.compile_cache = {}
+
+
+class SoftmaxBackward(ReductionBase):
+    def __init__(self, dtype: Type[cutlass.Numeric], N: int):
+        # 1 stage for computing dot product
+        super().__init__(dtype, N, stage=1, reduction_dtype=cutlass.Float32)
+
+    def _calculate_threads_per_row(self):
+        N = self.N
+        return (
+            8
+            if N <= 64
+            else (
+                16
+                if N <= 128
+                else (32 if N <= 3072 else (64 if N <= 6144 else (128 if N <= 16384 else 256)))
+            )
+        )
+
+    def _set_cluster_n(self):
+        N = self.N
+        if cutlass.const_expr(self.dtype.width == 16):
+            cluster_n = (
+                1
+                if N <= 16 * 1024
+                else (
+                    2
+                    if N <= 32 * 1024
+                    else (4 if N <= 64 * 1024 else (8 if N <= 128 * 1024 else 16))
+                )
+            )
+        else:  # fp32
+            cluster_n = (
+                1
+                if N <= 32 * 1024
+                else (
+                    2
+                    if N <= 64 * 1024
+                    else (4 if N <= 128 * 1024 else (8 if N <= 256 * 1024 else 16))
+                )
+            )
+        self.cluster_n = cluster_n
+
+    @cute.jit
+    def __call__(
+        self,
+        mDY: cute.Tensor,
+        mY: cute.Tensor,
+        mDX: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        assert mDY.element_type == self.dtype
+        assert mY.element_type == self.dtype
+        assert mDX.element_type == self.dtype
+        self._set_cluster_n()
+        tiler_mn, tv_layout = self._get_tv_layout()
+        num_threads = cute.size(tv_layout, mode=[0])
+        num_warps = num_threads // cute.arch.WARP_SIZE
+        self.kernel(mDY, mY, mDX, tv_layout, tiler_mn).launch(
+            grid=[cute.ceil_div(mDY.shape[0], tiler_mn[0]), self.cluster_n, 1],
+            block=[num_threads, 1, 1],
+            cluster=[1, self.cluster_n, 1] if self.cluster_n > 1 else None,
+            smem=self._smem_size_in_bytes(tiler_mn, num_warps) * 2,
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mDY: cute.Tensor,
+        mY: cute.Tensor,
+        mDX: cute.Tensor,
+        tv_layout: cute.Layout,
+        tiler_mn: cute.Shape,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, cluster_y, _ = cute.arch.block_idx()
+
+        shape = mDY.shape
+        idX = cute.make_identity_tensor(shape)
+        # slice for CTAs
+        gDY, gY, gDX, cX = [
+            cute.local_tile(mT, tiler_mn, (bidx, 0 if self.cluster_n == 1 else cluster_y))
+            for mT in (mDY, mY, mDX, idX)
+        ]
+
+        smem = cutlass.utils.SmemAllocator()
+        sDY = smem.allocate_tensor(
+            mDY.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16
+        )
+        sY = smem.allocate_tensor(
+            mY.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16
+        )
+        reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
+
+        # declare the atoms which will be used later for memory copy
+        copy_atom_load = cute.make_copy_atom(
+            cute.nvgpu.cpasync.CopyG2SOp(), mDY.element_type, num_bits_per_copy=128
+        )
+        copy_atom_store = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), gDX.element_type, num_bits_per_copy=128
+        )
+
+        thr_copy_load = cute.make_tiled_copy(copy_atom_load, tv_layout, tiler_mn).get_slice(tidx)
+        thr_copy_store = cute.make_tiled_copy(copy_atom_store, tv_layout, tiler_mn).get_slice(tidx)
+
+        tDYgDY = thr_copy_load.partition_S(gDY)
+        tDYsDY = thr_copy_load.partition_D(sDY)
+        tYgY = thr_copy_load.partition_S(gY)
+        tYsY = thr_copy_load.partition_D(sY)
+        tDXgDX = thr_copy_store.partition_D(gDX)
+        tDXcX = thr_copy_load.partition_S(cX)[(0, None), None, None]
+
+        # allocate fragments for gmem->rmem
+        tDYrDY, tYrY, tDXrDX = [cute.make_fragment_like(thr) for thr in (tDYgDY, tYgY, tDXgDX)]
+
+        num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
+        self._initialize_cluster(tidx, mbar_ptr, num_warps)
+
+        is_even_N = cutlass.const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
+        tDYpDY = (
+            utils.predicate_k(thr_copy_load.partition_S(cX), limit=shape[1])
+            if not is_even_N
+            else None
+        )
+
+        if tDXcX[0][0] < shape[0]:
+            cute.copy(copy_atom_load, tDYgDY, tDYsDY, pred=tDYpDY)
+            cute.copy(copy_atom_load, tYgY, tYsY, pred=tDYpDY)
+        cute.arch.cp_async_commit_group()
+        cute.arch.cp_async_wait_group(0)
+
+        # Fill OOB values with 0 for both tensors
+        if cutlass.const_expr(not is_even_N):
+            utils.fill_oob(tDYsDY, tDYpDY, tDYsDY.element_type.zero)
+            utils.fill_oob(tYsY, tDYpDY, tYsY.element_type.zero)
+
+        cute.autovec_copy(tDYsDY, tDYrDY)
+        cute.autovec_copy(tYsY, tYrY)
+        dy = tDYrDY.load().to(cute.Float32)
+        y = tYrY.load().to(cute.Float32)
+
+        # Compute dot product: dot = Σⱼ dy_j × y_j
+        dot_product = dy * y
+        threads_per_row = tv_layout.shape[0][0]
+        dot = utils.row_reduce(
+            dot_product,
+            cute.ReductionOp.ADD,
+            threads_per_row,
+            reduction_buffer[None, None, 0],
+            mbar_ptr if self.cluster_n > 1 else None,
+            init_val=0.0,
+            hook_fn=cute.arch.cluster_wait if cutlass.const_expr(self.cluster_n > 1) else None,
+        )
+
+        # Compute gradient: dx_i = y_i × (dy_i - dot)
+        dx = y * (dy - dot)
+        tDXrDX.store(dx.to(tDXrDX.element_type))
+
+        tDXpDX = (
+            utils.predicate_k(thr_copy_store.partition_S(cX), limit=shape[1])
+            if not is_even_N
+            else None
+        )
+        if tDXcX[0][0] < shape[0]:
+            cute.copy(copy_atom_store, tDXrDX, tDXgDX, pred=tDXpDX)
+
+
+def softmax_backward(dy: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Softmax backward pass.
+    Args:
+        dy: Upstream gradients tensor of shape (M, N)
+        y: Softmax output tensor of shape (M, N)
+    Returns:
+        Input gradients tensor of same shape as dy and y
+    """
+    assert dy.dim() == 2, "dy must be 2D"
+    assert y.dim() == 2, "y must be 2D"
+    assert dy.shape == y.shape, "dy and y must have same shape"
+    assert dy.is_cuda and y.is_cuda, "Tensors must be on CUDA device"
+    assert dy.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
+    assert y.dtype == dy.dtype, "dy and y must have same dtype"
+
+    M, N = dy.shape
+    dx = torch.empty_like(dy)
+    dtype = torch2cute_dtype_map[dy.dtype]
+    convert_from_dlpack = lambda tensor: (
+        from_dlpack(tensor.detach(), assumed_align=16).mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1)
+        )
+    )
+    dy_tensor, y_tensor, dx_tensor = [convert_from_dlpack(tensor) for tensor in (dy, y, dx)]
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    compile_key = (dtype, N)
+    if compile_key not in softmax_backward.compile_cache:
+        softmax_backward_op = SoftmaxBackward(dtype, N)
+        softmax_backward.compile_cache[compile_key] = cute.compile(
+            softmax_backward_op, dy_tensor, y_tensor, dx_tensor, current_stream
+        )
+    softmax_backward.compile_cache[compile_key](dy_tensor, y_tensor, dx_tensor, current_stream)
+    return dx
+
+
+softmax_backward.compile_cache = {}
