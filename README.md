@@ -32,6 +32,6 @@ from quack import rmsnorm, softmax, cross_entropy
 To set up the development environment:
 
 ```bash
-pip install -e .[dev]
+pip install -e '.[dev]'
 pre-commit install
 ```
