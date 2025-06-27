@@ -20,6 +20,10 @@ pip install quack-kernels
 - 🦆 Softmax forward and backward
 - 🦆 Cross entropy forward
 
+Upcoming:
+- 🦆 Cross entropy backward
+- 🦆 RMSNorm backward
+- 🦆 Rotary forward + backward
 
 ## Usage
 

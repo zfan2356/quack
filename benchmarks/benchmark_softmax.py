@@ -77,11 +77,6 @@ def run_softmax_backward(
     y = softmax(x)
     dy = torch.randn_like(y)
 
-    # Reference implementation
-    y_ref = F.softmax(x_ref, dim=-1)
-
-    compiled_func_ref = torch.compile(lambda: torch.autograd.grad(y_ref, x_ref, grad_outputs=dy, retain_graph=True))
-
     time.sleep(0.5)
     fn = lambda: torch.autograd.grad(y, x, grad_outputs=dy, retain_graph=True)
     avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
@@ -89,6 +84,10 @@ def run_softmax_backward(
     mem_bw = round(3 * x.numel() * dtype.width // 8 / (avg_time / 1000) / 1e9)
     print(f"Kernel execution time: {avg_time:.4f} ms")
     print(f"Mem throughput: {mem_bw:.2f} GB/s")
+
+    # Reference implementation
+    y_ref = F.softmax(x_ref, dim=-1)
+    compiled_func_ref = torch.compile(lambda: torch.autograd.grad(y_ref, x_ref, grad_outputs=dy, retain_graph=True))
 
     for _ in range(5): compiled_func_ref()  # warm up
     time.sleep(0.5)
