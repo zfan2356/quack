@@ -77,7 +77,7 @@ class CrossEntropy(ReductionBase):
         self.kernel(mX, mTarget, mLoss, mLSE, tv_layout, tiler_mn).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
             block=[num_threads, 1, 1],
-            cluster=[1, self.cluster_n, 1] if self.cluster_n > 1 else None,
+            cluster=[1, self.cluster_n, 1] if cutlass.const_expr(self.cluster_n > 1) else None,
             smem=self._smem_size_in_bytes(tiler_mn, num_warps),
             stream=stream,
         )
@@ -93,15 +93,16 @@ class CrossEntropy(ReductionBase):
         tiler_mn: cute.Shape,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, cluster_y, _ = cute.arch.block_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        if cutlass.const_expr(self.cluster_n > 1):
+            cluster_y = cute.arch.block_idx()[1]
+        else:
+            cluster_y = cutlass.const_expr(0)
 
         shape: cute.Shape = mX.shape
         idX = cute.make_identity_tensor(shape)
         # slice for CTAs
-        gX, cX = [
-            cute.local_tile(mT, tiler_mn, (bidx, 0 if self.cluster_n == 1 else cluster_y))
-            for mT in (mX, idX)
-        ]
+        gX, cX = [cute.local_tile(mT, tiler_mn, (bidx, cluster_y)) for mT in (mX, idX)]
 
         smem = cutlass.utils.SmemAllocator()
         sX = smem.allocate_tensor(
@@ -131,7 +132,9 @@ class CrossEntropy(ReductionBase):
 
         is_even_N = cutlass.const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
         tXpX = (
-            utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1]) if not is_even_N else None
+            utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
+            if cutlass.const_expr(not is_even_N)
+            else None
         )
         if row < shape[0]:
             cute.copy(copy_atom_load_X, tXgX, tXsX, pred=tXpX)
@@ -154,7 +157,7 @@ class CrossEntropy(ReductionBase):
                 cute.ReductionOp.MAX,
                 threads_per_row,
                 reduction_buffer[None, None, 0],
-                mbar_ptr + 0 if self.cluster_n > 1 else None,
+                mbar_ptr + 0 if cutlass.const_expr(self.cluster_n > 1) else None,
                 init_val=-cutlass.Float32.inf,
                 hook_fn=cute.arch.cluster_wait if cutlass.const_expr(self.cluster_n > 1) else None,
             )
@@ -172,7 +175,7 @@ class CrossEntropy(ReductionBase):
                 cute.ReductionOp.ADD,
                 threads_per_row,
                 reduction_buffer[None, None, 1],
-                mbar_ptr + 1 if self.cluster_n > 1 else None,
+                mbar_ptr + 1 if cutlass.const_expr(self.cluster_n > 1) else None,
                 init_val=0.0,
             )
         else:

@@ -37,19 +37,20 @@ def min_constexpr(
     return a if a < b else b
 
 
+@cute.jit
 def warp_reduce(
     val: cute.TensorSSA | cute.Numeric,
     op: Callable,
     width: cutlass.Constexpr[int] = cute.arch.WARP_SIZE,
 ) -> cute.TensorSSA | cute.Numeric:
-    if isinstance(val, cute.TensorSSA):
+    if cutlass.const_expr(isinstance(val, cute.TensorSSA)):
         res = cute.make_fragment(val.shape, val.dtype)
         res.store(val)
-        for i in range(cute.size(val.shape)):
+        for i in cutlass.range_constexpr(cute.size(val.shape)):
             res[i] = warp_reduce(res[i], op, width)
         return res.load()
     else:
-        for i in range(int(math.log2(width))):
+        for i in cutlass.range_constexpr(int(math.log2(width))):
             val = op(val, cute.arch.shuffle_sync_bfly(val, offset=1 << i))
     return val
 
@@ -111,15 +112,15 @@ def store_shared_remote(
     remote_mbar_ptr_i32 = set_block_rank(
         mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
     ).ir_value()
-    if isinstance(val, float):
+    if cutlass.const_expr(isinstance(val, float)):
         val = Float32(val)
     assert isinstance(val, (Float32, cutlass.Int64)), "val must be Float32 or Int64"
-    suffix = "f32" if isinstance(val, Float32) else "s64"
+    suffix = "f32" if cutlass.const_expr(isinstance(val, Float32)) else "s64"
     llvm.inline_asm(
         None,
         [remote_smem_ptr_i32, val.ir_value(loc=loc, ip=ip), remote_mbar_ptr_i32],
         f"st.async.shared::cluster.mbarrier::complete_tx::bytes.{suffix} [$0], $1, [$2];",
-        f"r,{'f' if isinstance(val, Float32) else 'l'},r",
+        f"r,{'f' if cutlass.const_expr(isinstance(val, Float32)) else 'l'},r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -299,6 +300,7 @@ def online_softmax_reduce(
     return max_x, sum_exp_x, (exp_x if cutlass.const_expr(return_exp_x) else None)
 
 
+@cute.jit
 def exp2f(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
     """exp2f calculation for both vector and scalar.
 
@@ -307,10 +309,10 @@ def exp2f(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
     :return: exp2 value
     :rtype: cute.TensorSSA or Float32
     """
-    if isinstance(x, cute.TensorSSA):
+    if cutlass.const_expr(isinstance(x, cute.TensorSSA)):
         res = cute.make_fragment(x.shape, Float32)
         res.store(x)
-        for i in range(cute.size(x.shape)):
+        for i in cutlass.range_constexpr(cute.size(x.shape)):
             res[i] = cute.arch.exp2(res[i])
         return res.load()
     else:
@@ -347,6 +349,7 @@ def rsqrt(a: float | Float32, *, loc=None, ip=None) -> Float32:
     )
 
 
+@cute.jit
 def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
     # Only compute predicates for the "k" dimension. For the mn dimension, we will use "if"
     tApA = cute.make_fragment(
@@ -356,8 +359,8 @@ def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
         ),
         cutlass.Boolean,
     )
-    for rest_v in range(tApA.shape[0]):
-        for rest_k in range(tApA.shape[2]):
+    for rest_v in cutlass.range_constexpr(tApA.shape[0]):
+        for rest_k in cutlass.range_constexpr(tApA.shape[2]):
             tApA[rest_v, 0, rest_k] = cute.elem_less(tAcA[(0, rest_v), 0, rest_k][1], limit)
     return tApA
 
@@ -373,8 +376,8 @@ def fill_oob(tXsX: cute.Tensor, tXpX: cute.Tensor, fill_value: cute.Numeric) -> 
     """
     tXrX_fill = cute.make_fragment_like(tXsX[(None, 0), 0, 0])
     tXrX_fill.fill(fill_value)
-    for rest_v in range(tXpX.shape[0]):
-        for rest_k in range(tXpX.shape[2]):
+    for rest_v in cutlass.range_constexpr(tXpX.shape[0]):
+        for rest_k in cutlass.range_constexpr(tXpX.shape[2]):
             if not tXpX[rest_v, 0, rest_k]:
                 cute.autovec_copy(tXrX_fill, tXsX[(None, rest_v), None, rest_k])
 

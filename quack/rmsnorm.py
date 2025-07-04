@@ -84,7 +84,7 @@ class RMSNorm(ReductionBase):
         self.kernel(mX, mW, mO, mRstd, eps, tv_layout, tiler_mn, self.reload_from).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
             block=[num_threads, 1, 1],
-            cluster=[1, self.cluster_n, 1] if self.cluster_n > 1 else None,
+            cluster=[1, self.cluster_n, 1] if cutlass.const_expr(self.cluster_n > 1) else None,
             smem=self._smem_size_in_bytes(tiler_mn, num_warps),
             stream=stream,
         )
@@ -103,7 +103,11 @@ class RMSNorm(ReductionBase):
         delay_w_load: cutlass.Constexpr = False,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, cluster_y, _ = cute.arch.block_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        if cutlass.const_expr(self.cluster_n > 1):
+            cluster_y = cute.arch.block_idx()[1]
+        else:
+            cluster_y = cutlass.const_expr(0)
 
         smem = cutlass.utils.SmemAllocator()
         sX = smem.allocate_tensor(
@@ -114,13 +118,10 @@ class RMSNorm(ReductionBase):
         shape = mX.shape
         idX = cute.make_identity_tensor(shape)
         # slice for CTAs
-        gX, gO, cX = [
-            cute.local_tile(mT, tiler_mn, (bidx, 0 if self.cluster_n == 1 else cluster_y))
-            for mT in (mX, mO, idX)
-        ]
-        gW = cute.local_tile(mW, tiler_mn, (0, 0 if self.cluster_n == 1 else cluster_y))
+        gX, gO, cX = [cute.local_tile(mT, tiler_mn, (bidx, cluster_y)) for mT in (mX, mO, idX)]
+        gW = cute.local_tile(mW, tiler_mn, (0, cluster_y))
         gRstd = (
-            cute.local_tile(mRstd, tiler_mn, (bidx, 0 if self.cluster_n == 1 else cluster_y))
+            cute.local_tile(mRstd, tiler_mn, (bidx, cluster_y))
             if cutlass.const_expr(mRstd is not None)
             else None
         )
@@ -167,7 +168,7 @@ class RMSNorm(ReductionBase):
         cute.arch.cp_async_commit_group()
 
         tWpW = utils.predicate_k(thr_copy_W.partition_S(cX), limit=shape[1])
-        if not delay_w_load:
+        if cutlass.const_expr(not delay_w_load):
             cute.copy(copy_atom_load_W, tWgW, tWrW, pred=tWpW)
 
         cute.arch.cp_async_wait_group(0)
@@ -192,12 +193,12 @@ class RMSNorm(ReductionBase):
                 and (self.cluster_n == 1 or cute.arch.block_idx_in_cluster() == 0)
             ):
                 tXrRstd[0] = rstd
-        if delay_w_load:
+        if cutlass.const_expr(delay_w_load):
             cute.copy(copy_atom_load_W, tWgW, tWrW, pred=tWpW)
-        if reload_from == "smem":
+        if cutlass.const_expr(reload_from == "smem"):
             cute.autovec_copy(tXsX, tXrX)
             x = tXrX.load().to(cute.Float32)
-        elif reload_from == "gmem":
+        elif cutlass.const_expr(reload_from == "gmem"):
             cute.copy(copy_atom_load_X, tXgX, tXrX, pred=tXpX)
             x = tXrX.load().to(cute.Float32)
         x_hat = x * rstd

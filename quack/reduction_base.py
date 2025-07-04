@@ -88,10 +88,10 @@ class ReductionBase:
     def _initialize_cluster(self, tidx: cutlass.Int32, mbar_ptr: cute.Pointer, num_warps: int):
         if cutlass.const_expr(self.cluster_n > 1):
             if tidx < self.stage:
-                cute.arch.mbarrier_init_arrive_cnt(mbar_ptr + tidx, 1)
+                cute.arch.mbarrier_init(mbar_ptr + tidx, 1)
             cute.arch.mbarrier_init_fence()
             if tidx < self.stage:
-                cute.arch.mbarrier_init_tx_bytes(
+                cute.arch.mbarrier_arrive_and_expect_tx(
                     mbar_ptr + tidx, num_warps * self.cluster_n * self.reduction_dtype.width // 8
                 )
             # Cluster arrive after barrier init
