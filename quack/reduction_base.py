@@ -6,8 +6,6 @@ from typing import Type, Tuple, Optional
 import cutlass
 import cutlass.cute as cute
 
-import quack.utils as utils
-
 
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
@@ -64,7 +62,7 @@ class ReductionBase:
 
     def _get_reduction_buffer_layout(self, tv_layout: cute.Layout, cluster_n: int):
         num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
-        warps_per_row = utils.max_constexpr(tv_layout.shape[0][0] // cute.arch.WARP_SIZE, 1)
+        warps_per_row = max(tv_layout.shape[0][0] // cute.arch.WARP_SIZE, 1)
         return cute.make_ordered_layout(
             (num_warps // warps_per_row, (warps_per_row, cluster_n), self.stage),
             order=(1, 0, 2),

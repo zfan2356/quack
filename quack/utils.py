@@ -24,20 +24,6 @@ def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Te
 
 
 @cute.jit
-def max_constexpr(
-    a: cutlass.Constexpr[cute.Numeric], b: cutlass.Constexpr[cute.Numeric]
-) -> cutlass.Constexpr[cute.Numeric]:
-    return a if a > b else b
-
-
-@cute.jit
-def min_constexpr(
-    a: cutlass.Constexpr[cute.Numeric], b: cutlass.Constexpr[cute.Numeric]
-) -> cutlass.Constexpr[cute.Numeric]:
-    return a if a < b else b
-
-
-@cute.jit
 def warp_reduce(
     val: cute.TensorSSA | cute.Numeric,
     op: Callable,
@@ -196,7 +182,7 @@ def row_reduce(
     val = warp_reduce(
         val,
         warp_op,
-        width=min_constexpr(threads_per_row, cute.arch.WARP_SIZE),
+        width=min(threads_per_row, cute.arch.WARP_SIZE),
     )
     if cutlass.const_expr(hook_fn is not None):
         hook_fn()
@@ -226,7 +212,7 @@ def online_softmax_reduce(
     max_x = warp_reduce(
         x.reduce(cute.ReductionOp.MAX, init_val=-Float32.inf, reduction_profile=0),
         cute.arch.fmax,
-        width=min_constexpr(threads_per_row, cute.arch.WARP_SIZE),
+        width=min(threads_per_row, cute.arch.WARP_SIZE),
     )
     log2_e = math.log2(math.e)
     exp_x = exp2f(x * log2_e - (max_x * log2_e))
@@ -234,7 +220,7 @@ def online_softmax_reduce(
     sum_exp_x = warp_reduce(
         exp_x.reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0),
         operator.add,
-        width=min_constexpr(threads_per_row, cute.arch.WARP_SIZE),
+        width=min(threads_per_row, cute.arch.WARP_SIZE),
     )
     if cutlass.const_expr(hook_fn is not None):
         hook_fn()
@@ -303,7 +289,6 @@ def online_softmax_reduce(
 @cute.jit
 def exp2f(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
     """exp2f calculation for both vector and scalar.
-
     :param x: input value
     :type x: cute.TensorSSA or Float32
     :return: exp2 value
