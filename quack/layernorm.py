@@ -211,7 +211,6 @@ class LayerNorm(ReductionBase):
             reduction_buffer[None, None, 1],
             mbar_ptr + 1 if cutlass.const_expr(self.cluster_n > 1) else None,
             init_val=0.0,
-            hook_fn=cute.arch.cluster_wait if cutlass.const_expr(self.cluster_n > 1) else None,
         )
         rstd = utils.rsqrt(sum_sq_x_sub_mean / shape[1] + eps)
         if cutlass.const_expr(mRstd is not None):
