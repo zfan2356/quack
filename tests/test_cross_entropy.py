@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from quack.cross_entropy import cross_entropy, cross_entropy_loss
+from quack.cross_entropy import _cross_entropy, cross_entropy
 import cutlass
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -27,7 +27,7 @@ def test_cross_entropy_forward(M, N, input_dtype):
     x_ref = x.detach().clone()
     target_ref = target.detach().clone()
     # Forward pass
-    loss = cross_entropy(x, target)
+    loss = _cross_entropy(x, target)
     loss_ref = F.cross_entropy(x_ref.float(), target_ref, reduction='none')
     # Check output shape and dtype
     assert loss.shape == (M,)
@@ -50,13 +50,13 @@ def test_cross_entropy_extreme_values(input_dtype):
     # Test with large positive values
     x_large = torch.full((M, N), 10.0, device=device, dtype=input_dtype)
     target = torch.randint(0, N, (M,), device=device, dtype=torch.int64)
-    loss_large = cross_entropy(x_large, target)
+    loss_large = _cross_entropy(x_large, target)
     # Should be around log(N) since all logits are equal
     expected_large = torch.full_like(loss_large, torch.log(torch.tensor(N, dtype=torch.float32)))
     torch.testing.assert_close(loss_large, expected_large, atol=1e-2, rtol=1e-2)
     # Test with large negative values
     x_small = torch.full((M, N), -10.0, device=device, dtype=input_dtype)
-    loss_small = cross_entropy(x_small, target)
+    loss_small = _cross_entropy(x_small, target)
     # Should also be around log(N)
     torch.testing.assert_close(loss_small, expected_large, atol=1e-2, rtol=1e-2)
     # Test with one-hot like scenario (one large value, rest small)
@@ -64,7 +64,7 @@ def test_cross_entropy_extreme_values(input_dtype):
     # Set the target class to have large logit
     for i in range(M):
         x_onehot[i, target[i]] = 10.0
-    loss_onehot = cross_entropy(x_onehot, target)
+    loss_onehot = _cross_entropy(x_onehot, target)
     # Should be close to 0 since target class has highest probability
     assert (loss_onehot < 1.0).all()
 
@@ -78,8 +78,8 @@ def test_cross_entropy_numerical_stability():
     target = torch.randint(0, N, (M,), device=device, dtype=torch.int64)
     # Add large constant to test numerical stability
     x_shifted = x + 100.0
-    loss = cross_entropy(x, target)
-    loss_shifted = cross_entropy(x_shifted, target)
+    loss = _cross_entropy(x, target)
+    loss_shifted = _cross_entropy(x_shifted, target)
     # Results should be identical (cross entropy is translation invariant)
     torch.testing.assert_close(loss, loss_shifted, atol=1e-5, rtol=1e-5)
 
@@ -91,12 +91,12 @@ def test_cross_entropy_edge_targets():
     x = 0.1 * torch.randn(M, N, device=device, dtype=torch.float32)
     # Test with target = 0 (first class)
     target_first = torch.zeros(M, device=device, dtype=torch.int64)
-    loss_first = cross_entropy(x, target_first)
+    loss_first = _cross_entropy(x, target_first)
     loss_ref_first = F.cross_entropy(x, target_first, reduction='none')
     torch.testing.assert_close(loss_first, loss_ref_first, atol=1e-4, rtol=1e-4)
     # Test with target = N-1 (last class)
     target_last = torch.full((M,), N-1, device=device, dtype=torch.int64)
-    loss_last = cross_entropy(x, target_last)
+    loss_last = _cross_entropy(x, target_last)
     loss_ref_last = F.cross_entropy(x, target_last, reduction='none')
     torch.testing.assert_close(loss_last, loss_ref_last, atol=1e-4, rtol=1e-4)
 
@@ -130,7 +130,7 @@ def test_cross_entropy_autograd_backward(M, N, input_dtype):
 
     cutlass.cuda.initialize_cuda_context()
 
-    loss = cross_entropy_loss(x, target)  # our autograd-enabled op
+    loss = cross_entropy(x, target)  # our autograd-enabled op
     loss_ref = F.cross_entropy(x_ref.float(), target_ref, reduction='none')
 
     torch.testing.assert_close(loss, loss_ref, atol=atol, rtol=rtol)
