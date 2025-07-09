@@ -7,8 +7,9 @@ from triton.testing import do_bench
 
 import cutlass
 import cutlass.torch as cutlass_torch
-
-from quack.rmsnorm import rmsnorm, rmsnorm_ref, rstd_ref
+from cutlass.cute.runtime import from_dlpack
+from quack.rmsnorm import rmsnorm, rmsnorm_ref, rstd_ref, rmsnorm_bwd_ref, _rmsnorm_backward
+import cutlass.cute as cute
 
 try:
     import cudnn
@@ -149,14 +150,12 @@ def run_rmsnorm_bwd(
     w_tensor = from_dlpack(w, assumed_align=16)
     rstd_tensor = from_dlpack(rstd, assumed_align=4).mark_compact_shape_dynamic(mode=0)
 
-    print("Compiling kernel with cute.compile ...")
-    compiled_func = cute.compile(rmsnorm_bwd, x_tensor, w_tensor, dout_tensor, rstd_tensor, dx_tensor)
     print("Executing kernel...")
 
     eps = 1e-6
     compiled_func_ref = torch.compile(rmsnorm_bwd_ref)
 
-    fn = lambda: compiled_func(x_tensor, w_tensor, dout_tensor, rstd_tensor, dx_tensor, eps)
+    fn = lambda: _rmsnorm_backward(x, w, dout, rstd, eps)
     avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
     print(f"Kernel execution time: {avg_time:.4f} ms")
     print(f"Mem throughput: {(3 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9:.2f} GB/s")
@@ -172,19 +171,31 @@ if __name__ == "__main__":
         description="example of elementwise add to demonstrate the numpy/pytorch as input for kernels"
     )
     parser.add_argument("--M", default=32768, type=int)
-    parser.add_argument("--N", default=1024, type=int)
+    parser.add_argument("--N", default=16384, type=int)
     parser.add_argument("--warmup_iterations", default=10, type=int)
     parser.add_argument("--iterations", default=100, type=int)
+    parser.add_argument("--backward", action="store_true", help="Benchmark backward pass instead of forward pass")
 
     args = parser.parse_args()
-    run_rmsnorm(
-        args.M,
-        args.N,
-        # dtype=cutlass.Float32,
-        dtype=cutlass.BFloat16,
-        warmup_iterations=args.warmup_iterations,
-        iterations=args.iterations,
-    )
+
+    if args.backward:
+        run_rmsnorm_bwd(
+            args.M,
+            args.N,
+            # dtype=cutlass.Float32,
+            dtype=cutlass.BFloat16,
+            warmup_iterations=args.warmup_iterations,
+            iterations=args.iterations,
+        )
+    else:
+        run_rmsnorm(
+            args.M,
+            args.N,
+            # dtype=cutlass.Float32,
+            dtype=cutlass.BFloat16,
+            warmup_iterations=args.warmup_iterations,
+            iterations=args.iterations,
+        )
     # # MN_pairs = [(32768, 256), (32768, 512), (32768, 1024), (32768, 2048), (32768, 4096), (32768, 8192), (32768, 16384), (32768, 32768), (32768, 65536), (16384, 131072), (8192, 262144)]
     # # MN_pairs = [(32768, 2048)]
     # MN_pairs = [(16384, 65536)]
