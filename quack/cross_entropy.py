@@ -200,7 +200,7 @@ class CrossEntropy(ReductionBase):
                 mLSE[row] = lse
 
 
-def cross_entropy(
+def _cross_entropy(
     x: torch.Tensor,
     target: torch.Tensor,
     return_lse: bool = False,
@@ -241,18 +241,18 @@ def cross_entropy(
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     compile_key = (dtype, N, lse is not None)
-    if compile_key not in cross_entropy.compile_cache:
+    if compile_key not in _cross_entropy.compile_cache:
         cross_entropy_op = CrossEntropy(dtype, N)
-        cross_entropy.compile_cache[compile_key] = cute.compile(
+        _cross_entropy.compile_cache[compile_key] = cute.compile(
             cross_entropy_op, x_tensor, target_tensor, loss_tensor, lse_tensor, stream
         )
-    cross_entropy.compile_cache[compile_key](
+    _cross_entropy.compile_cache[compile_key](
         x_tensor, target_tensor, loss_tensor, lse_tensor, stream
     )
     return loss if not return_lse else (loss, lse)
 
 
-cross_entropy.compile_cache = {}
+_cross_entropy.compile_cache = {}
 
 
 class CrossEntropyBackward:
@@ -546,7 +546,7 @@ _cross_entropy_backward.compile_cache = {}
 class CrossEntropyFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, target):
-        loss, lse = cross_entropy(x, target, return_lse=True)
+        loss, lse = _cross_entropy(x, target, return_lse=True)
         ctx.save_for_backward(x, target, lse)
         return loss
 
@@ -557,7 +557,7 @@ class CrossEntropyFunction(torch.autograd.Function):
         return dx, None
 
 
-def cross_entropy_loss(x: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def cross_entropy(x: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Cross entropy loss with automatic differentiation support.
 
     Args:

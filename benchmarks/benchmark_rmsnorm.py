@@ -8,7 +8,7 @@ from triton.testing import do_bench
 import cutlass
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
-from quack.rmsnorm import rmsnorm, rmsnorm_ref, rstd_ref, rmsnorm_bwd_ref, _rmsnorm_backward
+from quack.rmsnorm import _rmsnorm_fwd, rmsnorm_ref, rmsnorm
 import cutlass.cute as cute
 
 try:
@@ -43,14 +43,16 @@ def run_rmsnorm(
     eps = 1e-6
 
     print("Executing kernel...")
-    out, rstd = rmsnorm(x, w, eps=eps, return_rstd=True)
+    out, rstd = _rmsnorm_fwd(x, w, eps=eps, return_rstd=True)
 
     compiled_func_ref = torch.compile(rmsnorm_ref)
 
-    fn = lambda: rmsnorm(x, w, eps=eps)
+    fn = lambda: _rmsnorm_fwd(x, w, eps=eps)
     time.sleep(0.5)
     avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
-    mem_bw = (2 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9
+    # mem_bw = (2 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9
+    mem_bytes = (2 * x.numel() * dtype.width // 8 + w.numel() * 4)
+    mem_bw = round(mem_bytes / (avg_time / 1000) / 1e9)
     print(f"Kernel execution time: {avg_time:.4f} ms")
     print(f"Mem throughput: {mem_bw:.2f} GB/s")
 
@@ -58,7 +60,9 @@ def run_rmsnorm(
     for _ in range(5): fn()  # warm up
     time.sleep(0.5)
     avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
-    mem_bw_ref = (2 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9
+    # mem_bw_ref = (2 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9
+    mem_bytes_ref = (2 * x.numel() * dtype.width // 8 + w.numel() * 4)
+    mem_bw_ref = round(mem_bytes_ref / (avg_time / 1000) / 1e9)
     print(f"Ref kernel execution time: {avg_time:.4f} ms")
     print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
 
@@ -66,7 +70,9 @@ def run_rmsnorm(
         run_cudnn = rmsnorm_cudnn_setup(M, N, torch_dtype)
         time.sleep(0.5)
         avg_time = do_bench(run_cudnn, warmup=warmup_iterations, rep=iterations)
-        mem_bw_cudnn = (2 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9
+        # mem_bw_cudnn = (2 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9
+        mem_bytes_cudnn = (2 * x.numel() * dtype.width // 8 + w.numel() * 4)
+        mem_bw_cudnn = round(mem_bytes_cudnn / (avg_time / 1000) / 1e9)
         print(f"Cudnn kernel execution time: {avg_time:.4f} ms")
         print(f"Cudnn mem throughput: {mem_bw_cudnn:.2f} GB/s")
 
@@ -124,46 +130,56 @@ def run_rmsnorm_bwd(
     warmup_iterations=2,
     iterations=200,
 ):
+    if not torch.cuda.is_available():
+        raise RuntimeError(f"Ampere GPU is required to run this example!")
+
     print(f"Tensor dimensions: [{M}, {N}]")
     print(f"Input and Output Data type: {dtype}")
 
     torch_dtype = cutlass_torch.dtype(dtype)
     device = "cuda"
-    x = torch.randn(M, N, device=device, dtype=torch_dtype)
-    w = torch.randn(N, device=device, dtype=torch.float32)
-    dout = torch.randn(M, N, device=device, dtype=torch_dtype)
-    rstd = torch.randn(M, device=device, dtype=torch.float32)
-    dx = torch.empty_like(x)
+    
+    # Set up forward pass inputs with gradients enabled
+    x = torch.randn(M, N, device=device, dtype=torch_dtype, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_()
+    w = torch.randn(N, device=device, dtype=torch.float32, requires_grad=True)
+    w_ref = w.detach().clone().requires_grad_()
 
     print(f"Input tensor shapes:")
     print(f"x: {x.shape}, dtype: {x.dtype}")
     print(f"w: {w.shape}, dtype: {w.dtype}")
-    print(f"out: {dout.shape}, dtype: {dout.dtype}")
-    print(f"rstd: {rstd.shape}, dtype: {rstd.dtype}\n")
-    print(f"dx: {dout.shape}, dtype: {dx.dtype}")
-
-    convert_from_dlpack = lambda x: (
-        from_dlpack(x, assumed_align=16)
-        .mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
-    )
-    x_tensor, dout_tensor, dx_tensor = [convert_from_dlpack(tensor) for tensor in (x, dout, dx)]
-    w_tensor = from_dlpack(w, assumed_align=16)
-    rstd_tensor = from_dlpack(rstd, assumed_align=4).mark_compact_shape_dynamic(mode=0)
-
-    print("Executing kernel...")
 
     eps = 1e-6
-    compiled_func_ref = torch.compile(rmsnorm_bwd_ref)
+    
+    # Forward pass to get outputs and rstd
+    y = rmsnorm(x, w, eps=eps)
+    y_ref = rmsnorm_ref(x_ref, w_ref, eps=eps)
+    
+    # Create upstream gradients
+    dy = torch.randn_like(y)
 
-    fn = lambda: _rmsnorm_backward(x, w, dout, rstd, eps)
+    time.sleep(0.5)
+    # Benchmark custom backward pass
+    fn = lambda: torch.autograd.grad(y, [x, w], grad_outputs=dy, retain_graph=True)
     avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
+    sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count * 8
+    mem_bytes = (3 * x.numel() * dtype.width // 8 + w.numel() * 4 + x.shape[0] * 4 + sm_count * w.numel() * 4)
+    mem_bw = round(mem_bytes / (avg_time / 1000) / 1e9)
     print(f"Kernel execution time: {avg_time:.4f} ms")
-    print(f"Mem throughput: {(3 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9:.2f} GB/s")
-    fn = lambda: compiled_func_ref(x, w, dout, rstd)
-    fn()
-    avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
-    print(f"Ref kernel execution time: {avg_time:.4f} ms")
-    print(f"Ref mem throughput: {(3 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9:.2f} GB/s")
+    print(f"Mem throughput: {mem_bw:.2f} GB/s")
+
+    # Reference implementation
+    compiled_func_ref = torch.compile(lambda: torch.autograd.grad(y_ref, [x_ref, w_ref], grad_outputs=dy, retain_graph=True))
+    
+    for _ in range(5): compiled_func_ref()  # warm up
+    time.sleep(0.5)
+    avg_time_ref = do_bench(compiled_func_ref, warmup=warmup_iterations, rep=iterations)
+    mem_bytes_ref = (3 * x.numel() * dtype.width // 8 + w.numel() * 4 + x.shape[0] * 4 + sm_count * w.numel() * 4)
+    mem_bw_ref = round(mem_bytes_ref / (avg_time_ref / 1000) / 1e9)
+    print(f"Ref kernel execution time: {avg_time_ref:.4f} ms")
+    print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
+
+    return mem_bw, mem_bw_ref
 
 
 if __name__ == "__main__":
@@ -171,7 +187,8 @@ if __name__ == "__main__":
         description="example of elementwise add to demonstrate the numpy/pytorch as input for kernels"
     )
     parser.add_argument("--M", default=32768, type=int)
-    parser.add_argument("--N", default=16384, type=int)
+    parser.add_argument("--N", default=32768, type=int)
+    parser.add_argument("--dtype", type=cutlass.dtype, choices=[cutlass.BFloat16, cutlass.Float16, cutlass.Float32], default=cutlass.BFloat16)
     parser.add_argument("--warmup_iterations", default=10, type=int)
     parser.add_argument("--iterations", default=100, type=int)
     parser.add_argument("--backward", action="store_true", help="Benchmark backward pass instead of forward pass")
@@ -179,20 +196,20 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.backward:
+        print("=== RMSNorm Backward Pass Benchmark ===")
         run_rmsnorm_bwd(
             args.M,
             args.N,
-            # dtype=cutlass.Float32,
-            dtype=cutlass.BFloat16,
+            dtype=args.dtype,
             warmup_iterations=args.warmup_iterations,
             iterations=args.iterations,
         )
     else:
+        print("=== RMSNorm Forward Pass Benchmark ===")
         run_rmsnorm(
             args.M,
             args.N,
-            # dtype=cutlass.Float32,
-            dtype=cutlass.BFloat16,
+            dtype=args.dtype,
             warmup_iterations=args.warmup_iterations,
             iterations=args.iterations,
         )

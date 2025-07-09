@@ -9,7 +9,7 @@ from triton.testing import do_bench
 import cutlass
 import cutlass.torch as cutlass_torch
 
-from quack.cross_entropy import cross_entropy, _cross_entropy_backward
+from quack.cross_entropy import _cross_entropy, cross_entropy
 
 
 def run_cross_entropy(
@@ -31,11 +31,11 @@ def run_cross_entropy(
     x = 0.1 * torch.randn(M, N, device=device, dtype=torch_dtype)
     target = torch.randint(0, N, (M,), device=device, dtype=torch.int64)
 
-    loss = cross_entropy(x, target)
+    loss = _cross_entropy(x, target)
 
     compiled_func_ref = torch.compile(lambda x, target: F.cross_entropy(x, target, reduction='none'))
 
-    fn = lambda: cross_entropy(x, target)
+    fn = lambda: _cross_entropy(x, target)
     time.sleep(0.5)
     avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
     # Memory bandwidth calculation: read x (M*N elements) + read target (M elements) + write loss (M elements)
@@ -80,38 +80,27 @@ def run_cross_entropy_backward(
     print(f"x: {x.shape}, dtype: {x.dtype}")
     print(f"target: {target.shape}, dtype: {target.dtype}")
 
-    # First compute forward pass to get lse for our custom backward
-    with torch.no_grad():
-        _, lse = cross_entropy(x, target, return_lse=True)
-    
+    loss = cross_entropy(x, target)
     dloss = torch.randn(M, device=device, dtype=torch.float32)
+
+    time.sleep(0.5)
+    fn = lambda: torch.autograd.grad(loss, x, grad_outputs=dloss, retain_graph=True)
+    avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
+    # Memory bandwidth calculation: read x (M*N) + read target (M) + read dloss (M) + write grad (M*N)
+    mem_bw = round((2 * x.numel() * x.element_size() + target.numel() * target.element_size() + 
+                    dloss.numel() * dloss.element_size()) / (avg_time / 1000) / 1e9)
+    print(f"Kernel execution time: {avg_time:.4f} ms")
+    print(f"Mem throughput: {mem_bw:.2f} GB/s")
 
     # Reference implementation
     loss_ref = F.cross_entropy(x_ref, target, reduction='none')
-
     compiled_func_ref = torch.compile(lambda: torch.autograd.grad(loss_ref, x_ref, grad_outputs=dloss, retain_graph=True))
-
-    # Custom kernel backward pass - directly call the backward kernel
-    fn = lambda: _cross_entropy_backward(x, target, dloss, lse)
-    
-    time.sleep(0.5)
-    avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
-    # Memory bandwidth for backward pass:
-    # Read: x (M*N), target (M), dloss (M), lse (M)
-    # Write: grad (M*N)
-    mem_bw = round((x.numel()*x.element_size() + target.numel()*target.element_size() + 
-                    dloss.numel()*dloss.element_size() + x.numel()*x.element_size() + 
-                    lse.numel()*lse.element_size()) / (avg_time/1000) / 1e9)
-    print(f"Kernel execution time: {avg_time:.4f} ms")
-    print(f"Mem throughput: {mem_bw:.2f} GB/s")
 
     for _ in range(5): compiled_func_ref()  # warm up
     time.sleep(0.5)
     avg_time_ref = do_bench(compiled_func_ref, warmup=warmup_iterations, rep=iterations)
-    # PyTorch's backward pass memory bandwidth (same calculation for fair comparison)
-    mem_bw_ref = round((x.numel()*x.element_size() + target.numel()*target.element_size() + 
-                        dloss.numel()*dloss.element_size() + x.numel()*x.element_size() + 
-                        lse.numel()*lse.element_size()) / (avg_time_ref/1000) / 1e9)
+    mem_bw_ref = round((2 * x.numel() * x.element_size() + target.numel() * target.element_size() + 
+                        dloss.numel() * dloss.element_size()) / (avg_time_ref / 1000) / 1e9)
     print(f"Ref kernel execution time: {avg_time_ref:.4f} ms")
     print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
 

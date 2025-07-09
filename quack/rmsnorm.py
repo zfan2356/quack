@@ -209,20 +209,18 @@ class RMSNorm(ReductionBase):
             cute.copy(copy_atom_store_O, tXrO, tXgO, pred=tOpO)
 
 
-def rmsnorm(
+def _rmsnorm_fwd(
     x: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
     return_rstd: bool = False,
 ) -> torch.Tensor:
     """RMSNorm forward pass.
-
     Args:
         x: Input tensor of shape (M, N)
         weight: Weight tensor of shape (N,)
         eps: Small value for numerical stability
         return_rstd: Whether to return the reciprocal standard deviation
-
     Returns:
         Normalized output tensor of same shape as x
         If return_rstd is True, also returns rstd tensor of shape (M,)
@@ -258,18 +256,18 @@ def rmsnorm(
     )
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     compile_key = (dtype, N, rstd is not None)
-    if compile_key not in rmsnorm.compile_cache:
+    if compile_key not in _rmsnorm_fwd.compile_cache:
         rmsnorm_op = RMSNorm(dtype, N)
-        rmsnorm.compile_cache[compile_key] = cute.compile(
+        _rmsnorm_fwd.compile_cache[compile_key] = cute.compile(
             rmsnorm_op, x_tensor, weight_tensor, out_tensor, rstd_tensor, current_stream
         )
-    rmsnorm.compile_cache[compile_key](
+    _rmsnorm_fwd.compile_cache[compile_key](
         x_tensor, weight_tensor, out_tensor, rstd_tensor, current_stream, eps
     )
     return (out, rstd) if return_rstd else out
 
 
-rmsnorm.compile_cache = {}
+_rmsnorm_fwd.compile_cache = {}
 
 
 def rmsnorm_ref(x, w, eps=1e-6):
@@ -520,14 +518,11 @@ class RMSNormBackward(ReductionBase):
             if row < M:
                 cute.copy(copy_atom_store_dX, frgDx, thrDx, pred=tXpX)
 
-            # Proper cluster synchronization for dw accumulation
-            #'''
             if cutlass.const_expr(self.cluster_n > 1):
                 cute.arch.cluster_arrive()
                 cute.arch.cluster_wait()
             else:
                 cute.arch.barrier()
-            #'''
 
             if row < M:
                 dw_row = dout * x_hat
@@ -555,19 +550,36 @@ class RMSNormBackward(ReductionBase):
 
 
 def _rmsnorm_backward(
-    x: torch.Tensor,  # (M, N)
-    weight: torch.Tensor,  # (N, )
-    dout: torch.Tensor,  # (M, )
-    rstd: torch.Tensor,  # (M, N)
-    eps: float = 1e-6,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    dout: torch.Tensor,
+    rstd: torch.Tensor,
 ) -> (torch.Tensor, torch.Tensor):
+    """RMSNorm backward pass.
+    Args:
+        x: Input tensor of shape (M, N)
+        weight: Weight tensor of shape (N,)
+        dout: Upstream gradients tensor of shape (M, N)
+        rstd: Reciprocal standard deviation tensor of shape (M,)
+    Returns:
+        Tuple of (dx, dw) where:
+        - dx: Input gradients tensor of same shape as x
+        - dw: Weight gradients tensor of same shape as weight
+    """
+    assert x.dim() == 2, "Input must be 2D"
+    assert weight.dim() == 1, "Weight must be 1D"
+    assert x.shape[-1] == weight.shape[0], "Last dimension of input must match weight dimension"
+    assert x.is_cuda and weight.is_cuda, "Tensors must be on CUDA device"
+    assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
+    assert weight.dtype == torch.float32, "Weight must be float32"
+
     M, N = x.shape
     dx = torch.empty_like(x)
 
-    # sm_count = min(M, torch.cuda.get_device_properties(x.device).multi_processor_count * 8)
+    device = x.device
 
-    sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count * 8
-    dw_partial = torch.zeros((sm_count, N), device=weight.device, dtype=weight.dtype)
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count * 8
+    dw_partial = torch.zeros((sm_count, N), device=device, dtype=weight.dtype)
 
     dtype = torch2cute_dtype_map[x.dtype]
 
@@ -623,7 +635,7 @@ _rmsnorm_backward.compile_cache = {}
 class RMSNormFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, eps):
-        out, rstd = rmsnorm(x, weight, eps, return_rstd=True)
+        out, rstd = _rmsnorm_fwd(x, weight, eps, return_rstd=True)
         ctx.save_for_backward(x, weight, rstd)
         ctx.eps = eps
         return out
@@ -631,12 +643,12 @@ class RMSNormFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout):
         x, weight, rstd = ctx.saved_tensors
-        dx, dw = _rmsnorm_backward(x, weight, dout, rstd, ctx.eps)
+        dx, dw = _rmsnorm_backward(x, weight, dout, rstd)
         # dw is returned for weight gradient, None for eps gradient
         return dx, dw, None
 
 
-def rmsnorm_fused(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """RMSNorm forward pass with automatic differentiation support.
 
     Args:
