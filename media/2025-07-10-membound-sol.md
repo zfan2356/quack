@@ -606,13 +606,9 @@ This is our TV-layout.
 Layouts & tiler
 | Name  | Formula | Description |
 |-------|---------|-------------|
-| **Thread Layout** | (threads_per_row, cols_per_block): (vecsize × cols_per_block, 1) | <br>**Shape**: (Block N, Block M)
-<br>**Stride**: (vecsize × Block M, 1) |
-| **Value Layout** | (vecsize, num_blocks_N): (cols_per_block, cols_per_block × vecsize × threads_per_row) |
-<br>**Shape**: (vecsize, # reduced rows per thread block)
-<br>**Stride**: (Block M, # elements per thread block) |
-| **Tiler** | (cols_per_block, vecsize × num_blocks_N × threads_per_row) |
-<br>(Block M, # reduced rows per cluster) |
+| **Thread Layout** | (threads_per_row, cols_per_block): (vecsize × cols_per_block, 1) | <br>**Shape**: (Block N, Block M) <br>**Stride**: (vecsize × Block M, 1) |
+| **Value Layout** | (vecsize, num_blocks_N): (cols_per_block, cols_per_block × vecsize × threads_per_row) | <br>**Shape**: (vecsize, # reduced rows per thread block) <br>**Stride**: (Block M, # elements per thread block) |
+| **Tiler** | (cols_per_block, vecsize × num_blocks_N × threads_per_row) | (Block M, # reduced rows per cluster) |
 
 <div align="center">
 <figure>
