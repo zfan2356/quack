@@ -334,11 +334,7 @@ layernorm.compile_cache = {}
 
 def layernorm_ref(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6):
     x_f32 = x.float()
-    mean = x_f32.mean(dim=-1, keepdim=True)
-    var = ((x_f32 - mean) ** 2).mean(dim=-1, keepdim=True)
-    inv_std = torch.rsqrt(var + eps)
-    y = (x_f32 - mean) * inv_std * w.unsqueeze(0)
-    return y.to(x.dtype)
+    return torch.nn.functional.layer_norm(x_f32, w.shape, w, None, eps).to(x.dtype)
 
 
 def rstd_ref(x: torch.Tensor, eps: float = 1e-6):

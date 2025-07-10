@@ -63,59 +63,7 @@ def run_layernorm(
     print(f"Ref kernel execution time: {avg_time:.4f} ms")
     print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
 
-    if cudnn is not None:
-        run_cudnn = layernorm_cudnn_setup(M, N, torch_dtype)
-        time.sleep(0.5)
-        avg_time = do_bench(run_cudnn, warmup=warmup_iterations, rep=iterations)
-        mem_bw_cudnn = (2 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9
-        print(f"Cudnn kernel execution time: {avg_time:.4f} ms")
-        print(f"Cudnn mem throughput: {mem_bw_cudnn:.2f} GB/s")
-
     return mem_bw, mem_bw_ref
-
-
-def layernorm_cudnn_setup(M, N, dtype):
-    x_gpu = torch.empty(M, N, dtype=dtype, device="cuda")
-    scale_gpu = torch.empty(1, N, dtype=dtype, device="cuda")
-    epsilon_cpu = torch.ones((1, 1), dtype=torch.float32, device="cpu")
-    out_gpu = torch.empty_like(x_gpu)
-    inv_var_gpu = torch.empty(M, 1, dtype=torch.float32, device="cuda")
-    handle = cudnn.create_handle()
-    graph = cudnn.pygraph(
-        handle=handle,
-        intermediate_data_type=cudnn.data_type.FLOAT,
-        compute_data_type=cudnn.data_type.FLOAT,
-    )
-    # create tensor handles with the graph API
-    x = graph.tensor_like(x_gpu.detach()).set_name("X")
-    scale = graph.tensor_like(scale_gpu.detach()).set_name("scale")
-    epsilon = graph.tensor_like(epsilon_cpu).set_name("epsilon")
-    (out, inv_var) = graph.rmsnorm(
-        name="layernorm",
-        input=x,
-        norm_forward_phase=cudnn.norm_forward_phase.TRAINING,
-        scale=scale,
-        epsilon=epsilon,
-    )
-    # enable all outputs
-    out.set_name("output").set_output(True).set_data_type(out_gpu.dtype)
-    inv_var.set_name("inv_var").set_output(True).set_data_type(inv_var_gpu.dtype)
-    graph.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-    # Mapping of (handles -> memory)
-    variant_pack = {
-        x: x_gpu.detach(),
-        scale: scale_gpu.detach(),
-        epsilon: epsilon_cpu,
-        out: out_gpu,
-        inv_var: inv_var_gpu,
-    }
-    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
-
-    def run(*args, **kwargs):
-        graph.execute(variant_pack, workspace)
-        return out_gpu, inv_var_gpu
-
-    return run
 
 
 if __name__ == "__main__":
