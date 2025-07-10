@@ -148,7 +148,7 @@ Reduction strategy in different memory hierarchies
 | Thread Block Clusters      | Distributed Shared Memory     | Cluster reduction      |
 | Grids                      | Global Memory                 |                        |
 
-1. Thread reduction (read and write to registers)
+### 1. Thread reduction (read and write to registers)
 
 Each thread will reduce a multiple of vectorized loaded values locally. We use the member function `TensorSSA.reduce` where we provide an associative reduction operator `op`, an initial value before reduction `init_val`, and our reduction dimension `reduction_profile**.
 
@@ -172,7 +172,7 @@ max_x = x.reduce(cute.ReductionOp.MAX, init_val=float('-inf'),
 ```
 
 
-2. Warp reduction (read and write to registers)
+### 2. Warp reduction (read and write to registers)
 
 A warp is a fixed group of 32 contiguous threads that would execute common instructions per cycle. (Synchronous) **warp reduction** allows each thread to read another thread’s register in one cycle via a dedicated shuffle network within the same warp. **After the butterfly warp reduction (see the schematic below), every thread in the same warp obtains the reduced value**.
 
@@ -211,7 +211,7 @@ def warp_reduce(val: cute.Numeric,
 </div>
 
 
-3. Block reduction (read and write to shared memory)
+### 3. Block reduction (read and write to shared memory)
 
 A thread block usually composes multiple (up to 32 in H100) warps inside a thread block. In a block reduction, the first thread from each participating warp will write their warp-reduced value to a reduction buffer pre-allocated on the shared memory. After a block-level synchronization (barrier) that ensures every participating warp has finished writing, the top-laned threads of each warp will then read from the reduction buffer, and calculate the block-reduced value locally.
 
@@ -252,3 +252,156 @@ max_x = block_reduce(max_x, cute.arch.fmax, max_val_reduction_buffer,
   >
 </figure>
 </div>
+
+### 4. Cluster reduction (read and write to distributed shared memory)
+
+Thread block cluster is a newly introduced execution hierarchy in Hopper as a group of neighboring thread blocks (up to 16). Thread blocks within the same cluster will communicate with each other via distributed shared memory (DSMEM) that contains a dedicated fast SM-to-SM network.
+
+Within the same cluster, all the threads can access other SM’s shared memory via DSMEM where the shared memory’s virtual address space is logically distributed across all the blocks in the cluster. DSMEM can be referenced directly with simple pointers.
+
+<div align="center">
+<figure>
+  <img
+  src="dsmem.png"
+  alt="Distributed shared memory [8]">
+  <figcaption>Distributed shared memory [8]</figcaption>
+</figure>
+</div>
+
+
+In cluster reduction, we first send the current warp’s reduced value to all the peer thread block’s reduction buffer in peer’s SMEM. Such sending is conducted via a dedicated SM-to-SM fabric (as DSMEM). Then each warp fetches all warp’s values from their local reduction buffer, and reduces these values.
+
+We also need a memory barrier to count the number of arrivals so that we don’t dereference our local shared memory too early (otherwise we will have illegal memory access).
+
+<div align="center">
+<figure>
+  <img
+  src="cluster_reduction.png"
+  >
+</figure>
+</div>
+
+**Our helper function**:
+```python
+@dsl_user_op
+def set_block_rank(smem_ptr: cute.Pointer,
+                   peer_block_rank_in_cluster) -> cutlass.Int32:
+    # This instruction maps the given smem pointer to the address at another thread block’s smem in the cluster.
+    return inline_asm(...,
+            "mapa.shared::cluster.u32 $0, $1, $2;",
+            smem_ptr.toint(), peer_block_rank_in_cluster,
+            ...
+           )
+
+@dsl_user_op
+def store_shared_remote(val: float,
+                        smem_ptr: cute.Pointer,
+                        mbar_ptr: cute.Pointer,
+                        peer_block_rank_in_cluster) -> None:
+    # maps current reduction buffer’s pointer to the remote thread block’s SMEM addressable space.
+    remote_smem_ptr_i32 = set_block_rank(
+        smem_ptr, peer_block_rank_in_cluster
+    )
+    remote_mbar_ptr_i32 = set_block_rank(
+        mbar_ptr, peer_block_rank_in_cluster
+    )
+    # asynchronously stores current warp’s reduced value `val` to the remote thread block’s reduction buffer.
+    inline_asm(...,
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [$0], $1, [$2];",
+        remote_smem_ptr_i32, val, remote_mbar_ptr_i32,
+        ...
+    )
+
+@cute.jit
+def cluster_reduce(val: cute.Numeric,
+                   op: Callable,
+                   reduction_buffer: cute.Tensor,
+                   mbar_ptr: cute.Pointer,
+                   init_val: cute.Numeric = 0.0) -> cute.Numeric:
+    block_rank_in_cluster    = cute.arch.block_idx_in_cluster()
+    lane_idx, warp_idx       = cute.arch.lane_idx(), cute.arch.warp_idx()
+    warps_per_row, cluster_n = reduction_buffer.shape[1]
+    row_idx, col_idx = warp_idx // warps_per_row, warp_idx % warps_per_row
+
+    if lane_idx < cluster_n:
+        # `store_shared_remote` lets each top-laned write the warp-reduced value to cluster idx
+        store_shared_remote(
+            val,
+            # `elem_pointer` calculates the pointer offset that we should write in another thread block
+            elem_pointer(reduction_buffer,
+                        (row_idx, (col_idx, block_rank_in_cluster))),
+            mbar_ptr, peer_cta_rank_in_cluster=lane_idx
+        )
+   # ensure all participating warps have written the results
+    cute.arch.mbarrier_wait(mbar_ptr, phase=0)
+
+    block_reduce_val = init_val
+    num_iter = cute.ceil_div(warps_per_row * cluster_n, 32)
+    for i in cutlass.range_constexpr(num_iter):
+        idx = lane_idx + i * 32
+        if idx < cute.size(reduction_buffer, mode=[1]):
+            # each lane reduces across the reduction buffer
+            block_reduce_val = op(block_reduce_val,
+                                   reduction_buffer[row_idx, idx])
+    # warp reduce to obtain the final cluster-reduced result
+    return warp_reduce(block_reduce_val, op)
+```
+
+**Our example usage**:
+```python
+max_val_mbar_ptr = smem.allocate(8, byte_alignment=8)
+
+if tidx == 0:
+     cute.arch.mbarrier_init(max_val_mbar_ptr, 1)
+
+
+cute.arch.mbarrier_init_fence()
+if tidx == 0:
+    # initialize memory barrier transaction counter.
+    cute.arch.mbarrier_arrive_and_expect_tx(max_val_mbar_ptr, num_warps *
+                                            cluster_n * 4)
+    # send an “arrive” signal after barrier init
+    cute.arch.cluster_arrive_relaxed()
+......
+# wait until all warps in the cluster have initialized their local reduction buffer in their SMEM.
+cute.arch.cluster_wait()
+max_x = cluster_reduce(max_x, cute.arch.fmax, max_val_reduction_buffer,
+                       max_val_mbar_ptr, init_val=max_x)
+
+```
+
+### Reduction from top to bottom
+
+
+Let's put it together! We will first perform thread reduction, and aggregate our thread-reduced result within the same warp (warp reduction), and forward the reduced value again on each thread block or cluster depending on the number of reduction dimensions.
+
+**Our example usage**:
+```python
+# load from GMEM to the thread-owned registers
+x           = tXrX.load().to(cute.Float32)
+
+# thread reduction
+max_x       = x.reduce(cute.ReductionOp.MAX,
+                       init_val=float('-inf'),
+                       reduction_profile=0)
+
+# warp reduction
+max_x       = warp_reduce(
+    max_x, cute.arch.fmax,
+    width=32,
+)
+
+if cutlass.const_expr(warps_per_row * cluster_n) > 1:
+    # more than 1 warp per row, block or cluster reduction is needed!
+    if cutlass.const_expr(cluster_n) == 1:
+        # block reduction
+        max_x = block_reduce(max_x, cute.arch.fmax,
+                             max_val_reduction_buffer,
+                             init_val=max_x)
+    else:
+        # cluster reduction
+        max_x = cluster_reduce(max_x, cute.arch.fmax,
+                               max_val_reduction_buffer,
+                               max_val_mbar_ptr,
+                               init_val=max_x)
+```
