@@ -177,7 +177,7 @@ Each thread will reduce a multiple of vectorized loaded values locally. We use t
 
 **CuTe member function**:
 ```python
-TensorSSA.reduce(op, init_val, reduction_profile**
+TensorSSA.reduce(op, init_val, reduction_profile)
 ```
 
 **Our example usage**:
