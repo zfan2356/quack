@@ -66,7 +66,8 @@ Every tier of memory has a read & write primitive available for local reduction.
 </div>
 
 
-Hopper GPU’s Execution Granularity Meets Memory Hierarchy
+<center>Hopper GPU’s Execution Granularity Meets Memory Hierarchy</center>
+
 | Execution Granularity       | Operating Memory              | Description                                                                                                                                           |
 |----------------------------|-------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Threads                    | Registers (1st memory tier)    | Each thread can own up to 255 registers.                                                                                                              |
@@ -154,7 +155,8 @@ After each thread holds a small input vector, we will start reducing them! Every
 
 We will reduce the values from top to bottom in the following table, and each step we will only load & store in the corresponding memory hierarchy.
 
-Reduction strategy in different memory hierarchies
+<center>Reduction strategy in different memory hierarchies</center>
+
 | Execution Granularity       | Operating Memory              | Reduction Strategy     |
 |----------------------------|-------------------------------|------------------------|
 | Threads                    | Registers                     | Thread reduction       |
@@ -165,7 +167,7 @@ Reduction strategy in different memory hierarchies
 
 ### 1. Thread reduction (read and write to registers)
 
-Each thread will reduce a multiple of vectorized loaded values locally. We use the member function `TensorSSA.reduce` where we provide an associative reduction operator `op`, an initial value before reduction `init_val`, and our reduction dimension `reduction_profile**.
+Each thread will reduce a multiple of vectorized loaded values locally. We use the member function `TensorSSA.reduce` where we provide an associative reduction operator `op`, an initial value before reduction `init_val`, and our reduction dimension `reduction_profile`.
 
 <div align="center">
 <figure>
@@ -177,7 +179,7 @@ Each thread will reduce a multiple of vectorized loaded values locally. We use t
 
 **CuTe member function**:
 ```python
-TensorSSA.reduce(op, init_val, reduction_profile**
+TensorSSA.reduce(op, init_val, reduction_profile)
 ```
 
 **Our example usage**:
@@ -191,7 +193,7 @@ max_x = x.reduce(cute.ReductionOp.MAX, init_val=float('-inf'),
 
 A warp is a fixed group of 32 contiguous threads that would execute common instructions per cycle. (Synchronous) **warp reduction** allows each thread to read another thread’s register in one cycle via a dedicated shuffle network within the same warp. **After the butterfly warp reduction (see the schematic below), every thread in the same warp obtains the reduced value**.
 
-We define a helper function `warp_reduce` that performs warp reduction with “ butterfly” reduction order. We will refer readers to the CUDA blog written by Yuan and Vinod [6] that explains warp-level primitives in detail.
+We define a helper function `warp_reduce` that performs warp reduction with “butterfly” reduction order. We will refer readers to the CUDA blog written by Yuan and Vinod [6] that explains warp-level primitives in detail.
 
 
 **Our helper function**:
@@ -507,7 +509,7 @@ We use a batch size from 8k to 32k, and a reduction dimension from 256 to 256 * 
 - Liger kernel v0.5.10. [13] We only benchmark RMSNorm and softmax up to a reduction dim 65k as the larger size is not supported yet by the Liger kernel.
 - [cuDNN](https://docs.nvidia.com/deeplearning/cudnn/latest/) v9.10.1. We only benchmark the RMSNorm kernel.
 
-Our impl in CuTe DSL generally maintains a model memory throughput about 3 TB/s (~90% peak) for a reduction dimension larger than 4k, and **achieves nearly double throughput (e.g., 3.01 TB/s vs 1.46 TB/s for FP32 softmax)** compared to torch.compile when reduction dimension is 262k. **Our impl also significantly outperforms all baselines when reduction dim >= 65k for all 3 kernels**.
+Our impl in CuTe DSL generally maintains a model memory throughput about 3 TB/s (~90% peak) for a reduction dimension larger than 4k, and **achieves nearly 50% more throughput (e.g., 3.01 TB/s vs 1.89 TB/s for FP32 softmax)** compared to torch.compile when reduction dimension is 262k. **Our impl also significantly outperforms all baselines when reduction dim >= 65k for all 3 kernels**.
 
 <div align="center">
 <figure>
