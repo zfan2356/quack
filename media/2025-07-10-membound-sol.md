@@ -170,3 +170,42 @@ TensorSSA.reduce(op, init_val, reduction_profile**
 max_x = x.reduce(cute.ReductionOp.MAX, init_val=float('-inf'),
                  reduction_profile=0)
 ```
+
+
+2. Warp reduction (read and write to registers)
+
+A warp is a fixed group of 32 contiguous threads that would execute common instructions per cycle. (Synchronous) **warp reduction** allows each thread to read another thread’s register in one cycle via a dedicated shuffle network within the same warp. **After the butterfly warp reduction (see the schematic below), every thread in the same warp obtains the reduced value**.
+
+We define a helper function `warp_reduce` that performs warp reduction with “ butterfly” reduction order. We will refer readers to the CUDA blog written by Yuan and Vinod [6] that explains warp-level primitives in detail.
+
+
+**Out helper function**:
+```python
+@cute.jit
+def warp_reduce(val: cute.Numeric,
+                op: Callable,
+                width: cutlass.Constexpr = 32) -> cute.Numeric:
+    for i in range(int(math.log2(width))):
+        # cute.arch.shuffle_sync_bfly will read from another thread's registers
+        val = op(val, cute.arch.shuffle_sync_bfly(val, offset=1 << i))
+    return val
+```
+
+**Our example usage***:
+```python
+   max_x  = x.reduce(cute.ReductionOp.MAX, init_val=float('-inf'),
+                     reduction_profile=0)
+   max_x  = warp_reduce(
+        max_x, cute.arch.fmax,
+        width=32, # every thread in a warp will participate in the warp reduction
+    )
+```
+
+<div align="center">
+<figure>
+  <img
+  src="warp_reduction.png"
+  alt="Butterfly warp reduction, also named “xor warp shuffle” [7]">
+  <figcaption>Butterfly warp reduction, also named “xor warp shuffle” [7]</figcaption>
+</figure>
+</div>
