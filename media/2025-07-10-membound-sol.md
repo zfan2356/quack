@@ -38,7 +38,13 @@ Within the memory-bound kernels, elementwise activation is usually easier to dea
 
 In this blogpost, we describe how we can leverage the GPU memory hierarchy to implement efficient reduction kernels. As an example, we use CuTe DSL to implement 3 commonly used kernels in Large Language Models: RMSNorm, softmax, and cross entropy loss. We want to hit the maximum hardware throughput, or “GPU speed-of-light throughput”, and we need 2 ingredients: (1) global memory coalesce load/store (2) hardware-aware reduction strategy. As a bonus, we’ll also explain cluster reduction, a relatively new feature on Nvidia GPUs starting with Hopper (H100), and how that helps with very large reductions. This blogpost will explain the details of these ingredients and flesh out how they allow us to write speed-of-light kernels. Let’s start our journey!
 
-<!-- ![Duck rocket](max_reduction.png "Parallel maximum reduction [1]") -->
+<div align="center">
+<figure>
+  <img
+  src="QuACK.png"
+  >
+</figure>
+</div>
 
 Our code can be found at 🦆 <https://github.com/Dao-AILab/quack> 🦆
 
