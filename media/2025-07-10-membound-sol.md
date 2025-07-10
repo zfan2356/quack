@@ -405,3 +405,98 @@ if cutlass.const_expr(warps_per_row * cluster_n) > 1:
                                max_val_mbar_ptr,
                                init_val=max_x)
 ```
+
+
+## NCU profile (softmax kernel)
+
+### Our implementation
+
+We profile our softmax kernel implementation with batch dim=16K, reduction dim=131K in NVIDIA H100 with HBM3 (DRAM peak throughput = 3.35 TB/s) [8]. The memory workload diagrams are generated from [Nsight Compute](https://docs.nvidia.com/nsight-compute/NsightComputeCli/index.html). We use a thread block cluster with size 4, 256 threads per thread block, and we use FP32 for the input data type. The load & store is vectorized with each instruction carrying 128 bits (4 FP32 values).
+
+We achieve DRAM throughput (device memory throughput) at 3.01 TB/s which is 89.7% of the peak DRAM throughput. We also use DSMEM effectively besides SMEM.
+
+<figure>
+  <img
+  src="our-16k-131k.png"
+  alt="Our implementation’s memory workload diagram">
+  <figcaption>Our implementation’s memory workload diagram</figcaption>
+</figure>
+</div>
+
+### Torch compile
+
+We also compare our implementation with torch.compile (PyTorch version 2.7.1). We first obtain torch.compile’s generated Triton kernel codes as below.
+
+This kernel implements softmax with 2 global memory loads (one load each when calculating row-wise max and partial exponential sums, and final softmax value) and 1 store. In this case, although this triton kernel still saturates the hardware DRAM throughput, the unnecessary 1 load would still cause the triton kernel’s effective model memory throughput (~2.0 TB/s) to be **two-third** of our impl’s (~3.0 TB/s).
+
+Torch.compile’s generated Triton kernel (tuning config omitted)
+
+```python
+@triton.jit
+def triton_red_fused__softmax_0(in_ptr0, out_ptr2, xnumel, r0_numel,
+                           XBLOCK : tl.constexpr, R0_BLOCK : tl.constexpr):
+    xnumel = 16384
+    r0_numel = 131072
+    rnumel = r0_numel
+    RBLOCK: tl.constexpr = R0_BLOCK
+    xoffset = tl.program_id(0).to(tl.int64) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:, None].to(tl.int64)
+    xmask = tl.full([XBLOCK, R0_BLOCK], True, tl.int1)
+    r0_base = tl.arange(0, R0_BLOCK)[None, :].to(tl.int64)
+    rbase = r0_base
+    x0 = xindex
+    _tmp2_max = tl.full([XBLOCK, R0_BLOCK], float('-inf'), tl.float32)
+    _tmp2_sum = tl.zeros([XBLOCK, R0_BLOCK], tl.float32)
+    for r0_offset in range(0, r0_numel, R0_BLOCK):
+        r0_index = r0_offset + r0_base
+        r0_mask = tl.full([XBLOCK, R0_BLOCK], True, tl.int1)
+        roffset = r0_offset
+        rindex = r0_index
+        r0_1 = r0_index
+        tmp0 = tl.load(in_ptr0 + (r0_1 + 131072*x0), None, eviction_policy='evict_last')
+        tmp1 = tl.broadcast_to(tmp0, [XBLOCK, R0_BLOCK])
+
+        _tmp2_max_next, _tmp2_sum_next = triton_helpers.online_softmax_combine(
+             _tmp2_max, _tmp2_sum, tmp1, False
+         )
+
+        _tmp2_max = _tmp2_max_next
+        _tmp2_sum = _tmp2_sum_next
+
+    tmp4, tmp5 = triton_helpers.online_softmax_reduce(
+        _tmp2_max, _tmp2_sum, 1, False)
+    tmp4 = tmp4[:, None]
+    tmp5 = tmp5[:, None]
+    tmp2 = tmp4
+    tmp3 = tmp5
+    for r0_offset in range(0, r0_numel, R0_BLOCK):
+        r0_index = r0_offset + r0_base
+        r0_mask = tl.full([XBLOCK, R0_BLOCK], True, tl.int1)
+        roffset = r0_offset
+        rindex = r0_index
+        r0_1 = r0_index
+        tmp6 = tl.load(in_ptr0 + (r0_1 + 131072*x0), None, eviction_policy='evict_first')
+        tmp7 = tmp6 - tmp2
+        tmp8 = tl_math.exp(tmp7)
+        tmp9 = (tmp8 / tmp3)
+        tl.store(out_ptr2 + (r0_1 + 131072*x0), tmp9, None)
+```
+
+## Memory throughput
+
+We benchmark our RMSNorm, softmax, cross entropy loss kernel as below. The benchmark is still conducted on 1 NVIDIA H100 80GB with HBM3 with Intel Xeon Platinum 8468 CPU.
+
+We use a batch size from 8k to 32k, and a reduction dimension from 256 to 256 * 1024 = 262k with input data type as FP32 and BF16. Our baselines are listed below:
+- Torch.compile (PyTorch 2.7.1). We use the default mode for compilation.
+- Liger kernel v0.5.10. [13] We only benchmark RMSNorm and softmax up to a reduction dim 65k as the larger size is not supported yet by the Liger kernel.
+- [cuDNN](https://docs.nvidia.com/deeplearning/cudnn/latest/) v9.10.1. We only benchmark the RMSNorm kernel.
+
+Our impl in CuTe DSL generally maintains a model memory throughput about 3 TB/s (~90% peak) for a reduction dimension larger than 4k, and **achieves nearly double throughput (e.g., 3.01 TB/s vs 1.46 TB/s for FP32 softmax)** compared to torch.compile when reduction dimension is 262k. **Our impl also significantly outperforms all baselines when reduction dim >= 65k for all 3 kernels**.
+
+<figure>
+  <img
+  src="combined_kernel_benchmarks_final.png"
+  alt="Model memory throughput of multiple kernels">
+  <figcaption>Model memory throughput of multiple kernels</figcaption>
+</figure>
+</div>
