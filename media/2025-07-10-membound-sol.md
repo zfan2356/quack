@@ -546,7 +546,7 @@ Hitting “speed-of-light” model memory throughput confirms that a carefully h
   <img
   src="productivity-performance.png"
   alt="Productivity / Performance Pareto Frontier. From Phil Tillet’s talk.">
-  <figcaption>Productivity / Performance Pareto Frontier. From Phil Tillet’s [talk](https://semianalysis.com/wp-content/uploads/2025/03/Blackwell-Programming-for-the-Masses-With-OpenAI-Triton-Phil-Tillet.pdf).</figcaption>
+  <figcaption>Productivity / Performance Pareto Frontier. From Phil Tillet’s talk.</figcaption>
 </figure>
 </div>
 
@@ -555,3 +555,70 @@ We believe that an efficient GPU kernel development process could be automated. 
 #### Acknowledgments
 
 Huge thanks to the Nvidia Cutlass team for the awesome CuTe-DSL. Thanks to Yinwei Dai, Rui Pan, Mayank Mishra, Berlin Chen, Songlin Yang, and Xinyu Yang for feedback and suggestions that have improved this blogpost.
+
+#### References
+
+[1] Hwu, W. M. W., Kirk, D. B., & Hajj, I. E. (2022). Programming Massively Parallel Processors: A Hands-on Approach, Fourth Edition. Elsevier. https://doi.org/10.1016/C2020-0-02969-5
+
+[2] https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programming-model
+
+[3] https://fleetwood.dev/posts/domain-specific-architectures
+
+[4] https://chipsandcheese.com/p/nvidias-h100-funny-l2-and-tons-of-bandwidth
+
+[5] https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/#coalesced-access-to-global-memory
+
+[6] https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/
+
+[7] https://people.maths.ox.ac.uk/gilesm/cuda/lecs/lec4.pdf
+
+[8] https://resources.nvidia.com/en-us-data-center-overview/gtc22-whitepaper-hopper
+
+[9] https://github.com/linkedin/Liger-Kernel
+
+## Appendix
+
+### TV Layout
+
+For now let’s denote M as the batch dimension (columns) and N as the reduction dimension (rows). We will define our TV layout that we use to partition the input data for gmem coalesced access as below.
+
+We first define a few input-dependent hyperparams. We usually only tune `thread_per_row` and `cluster_n`.
+
+Tunable hyperparameters
+| Name           | Description                          |
+|----------------|--------------------------------------|
+| thread_per_row | # threads per row                    |
+| num_threads    | # threads per thread block           |
+| cluster_n      | Size of the thread block cluster     |
+| vecsize        | # elements per vectorized load       |
+
+
+And after we calculate the following 2 variables, we can derive our final TV-layout.
+
+Derived constants
+| Name           | Formula                                                        | Description                                 |
+|----------------|----------------------------------------------------------------|---------------------------------------------|
+| num_blocks_N   | # rows / (vec_size * thread_per_row * cluster_n)               | # reduced rows per thread block             |
+| cols_per_block | num_threads / thread_per_row                                   | # columns (batch dim) handled per thread block |
+
+This is our TV-layout.
+
+Layouts & tiler
+| Name  | Formula | Description |
+|-------|---------|-------------|
+| **Thread Layout** | (threads_per_row, cols_per_block): (vecsize × cols_per_block, 1)
+<br>**Shape**: (Block N, Block M)
+<br>**Stride**: (vecsize × Block M, 1) | Describes the layout of threads in a block. |
+| **Value Layout** | (vecsize, num_blocks_N): (cols_per_block, cols_per_block × vecsize × threads_per_row)
+<br>**Shape**: (vecsize, # reduced rows per thread block)
+<br>**Stride**: (Block M, # elements per thread block) | Describes the layout of values each thread accesses. |
+| **Tiler** | (cols_per_block, vecsize × num_blocks_N × threads_per_row)
+<br>(Block M, # reduced rows per cluster) | Describes how values are tiled across thread clusters. |
+
+<div align="center">
+<figure>
+  <img
+  src="tv_layout.png"
+  >
+</figure>
+</div>
