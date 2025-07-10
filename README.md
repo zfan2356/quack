@@ -31,6 +31,24 @@ Upcoming:
 from quack import rmsnorm, softmax, cross_entropy
 ```
 
+## Documentations
+
+[2025-07-10] We have a comprehensive
+[blogpost](media/2025-07-10-membound-sol.md) on how to get memory-bound kernels
+to speed-of-light, right in the comfort of Python thanks to the [CuTe-DSL](https://docs.nvidia.com/cutlass/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html).
+
+## Performance
+
+<div align="center">
+<figure>
+  <img
+  src="bf16_kernel_benchmarks_single_row.svg"
+  >
+</figure>
+</div>
+
+See our [blogpost](media/2025-07-10-membound-sol.md) for the details.
+
 ## Caveats 🦆⚠️
 
 **Tensor Size Limitation**: We currently only support tensors ≤ 4GB due to CuTe-DSL using int32 for indexing.
