@@ -37,7 +37,6 @@ class ReductionBase:
         vecsize = copy_bits // self.dtype.width
         assert self.N % vecsize == 0, f"Input N {self.N} is not divisible by vector size {vecsize}"
         num_threads = self._get_num_threads()
-        num_warps = num_threads // cute.arch.WARP_SIZE
         assert num_threads % cute.arch.WARP_SIZE == 0
 
         threads_per_row = self._calculate_threads_per_row()
