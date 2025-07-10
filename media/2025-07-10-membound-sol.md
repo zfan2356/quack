@@ -1,6 +1,15 @@
 # Getting Memory-bound Kernels to Speed-of-Light
 Wentao Guo, Ted Zadouri, Tri Dao
 
+<div align="center">
+<figure>
+  <img
+  src="bf16_kernel_benchmarks_single_row.svg"
+  >
+</figure>
+</div>
+
+
 To make GPUs go brrr for both model training and inference, one has to optimize both compute-bound kernels (e.g. matmul, attention) and memory-bound kernels (pretty much everything else, such as elementwise, normalization, loss). [Matmul](https://docs.nvidia.com/cuda/cublas/) and [attention](https://github.com/Dao-AILab/flash-attention/tree/main) are already some of the most heavily optimized subroutines that we have. Here we instead focus on memory-bound kernels, where most of the time is spent on memory access (IO) instead of on actual computation. By understanding and exploiting the thread and memory hierarchy on modern accelerators, we can get these kernels to close to speed-of-light (as fast as theoretically possible). Thanks to the recent [CuTe-DSL](https://docs.nvidia.com/cutlass/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html), we can do so right in the comfort of an ergonomic Python environment, without having to touch CUDA C or C++.
 
 For memory-bound kernels, the ratio between the number of Floating-point Operations (FLOPs) consumed and the number of bytes transferred is small (such ratio is called Arithmetic Intensity). Once a kernel’s arithmetic intensity enters the memory-bound regime, the kernel's throughput is determined by how many bytes/second the kernel can deliver rather than by FLOPs/second the kernel computes.
@@ -8,7 +17,7 @@ For memory-bound kernels, the ratio between the number of Floating-point Operati
 <div align="center">
 <figure>
   <img
-  src="our-16k-131k-arithmetic-intensity-white.png "
+  src="our-16k-131k-arithmetic-intensity-white.png"
   alt="Arithmetic intensity of a memory-bound softmax kernel is O(1)">
   <figcaption>Arithmetic intensity of a memory-bound softmax kernel is O(1)</figcaption>
 </figure>
@@ -415,6 +424,7 @@ We profile our softmax kernel implementation with batch dim=16K, reduction dim=1
 
 We achieve DRAM throughput (device memory throughput) at 3.01 TB/s which is 89.7% of the peak DRAM throughput. We also use DSMEM effectively besides SMEM.
 
+<div align="center">
 <figure>
   <img
   src="our-16k-131k.png"
@@ -493,6 +503,7 @@ We use a batch size from 8k to 32k, and a reduction dimension from 256 to 256 * 
 
 Our impl in CuTe DSL generally maintains a model memory throughput about 3 TB/s (~90% peak) for a reduction dimension larger than 4k, and **achieves nearly double throughput (e.g., 3.01 TB/s vs 1.46 TB/s for FP32 softmax)** compared to torch.compile when reduction dimension is 262k. **Our impl also significantly outperforms all baselines when reduction dim >= 65k for all 3 kernels**.
 
+<div align="center">
 <figure>
   <img
   src="combined_kernel_benchmarks_final.png"
@@ -500,3 +511,47 @@ Our impl in CuTe DSL generally maintains a model memory throughput about 3 TB/s 
   <figcaption>Model memory throughput of multiple kernels</figcaption>
 </figure>
 </div>
+
+**We believe our outstanding performance at >= 65k input is due to our successful utilization of cluster reduction in H100**. When the size of inputs are ultra long and depleting the SM’s registers and shared memory, without cluster reduction, we would have to switch to an online algorithm (like online softmax) otherwise we may get a massive register spilling that leads to significant throughput degradation.
+
+For example, we observe a significant performance degradation from ~3.0 TB/s to ~2.0 TB/s when we increase the input size from 32k to 65k with the Liger softmax kernel. By analyzing its memory workload chart and SASS code profile in NCU, we believe that a massive register spilling occurs with abnormally cascading write back to HBM as we are depleting each SM’s resources when we load 65k input per SM.
+
+<div align="center">
+<figure>
+  <img
+  src="liger-16k-65k-ncu.png"
+  alt="Liger softmax kernel’s memory workload at batch, reduce dim (16k, 65k) with FP32">
+  <figcaption>Liger softmax kernel’s memory workload at batch, reduce dim (16k, 65k) with FP32</figcaption>
+</figure>
+</div>
+
+
+<div align="center">
+<figure>
+  <img
+  src="liger-16k-65k.png"
+  alt="Liger softmax kernel’s register spills in assembly (LDL instruction)">
+  <figcaption>Liger softmax kernel’s register spills in assembly (LDL instruction)</figcaption>
+</figure>
+</div>
+
+However, cluster reduction allows multiple SMs to coordinate with each other and share their individual SM to form a “mega” SM (DSMEM). **Suppose one SM can only handle 32k inputs, a cluster with size 16 will allow us to handle 0.5M input without reloading from GMEM. As we have a clear understanding of hardware knowledge, we can easily squeeze every byte from all memory hierarchies and achieve “speed-of-light” throughput even with the vanilla 3-pass softmax**.
+
+## Conclusion
+
+Hitting “speed-of-light” model memory throughput confirms that a carefully hand-crafted CuTe kernel can squeeze every byte across all memory hierarchies in the hardware. But that efficiency comes at the price of per-operator and even per input-shape tuning, which imposes a natural tradeoff between efficiency and development efforts. Phil Tillet (Triton author) articulates this really well with this figure in his [talk](https://semianalysis.com/wp-content/uploads/2025/03/Blackwell-Programming-for-the-Masses-With-OpenAI-Triton-Phil-Tillet.pdf). In our experience with CuTe-DSL, it has offered both the productivity of Python with the control and performance of CUDA C++.
+
+<div align="center">
+<figure>
+  <img
+  src="productivity-performance.png"
+  alt="Productivity / Performance Pareto Frontier. From Phil Tillet’s talk.">
+  <figcaption>Productivity / Performance Pareto Frontier. From Phil Tillet’s [talk](https://semianalysis.com/wp-content/uploads/2025/03/Blackwell-Programming-for-the-Masses-With-OpenAI-Triton-Phil-Tillet.pdf).</figcaption>
+</figure>
+</div>
+
+We believe that an efficient GPU kernel development process could be automated. **For example, the input tensor’s TV-layout, load/store strategies, and reduction helper functions in RMSNorm can be directly applied in the softmax kernel and still achieve similar throughput**. Additionally, CuTe DSL would enable agile GPU kernel development on developer side or another codegen application operating on top of CuTe DSL. There is also an active research interest on applying LLM to auto-generate GPU kernels, and in the future, we may just call “LLM.compile” to generate highly-optimized GPU kernels.
+
+#### Acknowledgments
+
+Huge thanks to the Nvidia Cutlass team for the awesome CuTe-DSL. Thanks to Yinwei Dai, Rui Pan, Mayank Mishra, Berlin Chen, Songlin Yang, and Xinyu Yang for feedback and suggestions that have improved this blogpost.
