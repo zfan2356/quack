@@ -42,7 +42,7 @@ to speed-of-light, right in the comfort of Python thanks to the [CuTe-DSL](https
 <div align="center">
 <figure>
   <img
-  src="bf16_kernel_benchmarks_single_row.svg"
+  src="media/bf16_kernel_benchmarks_single_row.svg"
   >
 </figure>
 </div>
