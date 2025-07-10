@@ -165,7 +165,7 @@ Each thread will reduce a multiple of vectorized loaded values locally. We use t
 TensorSSA.reduce(op, init_val, reduction_profile**
 ```
 
-**Our example usage***:
+**Our example usage**:
 ```python
 max_x = x.reduce(cute.ReductionOp.MAX, init_val=float('-inf'),
                  reduction_profile=0)
@@ -179,7 +179,7 @@ A warp is a fixed group of 32 contiguous threads that would execute common instr
 We define a helper function `warp_reduce` that performs warp reduction with “ butterfly” reduction order. We will refer readers to the CUDA blog written by Yuan and Vinod [6] that explains warp-level primitives in detail.
 
 
-**Out helper function**:
+**Our helper function**:
 ```python
 @cute.jit
 def warp_reduce(val: cute.Numeric,
@@ -191,7 +191,7 @@ def warp_reduce(val: cute.Numeric,
     return val
 ```
 
-**Our example usage***:
+**Our example usage**:
 ```python
    max_x  = x.reduce(cute.ReductionOp.MAX, init_val=float('-inf'),
                      reduction_profile=0)
@@ -207,5 +207,48 @@ def warp_reduce(val: cute.Numeric,
   src="warp_reduction.png"
   alt="Butterfly warp reduction, also named “xor warp shuffle” [7]">
   <figcaption>Butterfly warp reduction, also named “xor warp shuffle” [7]</figcaption>
+</figure>
+</div>
+
+
+3. Block reduction (read and write to shared memory)
+
+A thread block usually composes multiple (up to 32 in H100) warps inside a thread block. In a block reduction, the first thread from each participating warp will write their warp-reduced value to a reduction buffer pre-allocated on the shared memory. After a block-level synchronization (barrier) that ensures every participating warp has finished writing, the top-laned threads of each warp will then read from the reduction buffer, and calculate the block-reduced value locally.
+
+**Our helper function**:
+```python
+@cute.jit
+def block_reduce(val: cute.Numeric,
+                 op: Callable,
+                 reduction_buffer: cute.Tensor,
+                 init_val: cute.Numeric = 0.0) -> cute.Numeric:
+    lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
+    warps_per_row      = reduction_buffer.shape[1]
+    row_idx, col_idx  = warp_idx // warps_per_row, warp_idx % warps_per_row
+    if lane_idx == 0:
+        # thread in lane 0 of each warp will write the warp-reduced value to the reduction buffer
+        reduction_buffer[row_idx, col_idx] = val
+    # synchronize the write results
+    cute.arch.barrier()
+
+    block_reduce_val = init_val
+    if lane_idx < warps_per_row:
+        # top-laned threads of each warp will read from the buffer
+        block_reduce_val = reduction_buffer[row_idx, lane_idx]
+    # then warp-reduce to get the block-reduced result
+    return warp_reduce(block_reduce_val, op)
+```
+
+**Our example usage**:
+```python
+max_x = block_reduce(max_x, cute.arch.fmax, max_val_reduction_buffer,
+                     init_val=max_x)
+```
+
+<div align="center">
+<figure>
+  <img
+  src="block_reduction.png"
+  >
 </figure>
 </div>
