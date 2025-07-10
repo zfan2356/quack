@@ -1,3 +1,5 @@
+# Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
+
 import math
 import torch
 from typing import Optional, Type
@@ -260,8 +262,6 @@ class CrossEntropyBackward:
         self.dtype = dtype
         self.N = N
         self.vecsize = 128 // dtype.width
-        # Will be set later depending on N and dtype
-        self.cluster_n: int | cutlass.Constexpr = 1
 
     def _calculate_threads_per_row(self):
         N = self.N
@@ -275,37 +275,13 @@ class CrossEntropyBackward:
             )
         )
 
-    def _set_cluster_n(self):
-        N = self.N
-        if cutlass.const_expr(self.dtype.width == 16):
-            cluster_n = (
-                1
-                if N <= 16 * 1024
-                else (
-                    2
-                    if N <= 32 * 1024
-                    else (4 if N <= 64 * 1024 else (8 if N <= 128 * 1024 else 16))
-                )
-            )
-        else:
-            cluster_n = (
-                1
-                if N <= 32 * 1024
-                else (
-                    2
-                    if N <= 64 * 1024
-                    else (4 if N <= 128 * 1024 else (8 if N <= 256 * 1024 else 16))
-                )
-            )
-        self.cluster_n = cluster_n
-
     def _get_tv_layout(self):
         N = self.N
         vecsize = self.vecsize
         num_threads = 128 if N <= 16384 else 256
         threads_per_row = self._calculate_threads_per_row()
         cols_per_block = num_threads // threads_per_row
-        num_blocks_N = cute.ceil_div(N // vecsize, threads_per_row * self.cluster_n)
+        num_blocks_N = cute.ceil_div(min(N, 16384) // vecsize, threads_per_row)
         tiler_mn = (cols_per_block, vecsize * num_blocks_N * threads_per_row)
         tv_layout = cute.make_layout(
             ((threads_per_row, cols_per_block), (vecsize, num_blocks_N)),
@@ -322,17 +298,15 @@ class CrossEntropyBackward:
         mX: cute.Tensor,
         mTarget: cute.Tensor,
         mDLoss: cute.Tensor,
-        mGrad: cute.Tensor,
+        mdX: cute.Tensor,
         mLSE: cute.Tensor,
         stream: cuda.CUstream,
     ):
         assert mX.element_type == self.dtype
-        assert mGrad.element_type == self.dtype
+        assert mdX.element_type == self.dtype
 
-        self._set_cluster_n()
         tiler_mn, tv_layout = self._get_tv_layout()
         num_threads = cute.size(tv_layout, mode=[0])
-        num_warps = num_threads // cute.arch.WARP_SIZE
 
         mDLoss = cute.make_tensor(
             mDLoss.iterator, cute.append(mDLoss.layout, cute.make_layout((self.N,), stride=(0,)))
@@ -352,16 +326,18 @@ class CrossEntropyBackward:
             mX,
             mTarget,
             mDLoss,
-            mGrad,
+            mdX,
             mLSE,
             mX.shape,
             tv_layout,
             tiler_mn,
-            self.cluster_n,
         ).launch(
-            grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
+            grid=[
+                cute.ceil_div(mX.shape[0], tiler_mn[0]),
+                cute.ceil_div(mX.shape[1], tiler_mn[1]),
+                1,
+            ],
             block=[num_threads, 1, 1],
-            cluster=[1, self.cluster_n, 1] if self.cluster_n > 1 else None,
             smem=smem_size,
             stream=stream,
         )
@@ -372,15 +348,14 @@ class CrossEntropyBackward:
         mX: cute.Tensor,  # (M, N)
         mTarget: cute.Tensor,  # (M,)
         mDLoss: cute.Tensor,  # (M,)
-        mGrad: cute.Tensor,  # (M, N)
+        mdX: cute.Tensor,  # (M, N)
         mLSE: cute.Tensor,  # (M,)
         shape: cute.Shape,
         tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
-        cluster_n: cutlass.Constexpr = 1,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, cluster_y, _ = cute.arch.block_idx()
+        bidx, bidy, _ = cute.arch.block_idx()
 
         smem = cutlass.utils.SmemAllocator()
         sX = smem.allocate_tensor(
@@ -389,9 +364,9 @@ class CrossEntropyBackward:
 
         idX = cute.make_identity_tensor(shape)
 
-        gX, gGrad, cX, gTarget, gDLoss, gLse = [
-            cute.local_tile(mT, tiler_mn, (bidx, 0 if self.cluster_n == 1 else cluster_y))
-            for mT in (mX, mGrad, idX, mTarget, mDLoss, mLSE)
+        gX, gdX, cX, gTarget, gDLoss, gLse = [
+            cute.local_tile(mT, tiler_mn, (bidx, bidy))
+            for mT in (mX, mdX, idX, mTarget, mDLoss, mLSE)
         ]
 
         copy_atom_load_X = cute.make_copy_atom(
@@ -401,7 +376,7 @@ class CrossEntropyBackward:
             cute.nvgpu.cpasync.CopyG2SOp(), gX.element_type, num_bits_per_copy=128
         )
         copy_atom_store_O = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), gGrad.element_type, num_bits_per_copy=128
+            cute.nvgpu.CopyUniversalOp(), gdX.element_type, num_bits_per_copy=128
         )
 
         thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
@@ -417,15 +392,12 @@ class CrossEntropyBackward:
         tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
         tXcFull = thr_copy_X.partition_S(cX)  # improve
 
-        tXrDLoss = thr_copy_X.partition_S(gDLoss)
-        tXrLse = thr_copy_X.partition_S(gLse)
-        tXrTarget = thr_copy_X.partition_S(gTarget)
-        tXgO = thr_copy_O.partition_D(gGrad)
+        tXgO = thr_copy_O.partition_D(gdX)
 
         # allocate fragments for gmem->rmem
         tXrX, tXrO = [cute.make_fragment_like(thr) for thr in (tXgX, tXgO)]
 
-        is_even_N = cutlass.const_expr(shape[1] == tiler_mn[1] * cluster_n)
+        is_even_N = cutlass.const_expr(shape[1] % tiler_mn[1] == 0)
         row = tXcX[0][0]
 
         tXpX = (
@@ -436,10 +408,8 @@ class CrossEntropyBackward:
 
         if row < shape[0]:
             cute.copy(copy_atom_load_X_async, tXgX, tXsX, pred=tXpX)
-
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
-
         if cutlass.const_expr(not is_even_N):
             utils.fill_oob(tXsX, tXpX, -tXsX.element_type.inf)
 
@@ -449,11 +419,10 @@ class CrossEntropyBackward:
         label = cute.Int32.zero
         dloss = cute.Float32.zero
         lse = cute.Float32.zero
-
-        if row < shape[0]:  # and tXcX[0][1] == 0:
-            label = cute.Int32(tXrTarget[0])
-            dloss = cute.Float32(tXrDLoss[0])
-            lse = cute.Float32(tXrLse[0])
+        if row < shape[0]:
+            label = cute.Int32(mTarget[row])
+            dloss = cute.Float32(mDLoss[row])
+            lse = cute.Float32(mLSE[row])
 
         log2_e = math.log2(math.e)
         probs = utils.exp2f((x - lse) * log2_e)
@@ -480,7 +449,7 @@ def _cross_entropy_backward(
     target: torch.Tensor,
     dloss: torch.Tensor,
     lse: torch.Tensor,
-    # grad: torch.Tensor,
+    inplace_backward: bool = False,
 ) -> torch.Tensor:
     """Cross entropy backward pass.
     Args:
@@ -505,7 +474,7 @@ def _cross_entropy_backward(
     assert target.dtype in [torch.int32, torch.int64], "Target must be int32 or int64"
 
     M, N = x.shape
-    grad = torch.empty_like(x)
+    dx = torch.empty_like(x) if not inplace_backward else x
     dtype = torch2cute_dtype_map[x.dtype]
 
     convert_from_dlpack = lambda tensor: (
@@ -514,7 +483,7 @@ def _cross_entropy_backward(
         )
     )
     x_tensor = convert_from_dlpack(x)
-    grad_tensor = convert_from_dlpack(grad)
+    dx_tensor = convert_from_dlpack(dx)
     dloss_tensor = from_dlpack(dloss.detach(), assumed_align=16).mark_compact_shape_dynamic(mode=0)
     lse_tensor = from_dlpack(lse.detach(), assumed_align=16).mark_compact_shape_dynamic(mode=0)
     target_tensor = from_dlpack(target.detach(), assumed_align=32).mark_compact_shape_dynamic(
@@ -530,14 +499,14 @@ def _cross_entropy_backward(
             x_tensor,
             target_tensor,
             dloss_tensor,
-            grad_tensor,
+            dx_tensor,
             lse_tensor,
             stream,
         )
     _cross_entropy_backward.compile_cache[compile_key](
-        x_tensor, target_tensor, dloss_tensor, grad_tensor, lse_tensor, stream
+        x_tensor, target_tensor, dloss_tensor, dx_tensor, lse_tensor, stream
     )
-    return grad
+    return dx
 
 
 _cross_entropy_backward.compile_cache = {}
@@ -545,19 +514,22 @@ _cross_entropy_backward.compile_cache = {}
 
 class CrossEntropyFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, target):
+    def forward(ctx, x, target, inplace_backward=False):
         loss, lse = _cross_entropy(x, target, return_lse=True)
         ctx.save_for_backward(x, target, lse)
+        ctx.inplace_backward = inplace_backward
         return loss
 
     @staticmethod
     def backward(ctx, dloss):
         x, target, lse = ctx.saved_tensors
-        dx = _cross_entropy_backward(x, target, dloss, lse)
-        return dx, None
+        dx = _cross_entropy_backward(x, target, dloss, lse, inplace_backward=ctx.inplace_backward)
+        return dx, None, None
 
 
-def cross_entropy(x: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def cross_entropy(
+    x: torch.Tensor, target: torch.Tensor, inplace_backward: bool = False
+) -> torch.Tensor:
     """Cross entropy loss with automatic differentiation support.
 
     Args:
@@ -567,4 +539,4 @@ def cross_entropy(x: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     Returns:
         Cross entropy loss tensor of shape (M,)
     """
-    return CrossEntropyFunction.apply(x, target)
+    return CrossEntropyFunction.apply(x, target, inplace_backward)
