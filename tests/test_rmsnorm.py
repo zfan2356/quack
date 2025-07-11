@@ -46,44 +46,47 @@ def test_rmsnorm_forward(M, N, input_dtype, eps):
 
 
 # @pytest.mark.parametrize("eps", [1e-5, 1e-6])
+@pytest.mark.parametrize("eps", [1e-5])
 # @pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("N", [1024, 4096, 16384])
-# def test_rmsnorm_backward(N, input_dtype, eps):
-#     """Test RMSNorm backward pass against reference implementation."""
-#     device = "cuda"
-#     M = 32
+@pytest.mark.parametrize("N", [4096])
+def test_rmsnorm_backward(N, input_dtype, eps):
+    """Test RMSNorm backward pass against reference implementation."""
+    device = "cuda"
+    M = 32 * 1024
 
-#     # Set tolerance based on dtype
-#     if input_dtype == torch.bfloat16:
-#         atol = 5e-2
-#     elif input_dtype == torch.float16:
-#         atol = 1e-2
-#     else:
-#         atol = 1e-4
+    # Set tolerance based on dtype
+    if input_dtype == torch.bfloat16:
+        atol = 5e-2
+    elif input_dtype == torch.float16:
+        atol = 1e-2
+    else:
+        atol = 1e-4
 
-#     # Set seed for reproducibility
-#     torch.random.manual_seed(0)
+    # Set seed for reproducibility
+    torch.random.manual_seed(0)
 
-#     # Create input tensors
-#     x = torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=True)
-#     weight = torch.randn(N, device=device, dtype=torch.float32, requires_grad=True)
+    # Create input tensors
+    x = torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=True)
+    weight = torch.randn(N, device=device, dtype=torch.float32, requires_grad=True)
 
-#     # Clone for reference
-#     x_ref = x.detach().clone().requires_grad_()
-#     weight_ref = weight.detach().clone().requires_grad_()
+    # Clone for reference
+    x_ref = x.detach().clone().requires_grad_()
+    weight_ref = weight.detach().clone().requires_grad_()
 
-#     # Forward pass
-#     out = rmsnorm(x, weight, eps=eps)
-#     out_ref = rmsnorm_ref(x_ref, weight_ref, eps=eps)
+    # Forward pass
+    out = rmsnorm(x, weight, eps=eps)
+    out_ref = rmsnorm_ref(x_ref, weight_ref, eps=eps)
 
-#     # Backward pass
-#     grad_out = torch.randn_like(out)
-#     out.backward(grad_out)
-#     out_ref.backward(grad_out)
+    # Backward pass
+    grad_out = torch.randn_like(out)
+    out.backward(grad_out)
+    out_ref.backward(grad_out)
 
-#     # Check gradients
-#     torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=1e-3)
-#     torch.testing.assert_close(weight.grad, weight_ref.grad, atol=atol, rtol=1e-3)
+    # Check gradients
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=1e-3)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=atol, rtol=1e-3)
 
 
 @pytest.mark.parametrize("eps", [1e-5])

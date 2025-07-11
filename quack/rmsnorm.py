@@ -300,8 +300,11 @@ def rmsnorm_bwd_ref(x, w, dout, rstd, eps=1e-6):
 
 class RMSNormBackward(ReductionBase):
     def __init__(self, dtype: cutlass.Numeric, N: int):
-        # 1 stage for computing mean of x_hat * wdy
-        super().__init__(dtype, N, stage=1, reduction_dtype=cutlass.Float32)
+        # 2 stages for double buffering when computing mean of x_hat * wdy
+        super().__init__(dtype, N, stage=2, reduction_dtype=cutlass.Float32)
+
+    def _get_num_threads(self):
+        return 128 if self.N <= 4096 else 256
 
     def _calculate_threads_per_row(self):
         N = self.N
@@ -311,7 +314,7 @@ class RMSNormBackward(ReductionBase):
             else (
                 16
                 if N <= 128
-                else (32 if N <= 1024 else (64 if N <= 2048 else (128 if N <= 8192 else 256)))
+                else (32 if N <= 1024 else (64 if N <= 2048 else (128 if N <= 4096 else 256)))
             )
         )
 
@@ -344,10 +347,10 @@ class RMSNormBackward(ReductionBase):
         self,
         mX: cute.Tensor,
         mW: cute.Tensor,
-        mDout: cute.Tensor,
+        mdOut: cute.Tensor,
         mRstd: cute.Tensor,
-        mDx: cute.Tensor,
-        mDw: cute.Tensor,
+        mdX: cute.Tensor,
+        mdW: cute.Tensor,
         sm_count: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -359,14 +362,11 @@ class RMSNormBackward(ReductionBase):
         mW_expanded_layout = cute.prepend(mW.layout, cute.make_layout((tiler_mn[0],), stride=(0,)))
         mW = cute.make_tensor(mW.iterator, mW_expanded_layout)
 
-        mRstd_expanded_layout = cute.append(mRstd.layout, cute.make_layout((self.N,), stride=(0,)))
-        mRstd = cute.make_tensor(mRstd.iterator, mRstd_expanded_layout)
-
         num_blocks = (
             sm_count if tiler_mn[0] == 1 else min(sm_count, cute.ceil_div(1024, tiler_mn[0]))
         )
 
-        self.kernel(mX, mW, mDout, mRstd, mDx, mDw, sm_count, tv_layout, tiler_mn).launch(
+        self.kernel(mX, mW, mdOut, mRstd, mdX, mdW, tv_layout, tiler_mn).launch(
             grid=[num_blocks, self.cluster_n, 1],
             block=[num_threads, 1, 1],
             cluster=[1, self.cluster_n, 1] if self.cluster_n > 1 else None,
@@ -379,17 +379,20 @@ class RMSNormBackward(ReductionBase):
         self,
         mX: cute.Tensor,
         mW: cute.Tensor,
-        mDout: cute.Tensor,
+        mdOut: cute.Tensor,
         mRstd: cute.Tensor,
-        mDx: cute.Tensor,
-        mDw: cute.Tensor,
-        sm_count: cutlass.Constexpr,
+        mdX: cute.Tensor,
+        mdW: cute.Tensor,
         tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, cluster_y, _ = cute.arch.block_idx()
+        bidx_start, _, _ = cute.arch.block_idx()
         gdim, _, _ = cute.arch.grid_dim()
+        if cutlass.const_expr(self.cluster_n > 1):
+            cluster_y = cute.arch.block_idx()[1]
+        else:
+            cluster_y = cutlass.const_expr(0)
 
         shape = mX.shape
         M, N = shape[0], shape[1]
@@ -408,11 +411,11 @@ class RMSNormBackward(ReductionBase):
         )
 
         copy_atom_store_dX = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), mDx.element_type, num_bits_per_copy=128
+            cute.nvgpu.CopyUniversalOp(), mdX.element_type, num_bits_per_copy=128
         )
 
         copy_atom_dw = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), mDw.element_type, num_bits_per_copy=128
+            cute.nvgpu.CopyUniversalOp(), mdW.element_type, num_bits_per_copy=128
         )
 
         thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
@@ -420,12 +423,12 @@ class RMSNormBackward(ReductionBase):
         thr_copy_dw = cute.make_tiled_copy(copy_atom_dw, tv_layout, tiler_mn).get_slice(tidx)
         thr_store_dx = cute.make_tiled_copy(copy_atom_store_dX, tv_layout, tiler_mn).get_slice(tidx)
 
-        gW = cute.local_tile(mW, tiler_mn, (bidx, 0 if self.cluster_n == 1 else cluster_y))
+        gW = cute.local_tile(mW, tiler_mn, (bidx_start, cluster_y))
         tWgW = thr_copy_W.partition_S(gW)
         tWrW = cute.make_fragment_like(tWgW)
         tXrW = thr_copy_X.retile(tWrW)
 
-        gW_coord = cute.local_tile(idX, tiler_mn, (0, 0 if self.cluster_n == 1 else cluster_y))
+        gW_coord = cute.local_tile(idX, tiler_mn, (0, cluster_y))
 
         tWpW = utils.predicate_k(thr_copy_W.partition_S(gW_coord), limit=shape[1])
         cute.copy(copy_atom_load_W, tWgW, tWrW, pred=tWpW)
@@ -435,117 +438,62 @@ class RMSNormBackward(ReductionBase):
 
         self._initialize_cluster(tidx, mbar_ptr, num_warps)
 
-        dw_coord = cute.local_tile(idX, tiler_mn, (0, 0 if self.cluster_n == 1 else cluster_y))
+        dw_coord = cute.local_tile(idX, tiler_mn, (0, cluster_y))
         tDwpDw = utils.predicate_k(thr_copy_dw.partition_S(dw_coord), limit=shape[1])
 
-        gDw = cute.local_tile(mDw, tiler_mn, (bidx, 0 if self.cluster_n == 1 else cluster_y))
+        gDw = cute.local_tile(mdW, tiler_mn, (bidx_start, cluster_y))
         tDwgDw = thr_copy_dw.partition_D(gDw)
-        tDwrDw = cute.make_fragment_like(tDwgDw)
-        dw_accumulator = thr_copy_X.retile(tDwrDw)
-        dw_accumulator.fill(0.0)
+        tDwrDw = cute.make_fragment_like(tDwgDw, cutlass.Float32)
+        tXrdW = thr_copy_X.retile(tDwrDw)
 
-        jump = sm_count if tiler_mn[0] == 1 else min(sm_count, cute.ceil_div(1024, tiler_mn[0]))
+        gX = cute.local_tile(mX, tiler_mn, (None, cluster_y))
+        gdOut = cute.local_tile(mdOut, tiler_mn, (None, cluster_y))
+        gdX = cute.local_tile(mdX, tiler_mn, (None, cluster_y))
+        cX = cute.local_tile(idX, tiler_mn, (None, cluster_y))
+        tXgX = thr_copy_X.partition_S(gX)
+        tXgdOut = thr_copy_X.partition_S(gdOut)
+        tXgdX = thr_store_dx.partition_D(gdX)
+        tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None, None]
+        # This doesn't change across iterations
+        tXpX = utils.predicate_k(thr_copy_X.partition_S(cX[None, None, 0]), limit=shape[1])
+
+        tXrX, tXrdOut, tXrdX = [
+            cute.make_fragment_like(thr[None, None, None, 0]) for thr in (tXgX, tXgdOut, tXgdX)
+        ]
 
         if cutlass.const_expr(self.cluster_n > 1):
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
 
-        for row_offset in cutlass.range(bidx, M, jump):
-            gX = cute.local_tile(
-                mX, tiler_mn, (row_offset, 0 if self.cluster_n == 1 else cluster_y)
-            )
-            gDout = cute.local_tile(
-                mDout, tiler_mn, (row_offset, 0 if self.cluster_n == 1 else cluster_y)
-            )
-            gRstd = cute.local_tile(
-                mRstd, tiler_mn, (row_offset, 0 if self.cluster_n == 1 else cluster_y)
-            )
-            gDx = cute.local_tile(
-                mDx, tiler_mn, (row_offset, 0 if self.cluster_n == 1 else cluster_y)
-            )
-            cX = cute.local_tile(
-                idX, tiler_mn, (row_offset, 0 if self.cluster_n == 1 else cluster_y)
-            )
-
-            tXgX = thr_copy_X.partition_S(gX)
-            thrDout = thr_copy_X.partition_S(gDout)
-            tXrRstd = thr_copy_W.partition_S(gRstd)
-            thrDx = thr_store_dx.partition_D(gDx)
-            tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
-
-            tXrX, frgDout, frgDx = [cute.make_fragment_like(thr) for thr in (tXgX, thrDout, thrDx)]
-
-            tXpX = utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
-
-            if tXcX[0][0] < shape[0]:
-                cute.copy(copy_atom_load_X, tXgX, tXrX, pred=tXpX)
-                cute.copy(copy_atom_load_X, thrDout, frgDout, pred=tXpX)
-
+        threads_per_row = tv_layout.shape[0][0]
+        tXrdW.fill(0.0)
+        stage = cutlass.Int32(0)
+        for bidx in cutlass.range(bidx_start, M, gdim):
+            cute.copy(copy_atom_load_X, tXgX[None, None, None, bidx], tXrX, pred=tXpX)
+            cute.copy(copy_atom_load_X, tXgdOut[None, None, None, bidx], tXrdOut, pred=tXpX)
             x = tXrX.load().to(cute.Float32)
-            dout = frgDout.load().to(cute.Float32)
-
-            rstd = tXrRstd[0]
+            dout = tXrdOut.load().to(cute.Float32)
+            row = tXcX[None, None, None, bidx][0][0]
+            rstd = mRstd[row]
             x_hat = x * rstd
             wdy = dout * weight
-
-            threads_per_row = tv_layout.shape[0][0]
-
-            row = tXcX[0][0]
-            if cutlass.const_expr(self.cluster_n > 1):
-                cute.arch.cluster_arrive()
-                cute.arch.cluster_wait()
-            else:
-                cute.arch.barrier()
-
             mean_xhat_wdy = (
                 utils.row_reduce(
                     x_hat * wdy,
                     cute.ReductionOp.ADD,
                     threads_per_row,
-                    reduction_buffer[None, None, 0],
-                    mbar_ptr + 0 if cutlass.const_expr(self.cluster_n > 1) else None,
+                    reduction_buffer[None, None, stage],
+                    mbar_ptr + stage if cutlass.const_expr(self.cluster_n > 1) else None,
                     init_val=0.0,
-                    hook_fn=cute.arch.cluster_wait
-                    if cutlass.const_expr(self.cluster_n > 1)
-                    else None,
                 )
                 / shape[1]
             )
-
             dx = (wdy - x_hat * mean_xhat_wdy) * rstd
-            frgDx.store(dx.to(frgDout.element_type))
+            tXrdX.store(dx.to(tXrdOut.element_type))
+            cute.copy(copy_atom_store_dX, tXrdX, tXgdX[None, None, None, bidx], pred=tXpX)
+            tXrdW.store(tXrdW.load() + dout * x_hat)
+            stage ^= 1
 
-            if row < M:
-                cute.copy(copy_atom_store_dX, frgDx, thrDx, pred=tXpX)
-
-            if cutlass.const_expr(self.cluster_n > 1):
-                cute.arch.cluster_arrive()
-                cute.arch.cluster_wait()
-            else:
-                cute.arch.barrier()
-
-            if row < M:
-                dw_row = dout * x_hat
-                current_dw = dw_accumulator.load().to(cute.Float32)
-                updated_dw = current_dw + dw_row
-                dw_accumulator.store(updated_dw.to(dw_accumulator.element_type))
-
-            """ 
-            if cutlass.const_expr(self.cluster_n > 1):
-                cute.arch.cluster_arrive()
-                cute.arch.cluster_wait()
-            else:
-                cute.arch.barrier()
-            """
-        """ 
-        if cutlass.const_expr(self.cluster_n > 1):
-            cute.arch.cluster_arrive()
-            cute.arch.cluster_wait()
-        else:
-            cute.arch.barrier()
-        """
-
-        cute.autovec_copy(dw_accumulator, tDwrDw)
         cute.copy(copy_atom_dw, tDwrDw, tDwgDw, pred=tDwpDw)
 
 
