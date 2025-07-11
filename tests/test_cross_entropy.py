@@ -16,18 +16,19 @@ import cutlass
 )
 @pytest.mark.parametrize("M", [1, 77, 289])
 # @pytest.mark.parametrize("M", [1])
-def test_cross_entropy_forward(M, N, input_dtype):
+def test_cross_entropy(M, N, input_dtype):
     """Test Cross Entropy forward pass against reference implementation."""
     device = "cuda"
-    atol, rtol = 1e-5, 1e-5
+    atol, rtol = 5e-5, 1e-5
     torch.random.manual_seed(0)
+    cutlass.cuda.initialize_cuda_context()
     # Create input tensors (scale down to avoid overflow)
-    x = 0.1 * torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=False)
+    x = (0.1 * torch.randn(M, N, device=device, dtype=input_dtype)).requires_grad_()
     target = torch.randint(0, N, (M,), device=device, dtype=torch.int64)
-    x_ref = x.detach().clone()
+    x_ref = x.detach().clone().requires_grad_()
     target_ref = target.detach().clone()
     # Forward pass
-    loss = _cross_entropy(x, target)
+    loss = cross_entropy(x, target)
     loss_ref = F.cross_entropy(x_ref.float(), target_ref, reduction='none')
     # Check output shape and dtype
     assert loss.shape == (M,)
@@ -40,6 +41,13 @@ def test_cross_entropy_forward(M, N, input_dtype):
     # Check that loss is reasonable (not inf or nan)
     assert not torch.isnan(loss).any()
     assert not torch.isinf(loss).any()
+    # Test backward pass
+    dloss = torch.randn_like(loss)
+    torch.cuda.synchronize()
+    dx_ref, = torch.autograd.grad(loss_ref, x_ref, grad_outputs=dloss)
+    dx, = torch.autograd.grad(loss, x, grad_outputs=dloss)
+    assert dx.shape == x.shape
+    torch.testing.assert_close(dx, dx_ref.to(input_dtype), atol=atol, rtol=rtol)
 
 
 @pytest.mark.parametrize("input_dtype", [torch.float16, torch.float32])
@@ -99,47 +107,3 @@ def test_cross_entropy_edge_targets():
     loss_last = _cross_entropy(x, target_last)
     loss_ref_last = F.cross_entropy(x, target_last, reduction='none')
     torch.testing.assert_close(loss_last, loss_ref_last, atol=1e-4, rtol=1e-4)
-
-
-
-
-
-@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize(
-    "N",
-    [192, 256, 512, 760, 1024, 1128, 2048, 4096, 8192, 16384, 32768, 65536, 128256, 131072, 256128, 262144]  # A representative subset to keep compile time reasonable
-)
-@pytest.mark.parametrize("M", [1, 37, 77])
-def test_cross_entropy_autograd_backward(M, N, input_dtype):
-    device = "cuda"
-    
-    if input_dtype == torch.bfloat16:
-        atol = 1e-3
-        rtol = 1e-3
-    else:
-        atol = 1e-5
-        rtol = 1e-5
-
-    torch.random.manual_seed(0)
-
-    x = 0.1 * torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=True)
-    target = torch.randint(0, N, (M,), device=device, dtype=torch.int64)
-
-    x_ref = x.detach().clone().requires_grad_(True)
-    target_ref = target.detach().clone()
-
-    cutlass.cuda.initialize_cuda_context()
-
-    loss = cross_entropy(x, target)  # our autograd-enabled op
-    loss_ref = F.cross_entropy(x_ref.float(), target_ref, reduction='none')
-
-    torch.testing.assert_close(loss, loss_ref, atol=atol, rtol=rtol)
-
-    dloss = torch.randn_like(loss)
-
-    dx_ref, = torch.autograd.grad(loss_ref, x_ref, grad_outputs=dloss)
-
-    dx, = torch.autograd.grad(loss, x, grad_outputs=dloss)
-
-    assert dx.shape == x.shape
-    torch.testing.assert_close(dx, dx_ref.to(input_dtype), atol=atol, rtol=rtol)

@@ -104,7 +104,10 @@ class CrossEntropy(ReductionBase):
         shape: cute.Shape = mX.shape
         idX = cute.make_identity_tensor(shape)
         # slice for CTAs
-        gX, cX = [cute.local_tile(mT, tiler_mn, (bidx, cluster_y)) for mT in (mX, idX)]
+        # We use domain_offset_i64 to deal with tensors larger than 2^31 elements
+        mX_off = utils.domain_offset_i64((bidx * tiler_mn[0], 0), mX)
+        gX = cute.local_tile(mX_off, tiler_mn, (0, cluster_y))
+        cX = cute.local_tile(idX, tiler_mn, (bidx, cluster_y))
 
         smem = cutlass.utils.SmemAllocator()
         sX = smem.allocate_tensor(
@@ -150,7 +153,9 @@ class CrossEntropy(ReductionBase):
 
         target_logit = cute.Float32.zero
         if row < shape[0] and tXcX[0][1] == 0:
-            target_logit = cute.Float32(mX[row, target])
+            # Use Int64 for indexing to deal with large tensors
+            mX_off = utils.domain_offset_i64((row, 0), mX)
+            target_logit = cute.Float32(mX_off[0, target])
 
         threads_per_row = tv_layout.shape[0][0]
         if cutlass.const_expr(not self.online_softmax):
@@ -363,11 +368,10 @@ class CrossEntropyBackward:
         )
 
         idX = cute.make_identity_tensor(shape)
-
-        gX, gdX, cX, gTarget, gDLoss, gLse = [
-            cute.local_tile(mT, tiler_mn, (bidx, bidy))
-            for mT in (mX, mdX, idX, mTarget, mDLoss, mLSE)
-        ]
+        # We use domain_offset_i64 to deal with tensors larger than 2^31 elements
+        mX, mdX = [utils.domain_offset_i64((bidx * tiler_mn[0], 0), mT) for mT in (mX, mdX)]
+        gX, gdX = [cute.local_tile(mT, tiler_mn, (0, bidy)) for mT in (mX, mdX)]
+        cX = cute.local_tile(idX, tiler_mn, (bidx, bidy))
 
         copy_atom_load_X = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), gX.element_type, num_bits_per_copy=128

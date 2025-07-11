@@ -124,7 +124,10 @@ class LayerNorm(ReductionBase):
         shape = mX.shape
         idX = cute.make_identity_tensor(shape)
         # slice for CTAs
-        gX, gO, cX = [cute.local_tile(mT, tiler_mn, (bidx, cluster_y)) for mT in (mX, mO, idX)]
+        # We use domain_offset_i64 to deal with tensors larger than 2^31 elements
+        mX, mO = [utils.domain_offset_i64((bidx * tiler_mn[0], 0), mT) for mT in (mX, mO)]
+        gX, gO = [cute.local_tile(mT, tiler_mn, (0, cluster_y)) for mT in (mX, mO)]
+        cX = cute.local_tile(idX, tiler_mn, (bidx, cluster_y))
         gW = cute.local_tile(mW, tiler_mn, (0, cluster_y))
         gRstd = (
             cute.local_tile(mRstd, tiler_mn, (bidx, cluster_y))
