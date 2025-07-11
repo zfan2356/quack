@@ -34,7 +34,7 @@ def test_softmax(M, N, input_dtype):
 
     torch.random.manual_seed(0)
     # Create input tensors (scale down to avoid overflow in softmax)
-    x = 0.1 * torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=True)
+    x = (0.1 * torch.randn(M, N, device=device, dtype=input_dtype)).requires_grad_()
     x_ref = x.detach().clone().requires_grad_(True)
 
     # Forward pass
@@ -58,13 +58,12 @@ def test_softmax(M, N, input_dtype):
 
     # Test backward pass
     dy = torch.randn_like(out)
+    torch.cuda.synchronize()  # without sync, torch.autograd gets wrong results
     dx_ref, = torch.autograd.grad(out_ref, x_ref, grad_outputs=dy)
     # Call our implementation later, otherwise getting CUDA_ERROR_INVALID_CONTEXT
     dx, = torch.autograd.grad(out, x, grad_outputs=dy)
-    # Check output shape and dtype
     assert dx.shape == dy.shape
     assert dx.dtype == input_dtype
-    # Check accuracy against reference
     torch.testing.assert_close(dx, dx_ref, atol=atol, rtol=rtol)
 
 
