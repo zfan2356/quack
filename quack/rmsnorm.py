@@ -311,7 +311,7 @@ class RMSNormBackward(ReductionBase):
             else (
                 16
                 if N <= 128
-                else (32 if N <= 3072 else (64 if N <= 6144 else (128 if N <= 16384 else 256)))
+                else (32 if N <= 1024 else (64 if N <= 2048 else (128 if N <= 8192 else 256)))
             )
         )
 
@@ -444,16 +444,13 @@ class RMSNormBackward(ReductionBase):
         dw_accumulator = thr_copy_X.retile(tDwrDw)
         dw_accumulator.fill(0.0)
 
-        M_pad = ((M + sm_count - 1) // sm_count) * sm_count
-
         jump = sm_count if tiler_mn[0] == 1 else min(sm_count, cute.ceil_div(1024, tiler_mn[0]))
 
         if cutlass.const_expr(self.cluster_n > 1):
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
 
-        ## need to update range_dynamic since it will be deprecated soon
-        for row_offset in cutlass.range_dynamic(bidx, M_pad, jump):
+        for row_offset in cutlass.range(bidx, M, jump):
             gX = cute.local_tile(
                 mX, tiler_mn, (row_offset, 0 if self.cluster_n == 1 else cluster_y)
             )
@@ -581,7 +578,8 @@ def _rmsnorm_backward(
 
     device = x.device
 
-    sm_count = torch.cuda.get_device_properties(device).multi_processor_count * 8
+    # This should be tuned on how many CTAs can be launched on each SM
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count * 2
     dw_partial = torch.zeros((sm_count, N), device=device, dtype=weight.dtype)
 
     dtype = torch2cute_dtype_map[x.dtype]

@@ -8,7 +8,7 @@ from triton.testing import do_bench
 import cutlass
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
-from quack.rmsnorm import _rmsnorm_fwd, rmsnorm_ref, rmsnorm
+from quack.rmsnorm import _rmsnorm_fwd, rmsnorm_ref, rmsnorm, _rmsnorm_backward
 import cutlass.cute as cute
 
 try:
@@ -138,7 +138,7 @@ def run_rmsnorm_bwd(
 
     torch_dtype = cutlass_torch.dtype(dtype)
     device = "cuda"
-    
+
     # Set up forward pass inputs with gradients enabled
     x = torch.randn(M, N, device=device, dtype=torch_dtype, requires_grad=True)
     x_ref = x.detach().clone().requires_grad_()
@@ -150,27 +150,35 @@ def run_rmsnorm_bwd(
     print(f"w: {w.shape}, dtype: {w.dtype}")
 
     eps = 1e-6
-    
+
     # Forward pass to get outputs and rstd
     y = rmsnorm(x, w, eps=eps)
     y_ref = rmsnorm_ref(x_ref, w_ref, eps=eps)
-    
+
     # Create upstream gradients
     dy = torch.randn_like(y)
+    rstd = torch.randn(M, device=device, dtype=torch.float32)
 
     time.sleep(0.5)
     # Benchmark custom backward pass
-    fn = lambda: torch.autograd.grad(y, [x, w], grad_outputs=dy, retain_graph=True)
-    avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
-    sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count * 8
-    mem_bytes = (3 * x.numel() * dtype.width // 8 + w.numel() * 4 + x.shape[0] * 4 + sm_count * w.numel() * 4)
+    # fn = lambda: torch.autograd.grad(y, [x, w], grad_outputs=dy, retain_graph=True)
+    def fn():
+        # x.grad = None  # Reset gradients to avoid accumulation
+        # y.backward(dy, retain_graph=True)
+        _rmsnorm_backward(x, w, dy, rstd)
+
+    from flash_attn.utils.benchmark import pytorch_profiler
+    pytorch_profiler(fn)
+    avg_time = do_bench(fn, grad_to_none=(x,), warmup=warmup_iterations, rep=iterations)
+    sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count * 2
+    mem_bytes = (3 * x.numel() * dtype.width // 8 + w.numel() * 8)
     mem_bw = round(mem_bytes / (avg_time / 1000) / 1e9)
     print(f"Kernel execution time: {avg_time:.4f} ms")
     print(f"Mem throughput: {mem_bw:.2f} GB/s")
 
     # Reference implementation
     compiled_func_ref = torch.compile(lambda: torch.autograd.grad(y_ref, [x_ref, w_ref], grad_outputs=dy, retain_graph=True))
-    
+
     for _ in range(5): compiled_func_ref()  # warm up
     time.sleep(0.5)
     avg_time_ref = do_bench(compiled_func_ref, warmup=warmup_iterations, rep=iterations)
