@@ -592,7 +592,8 @@ For now let’s denote M as the batch dimension (columns) and N as the reduction
 
 We first define a few input-dependent hyperparams. We usually only tune `thread_per_row` and `cluster_n`.
 
-Tunable hyperparameters
+<center>Tunable hyperparameters</center>
+
 | Name           | Description                          |
 |----------------|--------------------------------------|
 | thread_per_row | # threads per row                    |
@@ -603,7 +604,8 @@ Tunable hyperparameters
 
 And after we calculate the following 2 variables, we can derive our final TV-layout.
 
-Derived constants
+<center>Derived constants</center>
+
 | Name           | Formula                                                        | Description                                 |
 |----------------|----------------------------------------------------------------|---------------------------------------------|
 | num_blocks_N   | # rows / (vec_size * thread_per_row * cluster_n)               | # reduced rows per thread block             |
@@ -611,7 +613,8 @@ Derived constants
 
 This is our TV-layout.
 
-Layouts & tiler
+<center>Layouts & tiler</center>
+
 | Name  | Formula | Description |
 |-------|---------|-------------|
 | **Thread Layout** | (threads_per_row, cols_per_block): (vecsize × cols_per_block, 1) | <br>**Shape**: (Block N, Block M) <br>**Stride**: (vecsize × Block M, 1) |
