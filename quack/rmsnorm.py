@@ -314,7 +314,7 @@ class RMSNormBackward(ReductionBase):
             else (
                 16
                 if N <= 128
-                else (32 if N <= 1024 else (64 if N <= 2048 else (128 if N <= 4096 else 256)))
+                else (32 if N <= 1024 else (128 if N <= 2048 else (128 if N <= 4096 else 256)))
             )
         )
 
@@ -342,6 +342,15 @@ class RMSNormBackward(ReductionBase):
             )
         self.cluster_n = cluster_n
 
+    def _smem_size_in_bytes(self, tiler_mn, num_warps):
+        return (
+            # Multiply by 2 since we need space for X and dOut,
+            # and multiply by another 2 due to double buffering
+            cute.size_in_bytes(self.dtype, cute.make_layout(tiler_mn)) * 2 * 2
+            + self.stage * num_warps * self.cluster_n * (self.reduction_dtype.width // 8)
+            + self.stage * (cutlass.Int64.width // 8)
+        )
+
     @cute.jit
     def __call__(
         self,
@@ -351,7 +360,7 @@ class RMSNormBackward(ReductionBase):
         mRstd: cute.Tensor,
         mdX: cute.Tensor,
         mdW: cute.Tensor,
-        sm_count: cutlass.Constexpr,
+        sm_count: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         self._set_cluster_n()
@@ -400,37 +409,48 @@ class RMSNormBackward(ReductionBase):
         idX = cute.make_identity_tensor(shape)
 
         smem = cutlass.utils.SmemAllocator()
+        smem_layout = cute.make_ordered_layout((tiler_mn[0], tiler_mn[1], 2), order=(1, 0, 2))
+        sX = smem.allocate_tensor(mX.element_type, smem_layout, byte_alignment=16)
+        sdOut = smem.allocate_tensor(mdOut.element_type, smem_layout, byte_alignment=16)
         reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
 
         copy_atom_load_X = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), mX.element_type, num_bits_per_copy=128
         )
-
+        copy_atom_load_X_async = cute.make_copy_atom(
+            cute.nvgpu.cpasync.CopyG2SOp(), mX.element_type, num_bits_per_copy=128
+        )
         copy_atom_load_W = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), mW.element_type, num_bits_per_copy=128
         )
-
         copy_atom_store_dX = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), mdX.element_type, num_bits_per_copy=128
         )
-
-        copy_atom_dw = cute.make_copy_atom(
+        copy_atom_store_dW = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), mdW.element_type, num_bits_per_copy=128
         )
 
         thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
+        thr_copy_X_async = cute.make_tiled_copy(
+            copy_atom_load_X_async, tv_layout, tiler_mn
+        ).get_slice(tidx)
         thr_copy_W = cute.make_tiled_copy(copy_atom_load_W, tv_layout, tiler_mn).get_slice(tidx)
-        thr_copy_dw = cute.make_tiled_copy(copy_atom_dw, tv_layout, tiler_mn).get_slice(tidx)
-        thr_store_dx = cute.make_tiled_copy(copy_atom_store_dX, tv_layout, tiler_mn).get_slice(tidx)
+        thr_copy_dW = cute.make_tiled_copy(copy_atom_store_dW, tv_layout, tiler_mn).get_slice(tidx)
+        thr_store_dX = cute.make_tiled_copy(copy_atom_store_dX, tv_layout, tiler_mn).get_slice(tidx)
+        is_even_N = cutlass.const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
 
-        gW = cute.local_tile(mW, tiler_mn, (bidx_start, cluster_y))
+        gW = cute.local_tile(mW, tiler_mn, (0, cluster_y))
         tWgW = thr_copy_W.partition_S(gW)
         tWrW = cute.make_fragment_like(tWgW)
         tXrW = thr_copy_X.retile(tWrW)
 
         gW_coord = cute.local_tile(idX, tiler_mn, (0, cluster_y))
 
-        tWpW = utils.predicate_k(thr_copy_W.partition_S(gW_coord), limit=shape[1])
+        tWpW = (
+            utils.predicate_k(thr_copy_W.partition_S(gW_coord), limit=shape[1])
+            if not is_even_N
+            else None
+        )
         cute.copy(copy_atom_load_W, tWgW, tWrW, pred=tWpW)
         weight = tXrW.load().to(cute.Float32)
 
@@ -439,10 +459,14 @@ class RMSNormBackward(ReductionBase):
         self._initialize_cluster(tidx, mbar_ptr, num_warps)
 
         dw_coord = cute.local_tile(idX, tiler_mn, (0, cluster_y))
-        tDwpDw = utils.predicate_k(thr_copy_dw.partition_S(dw_coord), limit=shape[1])
+        tDwpDw = (
+            utils.predicate_k(thr_copy_dW.partition_S(dw_coord), limit=shape[1])
+            if not is_even_N
+            else None
+        )
 
         gDw = cute.local_tile(mdW, tiler_mn, (bidx_start, cluster_y))
-        tDwgDw = thr_copy_dw.partition_D(gDw)
+        tDwgDw = thr_copy_dW.partition_D(gDw)
         tDwrDw = cute.make_fragment_like(tDwgDw, cutlass.Float32)
         tXrdW = thr_copy_X.retile(tDwrDw)
 
@@ -451,11 +475,17 @@ class RMSNormBackward(ReductionBase):
         gdX = cute.local_tile(mdX, tiler_mn, (None, cluster_y))
         cX = cute.local_tile(idX, tiler_mn, (None, cluster_y))
         tXgX = thr_copy_X.partition_S(gX)
+        tXsX = thr_copy_X.partition_D(sX)
         tXgdOut = thr_copy_X.partition_S(gdOut)
-        tXgdX = thr_store_dx.partition_D(gdX)
+        tXsdOut = thr_copy_X.partition_D(sdOut)
+        tXgdX = thr_store_dX.partition_D(gdX)
         tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None, None]
         # This doesn't change across iterations
-        tXpX = utils.predicate_k(thr_copy_X.partition_S(cX[None, None, 0]), limit=shape[1])
+        tXpX = (
+            utils.predicate_k(thr_copy_X.partition_S(cX[None, None, 0]), limit=shape[1])
+            if not is_even_N
+            else None
+        )
 
         tXrX, tXrdOut, tXrdX = [
             cute.make_fragment_like(thr[None, None, None, 0]) for thr in (tXgX, tXgdOut, tXgdX)
@@ -468,13 +498,45 @@ class RMSNormBackward(ReductionBase):
         threads_per_row = tv_layout.shape[0][0]
         tXrdW.fill(0.0)
         stage = cutlass.Int32(0)
+        row = tXcX[None, None, None, 0][0][0]
+        if row < M:
+            cute.copy(
+                copy_atom_load_X_async,
+                tXgX[None, None, None, bidx_start],
+                tXsX[None, None, None, 0],
+                pred=tXpX,
+            )
+            cute.copy(
+                copy_atom_load_X_async,
+                tXgdOut[None, None, None, bidx_start],
+                tXsdOut[None, None, None, 0],
+                pred=tXpX,
+            )
+        cute.arch.cp_async_commit_group()
         for bidx in cutlass.range(bidx_start, M, gdim):
-            cute.copy(copy_atom_load_X, tXgX[None, None, None, bidx], tXrX, pred=tXpX)
-            cute.copy(copy_atom_load_X, tXgdOut[None, None, None, bidx], tXrdOut, pred=tXpX)
-            x = tXrX.load().to(cute.Float32)
-            dout = tXrdOut.load().to(cute.Float32)
             row = tXcX[None, None, None, bidx][0][0]
-            rstd = mRstd[row]
+            rstd = cutlass.Float.zero
+            if row < M or tiler_mn[0] == 1:
+                rstd = mRstd[row]
+            if row + gdim * tiler_mn[0] < M:
+                cute.copy(
+                    copy_atom_load_X_async,
+                    tXgX[None, None, None, bidx + gdim],
+                    tXsX[None, None, None, stage ^ 1],
+                    pred=tXpX,
+                )
+                cute.copy(
+                    copy_atom_load_X_async,
+                    tXgdOut[None, None, None, bidx + gdim],
+                    tXsdOut[None, None, None, stage ^ 1],
+                    pred=tXpX,
+                )
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(1)
+            cute.autovec_copy(tXsX[None, None, None, stage], tXrX)
+            x = tXrX.load().to(cute.Float32)
+            cute.autovec_copy(tXsdOut[None, None, None, stage], tXrdOut)
+            dout = tXrdOut.load().to(cute.Float32)
             x_hat = x * rstd
             wdy = dout * weight
             mean_xhat_wdy = (
@@ -490,11 +552,13 @@ class RMSNormBackward(ReductionBase):
             )
             dx = (wdy - x_hat * mean_xhat_wdy) * rstd
             tXrdX.store(dx.to(tXrdOut.element_type))
-            cute.copy(copy_atom_store_dX, tXrdX, tXgdX[None, None, None, bidx], pred=tXpX)
+            if row < M or tiler_mn[0] == 1:
+                cute.copy(copy_atom_store_dX, tXrdX, tXgdX[None, None, None, bidx], pred=tXpX)
             tXrdW.store(tXrdW.load() + dout * x_hat)
             stage ^= 1
 
-        cute.copy(copy_atom_dw, tDwrDw, tDwgDw, pred=tDwpDw)
+        # TODO: Implement the reduction for dw within the same threadblock if tile_mn[0] > 1
+        cute.copy(copy_atom_store_dW, tDwrDw, tDwgDw, pred=tDwpDw)
 
 
 def _rmsnorm_backward(
@@ -527,8 +591,10 @@ def _rmsnorm_backward(
     device = x.device
 
     # This should be tuned on how many CTAs can be launched on each SM
-    sm_count = torch.cuda.get_device_properties(device).multi_processor_count * 2
-    dw_partial = torch.zeros((sm_count, N), device=device, dtype=weight.dtype)
+    sm_count_factor = 4 if N <= 2048 else (2 if N <= 4096 else 1)
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count * sm_count_factor
+    # TODO: if we're using cluster, this should be cluster_count not sm_count
+    dw_partial = torch.empty((sm_count, N), device=device, dtype=weight.dtype)
 
     dtype = torch2cute_dtype_map[x.dtype]
 
@@ -571,6 +637,7 @@ def _rmsnorm_backward(
         rstd_tensor,
         dx_tensor,
         dw_partial_tensor,
+        sm_count,
         current_stream,
     )
 

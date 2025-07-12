@@ -133,9 +133,7 @@ class Softmax(ReductionBase):
 
         is_even_N = cutlass.const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
         tXpX = (
-            utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
-            if cutlass.const_expr(not is_even_N)
-            else None
+            utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1]) if not is_even_N else None
         )
         if tXcX[0][0] < shape[0]:
             cute.copy(copy_atom_load_X, tXgX, tXsX, pred=tXpX)

@@ -127,8 +127,8 @@ def run_rmsnorm_bwd(
     M,
     N,
     dtype: Type[cutlass.Numeric],
-    warmup_iterations=2,
-    iterations=200,
+    warmup_iterations=5,
+    iterations=100,
 ):
     if not torch.cuda.is_available():
         raise RuntimeError(f"Ampere GPU is required to run this example!")
