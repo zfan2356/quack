@@ -153,7 +153,6 @@ def run_rmsnorm_bwd(
 
     # Forward pass to get outputs and rstd
     y = rmsnorm(x, w, eps=eps)
-    y_ref = rmsnorm_ref(x_ref, w_ref, eps=eps)
 
     # Create upstream gradients
     dy = torch.randn_like(y)
@@ -167,17 +166,23 @@ def run_rmsnorm_bwd(
         # y.backward(dy, retain_graph=True)
         _rmsnorm_backward(x, w, dy, rstd)
 
-    from flash_attn.utils.benchmark import pytorch_profiler
-    pytorch_profiler(fn)
     avg_time = do_bench(fn, grad_to_none=(x,), warmup=warmup_iterations, rep=iterations)
     sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count * 2
     mem_bytes = (3 * x.numel() * dtype.width // 8 + w.numel() * 8)
     mem_bw = round(mem_bytes / (avg_time / 1000) / 1e9)
     print(f"Kernel execution time: {avg_time:.4f} ms")
     print(f"Mem throughput: {mem_bw:.2f} GB/s")
+    # from flash_attn.utils.benchmark import pytorch_profiler
+    # pytorch_profiler(fn)
 
     # Reference implementation
-    compiled_func_ref = torch.compile(lambda: torch.autograd.grad(y_ref, [x_ref, w_ref], grad_outputs=dy, retain_graph=True))
+    y_ref = torch.compile(rmsnorm_ref)(x_ref, w_ref, eps=eps)
+    compiled_func_ref = lambda: torch.autograd.grad(y_ref, [x_ref, w_ref], grad_outputs=dy, retain_graph=True)
+    # def f():
+    #     x_ref.grad = None  # Reset gradients to avoid accumulation
+    #     w_ref.grad = None
+    #     rmsnorm_ref(x_ref, w_ref, eps=eps).backward(dy)
+    # compiled_func_ref = torch.compile(f)
 
     for _ in range(5): compiled_func_ref()  # warm up
     time.sleep(0.5)
@@ -186,6 +191,7 @@ def run_rmsnorm_bwd(
     mem_bw_ref = round(mem_bytes_ref / (avg_time_ref / 1000) / 1e9)
     print(f"Ref kernel execution time: {avg_time_ref:.4f} ms")
     print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
+    # pytorch_profiler(compiled_func_ref)
 
     return mem_bw, mem_bw_ref
 

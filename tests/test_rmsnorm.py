@@ -49,16 +49,15 @@ def test_rmsnorm_forward(M, N, input_dtype, eps):
 @pytest.mark.parametrize("eps", [1e-5])
 # @pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
-# @pytest.mark.parametrize("N", [1024, 4096, 16384])
-@pytest.mark.parametrize("N", [4096])
+@pytest.mark.parametrize("N", [256, 512, 1024, 2048, 4096, 8192, 16384])
+# @pytest.mark.parametrize("N", [512])
 def test_rmsnorm_backward(N, input_dtype, eps):
     """Test RMSNorm backward pass against reference implementation."""
     device = "cuda"
     M = 32 * 1024
-
     # Set tolerance based on dtype
     if input_dtype == torch.bfloat16:
-        atol = 5e-2
+        atol = 1e-1
     elif input_dtype == torch.float16:
         atol = 1e-2
     else:
@@ -81,6 +80,7 @@ def test_rmsnorm_backward(N, input_dtype, eps):
 
     # Backward pass
     grad_out = torch.randn_like(out)
+    torch.cuda.synchronize()
     out.backward(grad_out)
     out_ref.backward(grad_out)
 

@@ -314,32 +314,17 @@ class RMSNormBackward(ReductionBase):
             else (
                 16
                 if N <= 128
-                else (32 if N <= 1024 else (128 if N <= 2048 else (128 if N <= 4096 else 256)))
+                else (32 if N <= 256 else (64 if N <= 512 else (128 if N <= 4096 else 256)))
             )
         )
 
     def _set_cluster_n(self):
         N = self.N
-        if cutlass.const_expr(self.dtype.width == 16):
-            cluster_n = (
-                1
-                if N <= 16 * 1024
-                else (
-                    2
-                    if N <= 32 * 1024
-                    else (4 if N <= 64 * 1024 else (8 if N <= 128 * 1024 else 16))
-                )
-            )
-        else:  # fp32
-            cluster_n = (
-                1
-                if N <= 32 * 1024
-                else (
-                    2
-                    if N <= 64 * 1024
-                    else (4 if N <= 128 * 1024 else (8 if N <= 256 * 1024 else 16))
-                )
-            )
+        cluster_n = (
+            1
+            if N <= 8 * 1024
+            else (2 if N <= 16 * 1024 else (4 if N <= 32 * 1024 else (8 if N <= 64 * 1024 else 16)))
+        )
         self.cluster_n = cluster_n
 
     def _smem_size_in_bytes(self, tiler_mn, num_warps):
@@ -371,10 +356,7 @@ class RMSNormBackward(ReductionBase):
         mW_expanded_layout = cute.prepend(mW.layout, cute.make_layout((tiler_mn[0],), stride=(0,)))
         mW = cute.make_tensor(mW.iterator, mW_expanded_layout)
 
-        num_blocks = (
-            sm_count if tiler_mn[0] == 1 else min(sm_count, cute.ceil_div(1024, tiler_mn[0]))
-        )
-
+        num_blocks = sm_count
         self.kernel(mX, mW, mdOut, mRstd, mdX, mdW, tv_layout, tiler_mn).launch(
             grid=[num_blocks, self.cluster_n, 1],
             block=[num_threads, 1, 1],
@@ -459,16 +441,16 @@ class RMSNormBackward(ReductionBase):
         self._initialize_cluster(tidx, mbar_ptr, num_warps)
 
         dw_coord = cute.local_tile(idX, tiler_mn, (0, cluster_y))
-        tDwpDw = (
+        tdWpdW = (
             utils.predicate_k(thr_copy_dW.partition_S(dw_coord), limit=shape[1])
             if not is_even_N
             else None
         )
 
-        gDw = cute.local_tile(mdW, tiler_mn, (bidx_start, cluster_y))
-        tDwgDw = thr_copy_dW.partition_D(gDw)
-        tDwrDw = cute.make_fragment_like(tDwgDw, cutlass.Float32)
-        tXrdW = thr_copy_X.retile(tDwrDw)
+        gdW = cute.local_tile(mdW, (1, tiler_mn[1]), (bidx_start, cluster_y))
+        tdWgdW = thr_copy_dW.partition_D(gdW)
+        tdWrdW = cute.make_fragment_like(tdWgdW, cutlass.Float32)
+        tXrdW = thr_copy_X.retile(tdWrdW)
 
         gX = cute.local_tile(mX, tiler_mn, (None, cluster_y))
         gdOut = cute.local_tile(mdOut, tiler_mn, (None, cluster_y))
@@ -492,13 +474,12 @@ class RMSNormBackward(ReductionBase):
         ]
 
         if cutlass.const_expr(self.cluster_n > 1):
-            cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
 
         threads_per_row = tv_layout.shape[0][0]
         tXrdW.fill(0.0)
         stage = cutlass.Int32(0)
-        row = tXcX[None, None, None, 0][0][0]
+        row = tXcX[None, None, None, bidx_start][0][0]
         if row < M:
             cute.copy(
                 copy_atom_load_X_async,
@@ -539,6 +520,10 @@ class RMSNormBackward(ReductionBase):
             dout = tXrdOut.load().to(cute.Float32)
             x_hat = x * rstd
             wdy = dout * weight
+            # TODO: this is suboptimal, we should just use an mbar instead
+            if cutlass.const_expr(self.cluster_n > 1):  # Prevent cluster from exiting early
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
             mean_xhat_wdy = (
                 utils.row_reduce(
                     x_hat * wdy,
@@ -550,6 +535,10 @@ class RMSNormBackward(ReductionBase):
                 )
                 / shape[1]
             )
+            # TODO: this is suboptimal, we should just use an mbar instead
+            if cutlass.const_expr(self.cluster_n > 1):  # Prevent cluster from exiting early
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
             dx = (wdy - x_hat * mean_xhat_wdy) * rstd
             tXrdX.store(dx.to(tXrdOut.element_type))
             if row < M or tiler_mn[0] == 1:
@@ -557,8 +546,27 @@ class RMSNormBackward(ReductionBase):
             tXrdW.store(tXrdW.load() + dout * x_hat)
             stage ^= 1
 
-        # TODO: Implement the reduction for dw within the same threadblock if tile_mn[0] > 1
-        cute.copy(copy_atom_store_dW, tDwrDw, tDwgDw, pred=tDwpDw)
+        if cutlass.const_expr(tiler_mn[0] > 1):
+            # reduction of dw_partial within the same threadblock
+            sdW = cute.make_tensor(
+                cute.recast_ptr(sX.iterator, dtype=cute.Float32),
+                cute.make_ordered_layout(tiler_mn, order=(1, 0)),
+            )
+            tXsdW = thr_copy_X.partition_D(sdW)
+            cute.arch.barrier()
+            row = tXcX[None, None, None, 0][0][0]
+            if row > 0:
+                cute.autovec_copy(tXrdW, tXsdW)
+            cute.arch.barrier()
+            if row == 0:
+                for i in cutlass.range_constexpr(1, cutlass.const_expr(tiler_mn[0])):
+                    tXrdW_other = cute.make_fragment_like(tXrdW)
+                    tXsdW_other = cute.make_tensor(tXsdW.iterator + i * sdW.stride[0], tXsdW.layout)
+                    cute.autovec_copy(tXsdW_other, tXrdW_other)
+                    tXrdW.store(tXrdW.load() + tXrdW_other.load())
+                cute.copy(copy_atom_store_dW, tdWrdW, tdWgdW, pred=tdWpdW)
+        else:
+            cute.copy(copy_atom_store_dW, tdWrdW, tdWgdW, pred=tdWpdW)
 
 
 def _rmsnorm_backward(
@@ -591,8 +599,10 @@ def _rmsnorm_backward(
     device = x.device
 
     # This should be tuned on how many CTAs can be launched on each SM
-    sm_count_factor = 4 if N <= 2048 else (2 if N <= 4096 else 1)
-    sm_count = torch.cuda.get_device_properties(device).multi_processor_count * sm_count_factor
+    sm_count_multiple = (
+        16 if N <= 256 else (8 if N <= 1024 else (4 if N <= 2048 else (2 if N <= 4096 else 1)))
+    )
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count * sm_count_multiple
     # TODO: if we're using cluster, this should be cluster_count not sm_count
     dw_partial = torch.empty((sm_count, N), device=device, dtype=weight.dtype)
 
