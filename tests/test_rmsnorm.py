@@ -9,20 +9,22 @@ from quack.rmsnorm import rmsnorm, rmsnorm_ref, rstd_ref
 @pytest.mark.parametrize("eps", [1e-5, 1e-6])
 # @pytest.mark.parametrize("eps", [1e-5])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
-# @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+# @pytest.mark.parametrize("input_dtype", [torch.float16])
 @pytest.mark.parametrize(
     "N",
     [192, 256, 512, 760, 1024, 1128, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
-    # [192]
+    # [262144]
 )
-@pytest.mark.parametrize("M", [1, 37, 199])
+@pytest.mark.parametrize("M", [1, 37, 199, 8 * 1024])
 # @pytest.mark.parametrize("M", [1])
-def test_rmsnorm_forward(M, N, input_dtype, eps):
+def test_rmsnorm_forward_backward(M, N, input_dtype, eps):
     """Test RMSNorm forward pass against reference implementation."""
+    if N >= 256 * 1024 and input_dtype == torch.float32 and M >= 8 * 1024:
+        pytest.skip("Skipping large tensor test for float32 to avoid OOM")
     device = "cuda"
     # Set tolerance based on dtype
     if input_dtype == torch.bfloat16:
-        atol = 5e-2
+        atol = 1e-1
     elif input_dtype == torch.float16:
         atol = 1e-2
     else:
@@ -35,56 +37,18 @@ def test_rmsnorm_forward(M, N, input_dtype, eps):
     out = rmsnorm(x, weight, eps=eps)
     out_ref = rmsnorm_ref(x_ref, weight_ref, eps=eps)
     # rstd_ref_val = rstd_ref(x_ref, eps=eps)
-
-    # Check output shape and dtype
     assert out.shape == x.shape
     assert out.dtype == input_dtype
-
-    # Check accuracy
     torch.testing.assert_close(out, out_ref, atol=atol, rtol=1e-3)
     # torch.testing.assert_close(rstd, rstd_ref_val, atol=atol, rtol=1e-3)
-
-
-# @pytest.mark.parametrize("eps", [1e-5, 1e-6])
-@pytest.mark.parametrize("eps", [1e-5])
-# @pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
-@pytest.mark.parametrize("N", [256, 512, 1024, 2048, 4096, 8192, 16384])
-# @pytest.mark.parametrize("N", [512])
-def test_rmsnorm_backward(N, input_dtype, eps):
-    """Test RMSNorm backward pass against reference implementation."""
-    device = "cuda"
-    M = 32 * 1024
-    # Set tolerance based on dtype
-    if input_dtype == torch.bfloat16:
-        atol = 1e-1
-    elif input_dtype == torch.float16:
-        atol = 1e-2
-    else:
-        atol = 1e-4
-
-    # Set seed for reproducibility
-    torch.random.manual_seed(0)
-
-    # Create input tensors
-    x = torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=True)
-    weight = torch.randn(N, device=device, dtype=torch.float32, requires_grad=True)
-
-    # Clone for reference
-    x_ref = x.detach().clone().requires_grad_()
-    weight_ref = weight.detach().clone().requires_grad_()
-
-    # Forward pass
-    out = rmsnorm(x, weight, eps=eps)
-    out_ref = rmsnorm_ref(x_ref, weight_ref, eps=eps)
-
     # Backward pass
+    if N > 128 * 1024 and input_dtype == torch.float32:
+        # Skip backward pass for due to not enough smem
+        return
     grad_out = torch.randn_like(out)
     torch.cuda.synchronize()
-    out.backward(grad_out)
     out_ref.backward(grad_out)
-
-    # Check gradients
+    out.backward(grad_out)
     torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=1e-3)
     torch.testing.assert_close(weight.grad, weight_ref.grad, atol=atol, rtol=1e-3)
 

@@ -120,12 +120,20 @@ def cluster_reduce(
     reduction_buffer: cute.Tensor,
     mbar_ptr: cute.Pointer,
     init_val: cute.Numeric = 0.0,
+    phase: Optional[cutlass.Int32] = None,
 ) -> cute.Numeric:
     """reduction_buffer has shape (num_warps / warps_per_row, (warps_per_row, cluster_n))"""
     cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
     lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
-    warps_per_row, cluster_n = reduction_buffer.shape[1]
+    rows_per_block, (warps_per_row, cluster_n) = reduction_buffer.shape
     row_idx, col_idx = warp_idx // warps_per_row, warp_idx % warps_per_row
+    if warp_idx == 0:
+        with cute.arch.elect_one():
+            num_warps = rows_per_block * warps_per_row
+            cute.arch.mbarrier_arrive_and_expect_tx(
+                mbar_ptr,
+                num_warps * cluster_n * reduction_buffer.element_type.width // 8,
+            )
     if lane_idx < cluster_n:
         store_shared_remote(
             val,
@@ -133,7 +141,7 @@ def cluster_reduce(
             mbar_ptr,
             peer_cta_rank_in_cluster=lane_idx,
         )
-    cute.arch.mbarrier_wait(mbar_ptr, phase=0)
+    cute.arch.mbarrier_wait(mbar_ptr, phase=phase if phase is not None else 0)
     block_reduce_val = init_val
     num_iter = cute.ceil_div(warps_per_row * cluster_n, cute.arch.WARP_SIZE)
     for i in cutlass.range_constexpr(num_iter):
@@ -149,13 +157,14 @@ def block_or_cluster_reduce(
     op: Callable,
     reduction_buffer: cute.Tensor,
     mbar_ptr: Optional[cute.Pointer],
+    phase: Optional[cutlass.Int32] = None,
     init_val: cute.Numeric = 0.0,
 ) -> cute.Numeric:
     """Perform either block or cluster reduction based on whether mbar_ptr is provided."""
     if cutlass.const_expr(mbar_ptr is None):
         return block_reduce(val, op, reduction_buffer, init_val=init_val)
     else:
-        return cluster_reduce(val, op, reduction_buffer, mbar_ptr, init_val=init_val)
+        return cluster_reduce(val, op, reduction_buffer, mbar_ptr, phase=phase, init_val=init_val)
 
 
 @cute.jit
@@ -165,6 +174,7 @@ def row_reduce(
     threads_per_row: cutlass.Constexpr[int],
     reduction_buffer: Optional[cute.Tensor] = None,
     mbar_ptr: Optional[cute.Pointer] = None,
+    phase: Optional[cutlass.Int32] = None,
     init_val: cute.Numeric = 0.0,
     hook_fn: Optional[Callable] = None,
 ) -> cute.Numeric:
@@ -193,7 +203,7 @@ def row_reduce(
         ), "mbar_ptr must be provided for cluster reduction"
         if cutlass.const_expr(warps_per_row > 1 or cluster_n > 1):
             val = block_or_cluster_reduce(
-                val, warp_op, reduction_buffer, mbar_ptr, init_val=init_val
+                val, warp_op, reduction_buffer, mbar_ptr, phase=phase, init_val=init_val
             )
     return val
 
@@ -205,6 +215,7 @@ def online_softmax_reduce(
     reduction_buffer: Optional[cute.Tensor] = None,
     mbar_ptr: Optional[cute.Pointer] = None,
     hook_fn: Optional[Callable] = None,
+    phase: Optional[cutlass.Int32] = None,
     return_exp_x: bool = False,
 ) -> [Float32, Float32, Optional[cute.TensorSSA]]:
     assert x.dtype == Float32, "x must be of type Float32"
@@ -225,7 +236,7 @@ def online_softmax_reduce(
     if cutlass.const_expr(hook_fn is not None):
         hook_fn()
     if cutlass.const_expr(reduction_buffer is not None):
-        warps_per_row, cluster_n = reduction_buffer.shape[1]
+        rows_per_block, (warps_per_row, cluster_n) = reduction_buffer.shape
         assert (
             cluster_n == 1 or mbar_ptr is not None
         ), "mbar_ptr must be provided for cluster reduction"
@@ -251,6 +262,13 @@ def online_softmax_reduce(
                 max_x = max_x_final
             else:
                 cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
+                if warp_idx == 0:
+                    with cute.arch.elect_one():
+                        num_warps = rows_per_block * warps_per_row
+                        cute.arch.mbarrier_arrive_and_expect_tx(
+                            mbar_ptr,
+                            num_warps * cluster_n * reduction_buffer.element_type.width // 8,
+                        )
                 if lane_idx < cluster_n:
                     store_shared_remote(
                         f32x2_to_i64(max_x, sum_exp_x),
@@ -258,7 +276,7 @@ def online_softmax_reduce(
                         mbar_ptr,
                         peer_cta_rank_in_cluster=lane_idx,
                     )
-                cute.arch.mbarrier_wait(mbar_ptr, phase=0)
+                cute.arch.mbarrier_wait(mbar_ptr, phase=phase if phase is not None else 0)
                 num_iter = cute.ceil_div(warps_per_row * cluster_n, cute.arch.WARP_SIZE)
                 max_x_single_warp = cute.make_fragment(num_iter, Float32)
                 max_x_single_warp.fill(-Float32.inf)
@@ -351,7 +369,7 @@ def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
 
 
 @cute.jit
-def fill_oob(tXsX: cute.Tensor, tXpX: cute.Tensor, fill_value: cute.Numeric) -> None:
+def fill_oob(tXsX: cute.Tensor, tXpX: Optional[cute.Tensor], fill_value: cute.Numeric) -> None:
     """Fill out-of-bounds values in shared memory tensor.
 
     Args:
@@ -361,9 +379,12 @@ def fill_oob(tXsX: cute.Tensor, tXpX: cute.Tensor, fill_value: cute.Numeric) -> 
     """
     tXrX_fill = cute.make_fragment_like(tXsX[(None, 0), 0, 0])
     tXrX_fill.fill(fill_value)
-    for rest_v in cutlass.range_constexpr(tXpX.shape[0]):
-        for rest_k in cutlass.range_constexpr(tXpX.shape[2]):
-            if not tXpX[rest_v, 0, rest_k]:
+    for rest_v in cutlass.range_constexpr(tXsX.shape[0][1]):
+        for rest_k in cutlass.range_constexpr(tXsX.shape[2]):
+            if cutlass.const_expr(tXpX is not None):
+                if not tXpX[rest_v, 0, rest_k]:
+                    cute.autovec_copy(tXrX_fill, tXsX[(None, rest_v), None, rest_k])
+            else:
                 cute.autovec_copy(tXrX_fill, tXsX[(None, rest_v), None, rest_k])
 
 

@@ -68,7 +68,7 @@ class ReductionBase:
         )
 
     def _allocate_reduction_buffer_and_mbar(
-        self, smem: cutlass.utils.SmemAllocator, tv_layout: cute.Layout
+        self, smem: cutlass.utils.SmemAllocator, tv_layout: cute.Layout, is_persistent: bool = False
     ) -> Tuple[cute.Tensor, Optional[cute.Pointer]]:
         reduction_buffer = smem.allocate_tensor(
             self.reduction_dtype,
@@ -76,20 +76,28 @@ class ReductionBase:
             byte_alignment=4,
         )
         if cutlass.const_expr(self.cluster_n > 1):
-            mbar_ptr = smem.allocate_array(cutlass.Int64, num_elems=self.stage)
+            mbar_ptr = smem.allocate_array(
+                cutlass.Int64, num_elems=self.stage if not is_persistent else self.stage * 2
+            )
         else:
             mbar_ptr = None
         return reduction_buffer, mbar_ptr
 
     @cute.jit
-    def _initialize_cluster(self, tidx: cutlass.Int32, mbar_ptr: cute.Pointer, num_warps: int):
+    def _initialize_cluster(
+        self,
+        tidx: cutlass.Int32,
+        mbar_ptr: cute.Pointer,
+        num_warps: int,
+        is_persistent: bool = False,
+    ):
         if cutlass.const_expr(self.cluster_n > 1):
-            if tidx < self.stage:
+            if tidx < self.stage:  # Initialize full barrier
                 cute.arch.mbarrier_init(mbar_ptr + tidx, 1)
+                if cutlass.const_expr(is_persistent):  # Initialize empty barrier
+                    cute.arch.mbarrier_init(
+                        mbar_ptr + self.stage + tidx, num_warps * self.cluster_n
+                    )
             cute.arch.mbarrier_init_fence()
-            if tidx < self.stage:
-                cute.arch.mbarrier_arrive_and_expect_tx(
-                    mbar_ptr + tidx, num_warps * self.cluster_n * self.reduction_dtype.width // 8
-                )
             # Cluster arrive after barrier init
             cute.arch.cluster_arrive_relaxed()

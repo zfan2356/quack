@@ -157,6 +157,7 @@ class RMSNorm(ReductionBase):
 
         # allocate fragments for gmem->rmem
         tWrW = cute.make_fragment_like(tWgW)
+        tWrW.fill(0.0)
         tXrW = thr_copy_X.retile(tWrW)
         tXrX, tXrO = [cute.make_fragment_like(thr) for thr in (tXgX, tXgO)]
 
@@ -302,6 +303,9 @@ class RMSNormBackward(ReductionBase):
     def __init__(self, dtype: cutlass.Numeric, N: int):
         # 2 stages for double buffering when computing mean of x_hat * wdy
         super().__init__(dtype, N, stage=2, reduction_dtype=cutlass.Float32)
+        if self.N > 128 * 1024 and self.dtype.width >= 32:
+            # Not enough smem
+            raise ValueError("RMSNormBackward does not support N > 128k with dtype >= 32 bits")
 
     def _get_num_threads(self):
         return 128 if self.N <= 4096 else 256
@@ -333,7 +337,7 @@ class RMSNormBackward(ReductionBase):
             # and multiply by another 2 due to double buffering
             cute.size_in_bytes(self.dtype, cute.make_layout(tiler_mn)) * 2 * 2
             + self.stage * num_warps * self.cluster_n * (self.reduction_dtype.width // 8)
-            + self.stage * (cutlass.Int64.width // 8)
+            + self.stage * (cutlass.Int64.width // 8) * 2  # mult 2 as we need 2 mbar per stage
         )
 
     @cute.jit
@@ -387,6 +391,7 @@ class RMSNormBackward(ReductionBase):
 
         shape = mX.shape
         M, N = shape[0], shape[1]
+        is_even_N = cutlass.const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
 
         idX = cute.make_identity_tensor(shape)
 
@@ -394,7 +399,13 @@ class RMSNormBackward(ReductionBase):
         smem_layout = cute.make_ordered_layout((tiler_mn[0], tiler_mn[1], 2), order=(1, 0, 2))
         sX = smem.allocate_tensor(mX.element_type, smem_layout, byte_alignment=16)
         sdOut = smem.allocate_tensor(mdOut.element_type, smem_layout, byte_alignment=16)
-        reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
+        reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(
+            smem, tv_layout, is_persistent=True
+        )
+        if cutlass.const_expr(mbar_ptr is not None):
+            mbar_full_ptr, mbar_empty_ptr = mbar_ptr, mbar_ptr + 2
+        else:
+            mbar_full_ptr, mbar_empty_ptr = None, None
 
         copy_atom_load_X = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), mX.element_type, num_bits_per_copy=128
@@ -419,11 +430,13 @@ class RMSNormBackward(ReductionBase):
         thr_copy_W = cute.make_tiled_copy(copy_atom_load_W, tv_layout, tiler_mn).get_slice(tidx)
         thr_copy_dW = cute.make_tiled_copy(copy_atom_store_dW, tv_layout, tiler_mn).get_slice(tidx)
         thr_store_dX = cute.make_tiled_copy(copy_atom_store_dX, tv_layout, tiler_mn).get_slice(tidx)
-        is_even_N = cutlass.const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
 
         gW = cute.local_tile(mW, tiler_mn, (0, cluster_y))
         tWgW = thr_copy_W.partition_S(gW)
         tWrW = cute.make_fragment_like(tWgW)
+        # Need this, otherwise rW can have arbitrary values that changes the reduction
+        if not is_even_N:
+            tWrW.fill(0.0)
         tXrW = thr_copy_X.retile(tWrW)
 
         gW_coord = cute.local_tile(idX, tiler_mn, (0, cluster_y))
@@ -438,7 +451,7 @@ class RMSNormBackward(ReductionBase):
 
         num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
 
-        self._initialize_cluster(tidx, mbar_ptr, num_warps)
+        self._initialize_cluster(tidx, mbar_ptr, num_warps, is_persistent=True)
 
         dw_coord = cute.local_tile(idX, tiler_mn, (0, cluster_y))
         tdWpdW = (
@@ -473,12 +486,7 @@ class RMSNormBackward(ReductionBase):
             cute.make_fragment_like(thr[None, None, None, 0]) for thr in (tXgX, tXgdOut, tXgdX)
         ]
 
-        if cutlass.const_expr(self.cluster_n > 1):
-            cute.arch.cluster_wait()
-
-        threads_per_row = tv_layout.shape[0][0]
-        tXrdW.fill(0.0)
-        stage = cutlass.Int32(0)
+        # Prefetch the first batch
         row = tXcX[None, None, None, bidx_start][0][0]
         if row < M:
             cute.copy(
@@ -493,13 +501,25 @@ class RMSNormBackward(ReductionBase):
                 tXsdOut[None, None, None, 0],
                 pred=tXpX,
             )
+        elif tiler_mn[0] > 1:
+            # Fill with zero, otherwise smem will be uninitialized, and we could read this back
+            # later into registers, causing wrong dW.
+            utils.fill_oob(tXsX[None, None, None, 0], None, fill_value=mX.element_type.zero)
+            utils.fill_oob(tXsdOut[None, None, None, 0], None, fill_value=mdOut.element_type.zero)
         cute.arch.cp_async_commit_group()
-        for bidx in cutlass.range(bidx_start, M, gdim):
+
+        if cutlass.const_expr(self.cluster_n > 1):
+            cute.arch.cluster_wait()
+
+        threads_per_row = tv_layout.shape[0][0]
+        tXrdW.fill(0.0)
+        stage = cutlass.Int32(0)
+        producer_phase = cutlass.Int32(1)
+        consumer_phase = cutlass.Int32(0)
+        for bidx in cutlass.range(bidx_start, cute.ceil_div(M, tiler_mn[0]), gdim):
             row = tXcX[None, None, None, bidx][0][0]
             rstd = cutlass.Float.zero
-            if row < M or tiler_mn[0] == 1:
-                rstd = mRstd[row]
-            if row + gdim * tiler_mn[0] < M:
+            if row + gdim * tiler_mn[0] < M:  # Prefetch the next batch
                 cute.copy(
                     copy_atom_load_X_async,
                     tXgX[None, None, None, bidx + gdim],
@@ -512,7 +532,16 @@ class RMSNormBackward(ReductionBase):
                     tXsdOut[None, None, None, stage ^ 1],
                     pred=tXpX,
                 )
+            elif tiler_mn[0] > 1:
+                utils.fill_oob(
+                    tXsX[None, None, None, stage ^ 1], None, fill_value=mX.element_type.zero
+                )
+                utils.fill_oob(
+                    tXsdOut[None, None, None, stage ^ 1], None, fill_value=mdOut.element_type.zero
+                )
             cute.arch.cp_async_commit_group()
+            if row < M or tiler_mn[0] == 1:
+                rstd = mRstd[row]
             cute.arch.cp_async_wait_group(1)
             cute.autovec_copy(tXsX[None, None, None, stage], tXrX)
             x = tXrX.load().to(cute.Float32)
@@ -520,31 +549,41 @@ class RMSNormBackward(ReductionBase):
             dout = tXrdOut.load().to(cute.Float32)
             x_hat = x * rstd
             wdy = dout * weight
-            # TODO: this is suboptimal, we should just use an mbar instead
-            if cutlass.const_expr(self.cluster_n > 1):  # Prevent cluster from exiting early
-                cute.arch.cluster_arrive()
-                cute.arch.cluster_wait()
+            if cutlass.const_expr(self.cluster_n > 1):
+                cute.arch.mbarrier_wait(mbar_empty_ptr + stage, producer_phase)
             mean_xhat_wdy = (
                 utils.row_reduce(
                     x_hat * wdy,
                     cute.ReductionOp.ADD,
                     threads_per_row,
                     reduction_buffer[None, None, stage],
-                    mbar_ptr + stage if cutlass.const_expr(self.cluster_n > 1) else None,
+                    mbar_full_ptr + stage if cutlass.const_expr(self.cluster_n > 1) else None,
+                    phase=consumer_phase,
                     init_val=0.0,
                 )
                 / shape[1]
             )
-            # TODO: this is suboptimal, we should just use an mbar instead
-            if cutlass.const_expr(self.cluster_n > 1):  # Prevent cluster from exiting early
-                cute.arch.cluster_arrive()
-                cute.arch.cluster_wait()
+            if cutlass.const_expr(self.cluster_n > 1):
+                # It's faster to have 1 lane per warp to signal the mbar, rather than all lanes
+                # Requires adjusting the thread_count when initializing the mbar
+                cute.arch.sync_warp()
+                lane_idx = cute.arch.lane_idx()
+                if lane_idx < self.cluster_n:
+                    cute.arch.mbarrier_arrive(
+                        mbar_empty_ptr + stage, peer_cta_rank_in_cluster=lane_idx
+                    )
             dx = (wdy - x_hat * mean_xhat_wdy) * rstd
             tXrdX.store(dx.to(tXrdOut.element_type))
             if row < M or tiler_mn[0] == 1:
                 cute.copy(copy_atom_store_dX, tXrdX, tXgdX[None, None, None, bidx], pred=tXpX)
             tXrdW.store(tXrdW.load() + dout * x_hat)
             stage ^= 1
+            if stage == 0:
+                consumer_phase ^= 1
+                producer_phase ^= 1
+
+        if cutlass.const_expr(self.cluster_n > 1):  # Prevent cluster from exiting early
+            cute.arch.mbarrier_wait(mbar_empty_ptr + stage, producer_phase)
 
         if cutlass.const_expr(tiler_mn[0] > 1):
             # reduction of dw_partial within the same threadblock
@@ -602,9 +641,15 @@ def _rmsnorm_backward(
     sm_count_multiple = (
         16 if N <= 256 else (8 if N <= 1024 else (4 if N <= 2048 else (2 if N <= 4096 else 1)))
     )
-    sm_count = torch.cuda.get_device_properties(device).multi_processor_count * sm_count_multiple
-    # TODO: if we're using cluster, this should be cluster_count not sm_count
-    dw_partial = torch.empty((sm_count, N), device=device, dtype=weight.dtype)
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    # By right, if we're using cluster, this should be cluster_count not sm_count.
+    # But for cluster >= 4, due to quantization we would need to query active max cluster.
+    # Instead we just do sm_count * 2, which is reasonably larger than active_cluster_count to
+    # avoid wave quantization.
+    sm_count = (
+        sm_count * sm_count_multiple if N <= 8192 else sm_count // 2 if N <= 16384 else sm_count * 2
+    )
+    dw_partial = torch.empty(sm_count, N, device=device, dtype=weight.dtype)
 
     dtype = torch2cute_dtype_map[x.dtype]
 

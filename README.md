@@ -16,13 +16,12 @@ pip install quack-kernels
 
 ## Kernels 🐥
 
-- 🦆 RMSNorm forward
+- 🦆 RMSNorm forward + backward
 - 🦆 Softmax forward + backward
 - 🦆 Cross entropy forward + backward
 - 🦆 Layernorm forward
 
 Upcoming:
-- 🦆 RMSNorm backward
 - 🦆 Rotary forward + backward
 
 ## Usage
