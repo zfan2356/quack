@@ -1,6 +1,5 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
-
 import torch
 from typing import Optional
 
@@ -440,7 +439,6 @@ class RMSNormBackward(ReductionBase):
         tXrW = thr_copy_X.retile(tWrW)
 
         gW_coord = cute.local_tile(idX, tiler_mn, (0, cluster_y))
-
         tWpW = (
             utils.predicate_k(thr_copy_W.partition_S(gW_coord), limit=shape[1])
             if not is_even_N
@@ -489,15 +487,17 @@ class RMSNormBackward(ReductionBase):
         # Prefetch the first batch
         row = tXcX[None, None, None, bidx_start][0][0]
         if row < M:
+            tXgX_cur = utils.coord_offset_i64(bidx_start, tXgX, dim=3)[None, None, None, 0]
+            tXgdOut_cur = utils.coord_offset_i64(bidx_start, tXgdOut, dim=3)[None, None, None, 0]
             cute.copy(
                 copy_atom_load_X_async,
-                tXgX[None, None, None, bidx_start],
+                tXgX_cur,
                 tXsX[None, None, None, 0],
                 pred=tXpX,
             )
             cute.copy(
                 copy_atom_load_X_async,
-                tXgdOut[None, None, None, bidx_start],
+                tXgdOut_cur,
                 tXsdOut[None, None, None, 0],
                 pred=tXpX,
             )
@@ -520,15 +520,19 @@ class RMSNormBackward(ReductionBase):
             row = tXcX[None, None, None, bidx][0][0]
             rstd = cutlass.Float.zero
             if row + gdim * tiler_mn[0] < M:  # Prefetch the next batch
+                tXgX_cur = utils.coord_offset_i64(bidx + gdim, tXgX, dim=3)[None, None, None, 0]
+                tXgdOut_cur = utils.coord_offset_i64(bidx + gdim, tXgdOut, dim=3)[
+                    None, None, None, 0
+                ]
                 cute.copy(
                     copy_atom_load_X_async,
-                    tXgX[None, None, None, bidx + gdim],
+                    tXgX_cur,
                     tXsX[None, None, None, stage ^ 1],
                     pred=tXpX,
                 )
                 cute.copy(
                     copy_atom_load_X_async,
-                    tXgdOut[None, None, None, bidx + gdim],
+                    tXgdOut_cur,
                     tXsdOut[None, None, None, stage ^ 1],
                     pred=tXpX,
                 )
@@ -575,7 +579,8 @@ class RMSNormBackward(ReductionBase):
             dx = (wdy - x_hat * mean_xhat_wdy) * rstd
             tXrdX.store(dx.to(tXrdOut.element_type))
             if row < M or tiler_mn[0] == 1:
-                cute.copy(copy_atom_store_dX, tXrdX, tXgdX[None, None, None, bidx], pred=tXpX)
+                tXgdX_cur = utils.coord_offset_i64(bidx, tXgdX, dim=3)[None, None, None, 0]
+                cute.copy(copy_atom_store_dX, tXrdX, tXgdX_cur, pred=tXpX)
             tXrdW.store(tXrdW.load() + dout * x_hat)
             stage ^= 1
             if stage == 0:

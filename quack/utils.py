@@ -417,7 +417,26 @@ def i64_to_f32x2(c: cutlass.Int64, *, loc=None, ip=None) -> Tuple[Float32, Float
 def domain_offset_i64(coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
     flat_coord_i64 = tuple(cutlass.Int64(c) for c in cute.flatten(coord))
     flat_stride = cute.flatten_to_tuple(tensor.stride)
+    assert len(flat_coord_i64) == len(
+        flat_stride
+    ), "Coordinate and stride must have the same length"
     offset = sum(c * s for c, s in zip(flat_coord_i64, flat_stride))
+    assert isinstance(tensor.iterator, cute.Pointer)
+    # HACK: we assume that applying the offset does not change the pointer alignment
+    new_ptr = cute.make_ptr(
+        tensor.element_type,
+        tensor.iterator.toint() + offset * tensor.element_type.width // 8,
+        tensor.memspace,
+        assumed_align=tensor.iterator.max_alignment,
+    )
+    return cute.make_tensor(new_ptr, tensor.layout)
+
+
+@dsl_user_op
+def coord_offset_i64(
+    idx: cute.typing.Int, tensor: cute.Tensor, dim: int, *, loc=None, ip=None
+) -> cute.Tensor:
+    offset = cutlass.Int64(idx) * cute.size(tensor.stride[dim])
     assert isinstance(tensor.iterator, cute.Pointer)
     # HACK: we assume that applying the offset does not change the pointer alignment
     new_ptr = cute.make_ptr(
