@@ -1,14 +1,14 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
-import torch
 from typing import Optional
 
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
 import quack.utils as utils
+import torch
+from cutlass.cute.runtime import from_dlpack
 from quack.reduction_base import ReductionBase, torch2cute_dtype_map
 
 
@@ -19,41 +19,55 @@ class RMSNorm(ReductionBase):
         self.delay_w_load = False
 
     def _calculate_threads_per_row(self):
+        """Calculate the number of threads per row for the RMSNorm kernel."""
         N = self.N
-        return (
-            8
-            if N <= 64
-            else (
-                16
-                if N <= 128
-                else (32 if N <= 3072 else (64 if N <= 6144 else (128 if N <= 16384 else 256)))
-            )
-        )
+        if N <= 64:
+            return 8
+        elif N <= 128:
+            return 16
+        elif N <= 3072:
+            return 32
+        elif N <= 6144:
+            return 64
+        elif N <= 16384:
+            return 128
+        else:
+            return 256
 
     def _set_cluster_n(self):
+        """
+        Set the number of clusters for the RMSNorm kernel.
+        Stored in self.cluster_n.
+        """
         N = self.N
+
         # cluster_n = 4 is faster and cluster_n = 2 for N=64k for some reason
         # Similarly cluster_n = 8 is faster for N=128k
         if cutlass.const_expr(self.dtype.width == 16):
-            cluster_n = (
-                1
-                if N <= 16 * 1024
-                else (
-                    2
-                    if N <= 32 * 1024
-                    else (4 if N <= 64 * 1024 else (8 if N <= 128 * 1024 else 16))
-                )
-            )
-        else:  # fp32
-            cluster_n = (
-                1
-                if N <= 32 * 1024
-                else (
-                    2
-                    if N <= 64 * 1024
-                    else (4 if N <= 128 * 1024 else (8 if N <= 256 * 1024 else 16))
-                )
-            )
+            # 16-bit types (fp16, bf16)
+            if N <= 16 * 1024:
+                cluster_n = 1
+            elif N <= 32 * 1024:
+                cluster_n = 2
+            elif N <= 64 * 1024:
+                cluster_n = 4
+            elif N <= 128 * 1024:
+                cluster_n = 8
+            else:
+                cluster_n = 16
+        else:
+            # 32-bit types (fp32)
+            if N <= 32 * 1024:
+                cluster_n = 1
+            elif N <= 64 * 1024:
+                cluster_n = 2
+            elif N <= 128 * 1024:
+                cluster_n = 4
+            elif N <= 256 * 1024:
+                cluster_n = 8
+            else:
+                cluster_n = 16
+
         self.cluster_n = cluster_n
 
     @cute.jit
@@ -82,7 +96,7 @@ class RMSNorm(ReductionBase):
         self.kernel(mX, mW, mO, mRstd, eps, tv_layout, tiler_mn, self.reload_from).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
             block=[num_threads, 1, 1],
-            cluster=[1, self.cluster_n, 1] if cutlass.const_expr(self.cluster_n > 1) else None,
+            cluster=([1, self.cluster_n, 1] if cutlass.const_expr(self.cluster_n > 1) else None),
             smem=self._smem_size_in_bytes(tiler_mn, num_warps),
             stream=stream,
         )
@@ -109,7 +123,9 @@ class RMSNorm(ReductionBase):
 
         smem = cutlass.utils.SmemAllocator()
         sX = smem.allocate_tensor(
-            mX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16
+            mX.element_type,
+            cute.make_ordered_layout(tiler_mn, order=(1, 0)),
+            byte_alignment=16,
         )
         reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
 
@@ -184,7 +200,7 @@ class RMSNorm(ReductionBase):
             reduction_buffer[None, None, 0],
             mbar_ptr,
             init_val=0.0,
-            hook_fn=cute.arch.cluster_wait if cutlass.const_expr(self.cluster_n > 1) else None,
+            hook_fn=(cute.arch.cluster_wait if cutlass.const_expr(self.cluster_n > 1) else None),
         )
         rstd = utils.rsqrt(sum_sq_x / shape[1] + eps)
         if cutlass.const_expr(mRstd is not None):
@@ -232,7 +248,11 @@ def _rmsnorm_fwd(
     assert weight.dim() == 1, "Weight must be 1D"
     assert x.shape[-1] == weight.shape[0], "Last dimension of input must match weight dimension"
     assert x.is_cuda and weight.is_cuda, "Tensors must be on CUDA device"
-    assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
+    assert x.dtype in [
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ], "Unsupported dtype"
     assert weight.dtype == torch.float32, "Weight must be float32"
     M, N = x.shape
     device = x.device
@@ -538,10 +558,14 @@ class RMSNormBackward(ReductionBase):
                 )
             elif tiler_mn[0] > 1:
                 utils.fill_oob(
-                    tXsX[None, None, None, stage ^ 1], None, fill_value=mX.element_type.zero
+                    tXsX[None, None, None, stage ^ 1],
+                    None,
+                    fill_value=mX.element_type.zero,
                 )
                 utils.fill_oob(
-                    tXsdOut[None, None, None, stage ^ 1], None, fill_value=mdOut.element_type.zero
+                    tXsdOut[None, None, None, stage ^ 1],
+                    None,
+                    fill_value=mdOut.element_type.zero,
                 )
             cute.arch.cp_async_commit_group()
             if row < M or tiler_mn[0] == 1:
@@ -561,7 +585,7 @@ class RMSNormBackward(ReductionBase):
                     cute.ReductionOp.ADD,
                     threads_per_row,
                     reduction_buffer[None, None, stage],
-                    mbar_full_ptr + stage if cutlass.const_expr(self.cluster_n > 1) else None,
+                    (mbar_full_ptr + stage if cutlass.const_expr(self.cluster_n > 1) else None),
                     phase=consumer_phase,
                     init_val=0.0,
                 )
@@ -634,7 +658,11 @@ def _rmsnorm_backward(
     assert weight.dim() == 1, "Weight must be 1D"
     assert x.shape[-1] == weight.shape[0], "Last dimension of input must match weight dimension"
     assert x.is_cuda and weight.is_cuda, "Tensors must be on CUDA device"
-    assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
+    assert x.dtype in [
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ], "Unsupported dtype"
     assert weight.dtype == torch.float32, "Weight must be float32"
 
     M, N = x.shape
