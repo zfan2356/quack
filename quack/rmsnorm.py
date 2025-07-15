@@ -1,14 +1,14 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
-import torch
 from typing import Optional
 
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
 import quack.utils as utils
+import torch
+from cutlass.cute.runtime import from_dlpack
 from quack.reduction_base import ReductionBase, torch2cute_dtype_map
 
 
@@ -82,7 +82,7 @@ class RMSNorm(ReductionBase):
         self.kernel(mX, mW, mO, mRstd, eps, tv_layout, tiler_mn, self.reload_from).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
             block=[num_threads, 1, 1],
-            cluster=[1, self.cluster_n, 1] if cutlass.const_expr(self.cluster_n > 1) else None,
+            cluster=([1, self.cluster_n, 1] if cutlass.const_expr(self.cluster_n > 1) else None),
             smem=self._smem_size_in_bytes(tiler_mn, num_warps),
             stream=stream,
         )
@@ -109,7 +109,9 @@ class RMSNorm(ReductionBase):
 
         smem = cutlass.utils.SmemAllocator()
         sX = smem.allocate_tensor(
-            mX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16
+            mX.element_type,
+            cute.make_ordered_layout(tiler_mn, order=(1, 0)),
+            byte_alignment=16,
         )
         reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
 
@@ -184,7 +186,7 @@ class RMSNorm(ReductionBase):
             reduction_buffer[None, None, 0],
             mbar_ptr,
             init_val=0.0,
-            hook_fn=cute.arch.cluster_wait if cutlass.const_expr(self.cluster_n > 1) else None,
+            hook_fn=(cute.arch.cluster_wait if cutlass.const_expr(self.cluster_n > 1) else None),
         )
         rstd = utils.rsqrt(sum_sq_x / shape[1] + eps)
         if cutlass.const_expr(mRstd is not None):
@@ -232,7 +234,11 @@ def _rmsnorm_fwd(
     assert weight.dim() == 1, "Weight must be 1D"
     assert x.shape[-1] == weight.shape[0], "Last dimension of input must match weight dimension"
     assert x.is_cuda and weight.is_cuda, "Tensors must be on CUDA device"
-    assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
+    assert x.dtype in [
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ], "Unsupported dtype"
     assert weight.dtype == torch.float32, "Weight must be float32"
     M, N = x.shape
     device = x.device
@@ -538,10 +544,14 @@ class RMSNormBackward(ReductionBase):
                 )
             elif tiler_mn[0] > 1:
                 utils.fill_oob(
-                    tXsX[None, None, None, stage ^ 1], None, fill_value=mX.element_type.zero
+                    tXsX[None, None, None, stage ^ 1],
+                    None,
+                    fill_value=mX.element_type.zero,
                 )
                 utils.fill_oob(
-                    tXsdOut[None, None, None, stage ^ 1], None, fill_value=mdOut.element_type.zero
+                    tXsdOut[None, None, None, stage ^ 1],
+                    None,
+                    fill_value=mdOut.element_type.zero,
                 )
             cute.arch.cp_async_commit_group()
             if row < M or tiler_mn[0] == 1:
@@ -561,7 +571,7 @@ class RMSNormBackward(ReductionBase):
                     cute.ReductionOp.ADD,
                     threads_per_row,
                     reduction_buffer[None, None, stage],
-                    mbar_full_ptr + stage if cutlass.const_expr(self.cluster_n > 1) else None,
+                    (mbar_full_ptr + stage if cutlass.const_expr(self.cluster_n > 1) else None),
                     phase=consumer_phase,
                     init_val=0.0,
                 )
@@ -634,7 +644,11 @@ def _rmsnorm_backward(
     assert weight.dim() == 1, "Weight must be 1D"
     assert x.shape[-1] == weight.shape[0], "Last dimension of input must match weight dimension"
     assert x.is_cuda and weight.is_cuda, "Tensors must be on CUDA device"
-    assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
+    assert x.dtype in [
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ], "Unsupported dtype"
     assert weight.dtype == torch.float32, "Weight must be float32"
 
     M, N = x.shape
@@ -717,14 +731,16 @@ class RMSNormFunction(torch.autograd.Function):
         x = x.view(-1, x.shape[-1])
 
         out, rstd = _rmsnorm_fwd(x, weight, eps, return_rstd=True)
-        ctx.save_for_backward(x, weight, rstd, x_shape_start)
+        ctx.save_for_backward(x, weight, rstd)
         ctx.eps = eps
+        ctx.x_shape_start = x_shape_start
 
         return out.reshape(x_shape_start)
 
     @staticmethod
     def backward(ctx, dout):
-        x, weight, rstd, x_shape_start = ctx.saved_tensors
+        x, weight, rstd = ctx.saved_tensors
+        x_shape_start = ctx.x_shape_start
         dx, dw = _rmsnorm_backward(x, weight, dout, rstd)
         dx = dx.view(x_shape_start)
         # dw is returned for weight gradient, None for eps gradient
