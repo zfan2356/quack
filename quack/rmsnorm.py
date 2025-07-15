@@ -739,15 +739,24 @@ _rmsnorm_backward.compile_cache = {}
 class RMSNormFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, eps):
+        x_shape_start = x.shape
+
+        # Flatten input
+        x = x.view(-1, x.shape[-1])
+
         out, rstd = _rmsnorm_fwd(x, weight, eps, return_rstd=True)
         ctx.save_for_backward(x, weight, rstd)
         ctx.eps = eps
-        return out
+        ctx.x_shape_start = x_shape_start
+
+        return out.reshape(x_shape_start)
 
     @staticmethod
     def backward(ctx, dout):
         x, weight, rstd = ctx.saved_tensors
+        x_shape_start = ctx.x_shape_start
         dx, dw = _rmsnorm_backward(x, weight, dout, rstd)
+        dx = dx.view(x_shape_start)
         # dw is returned for weight gradient, None for eps gradient
         return dx, dw, None
 

@@ -12,7 +12,22 @@ from quack.rmsnorm import rmsnorm, rmsnorm_ref, rstd_ref
 # @pytest.mark.parametrize("input_dtype", [torch.float16])
 @pytest.mark.parametrize(
     "N",
-    [192, 256, 512, 760, 1024, 1128, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
+    [
+        192,
+        256,
+        512,
+        760,
+        1024,
+        1128,
+        2048,
+        4096,
+        8192,
+        16384,
+        32768,
+        65536,
+        131072,
+        262144,
+    ],
     # [262144]
 )
 @pytest.mark.parametrize("M", [1, 37, 199, 8 * 1024])
@@ -57,7 +72,7 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, eps):
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize(
     "N",
-    [131072, 262144]
+    [131072, 262144],
     # [262144]
 )
 @pytest.mark.parametrize("M", [32 * 1024])
@@ -82,8 +97,10 @@ def test_rmsnorm_large_tensor(M, N, input_dtype, eps):
     rmsnorm_compiled(x[:32], weight, eps=eps)
     out_ref = rmsnorm_compiled(x, weight, eps=eps)
     # Need to chunk, otherwise it OOMs
-    assert all((out_c - out_ref_c).abs().max() < atol
-               for out_c, out_ref_c in zip(out.chunk(16), out_ref.chunk(16)))
+    assert all(
+        (out_c - out_ref_c).abs().max() < atol
+        for out_c, out_ref_c in zip(out.chunk(16), out_ref.chunk(16))
+    )
 
 
 @pytest.mark.parametrize("return_rstd", [True, False])
@@ -111,18 +128,24 @@ def test_rmsnorm_input_validation():
     """Test input validation and error handling."""
     device = "cuda"
 
-    # Test 3D input (should fail)
+    # Test 3D input (should now work since rmsnorm was updated to accept 3D inputs)
     x_3d = torch.randn(2, 32, 1024, device=device, dtype=torch.float16)
     weight = torch.randn(1024, device=device, dtype=torch.float32)
 
-    with pytest.raises(AssertionError, match="Input must be 2D"):
-        rmsnorm(x_3d, weight)
+    # This should not raise an exception now
+    out = rmsnorm(x_3d, weight)
+    # Verify output shape matches input shape
+    assert out.shape == x_3d.shape
+    # Verify output dtype matches input dtype
+    assert out.dtype == x_3d.dtype
 
     # Test weight dimension mismatch
     x = torch.randn(32, 1024, device=device, dtype=torch.float16)
     weight_wrong = torch.randn(512, device=device, dtype=torch.float32)
 
-    with pytest.raises(AssertionError, match="Last dimension of input must match weight dimension"):
+    with pytest.raises(
+        AssertionError, match="Last dimension of input must match weight dimension"
+    ):
         rmsnorm(x, weight_wrong)
 
     # Test CPU tensors (should fail)
