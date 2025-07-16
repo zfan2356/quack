@@ -5,7 +5,6 @@ import torch
 
 from quack.rmsnorm import rmsnorm, rmsnorm_ref, rstd_ref, _rmsnorm_fwd
 
-
 @pytest.mark.parametrize("eps", [1e-5, 1e-6])
 # @pytest.mark.parametrize("eps", [1e-5])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -162,10 +161,172 @@ def test_rmsnorm_input_validation():
 
     # Test wrong weight dtype
     x = torch.randn(32, 1024, device=device, dtype=torch.float16)
-    weight_wrong_dtype = torch.randn(1024, device=device, dtype=torch.float16)
+    weight_wrong_dtype = torch.randn(1024, device=device, dtype=torch.float64)
 
-    with pytest.raises(AssertionError, match="Weight must be float32"):
+    with pytest.raises(AssertionError, match="Weight must be float32, float16 or bfloat16"):
         rmsnorm(x, weight_wrong_dtype)
+
+
+def test_rmsnorm_bf16_weights():
+    """Test that bfloat16 weights work correctly with rmsnorm."""
+    device = "cuda"
+    M, N = 32, 1024
+    eps = 1e-6
+
+    # Test with bfloat16 input and weights
+    x = torch.randn(M, N, device=device, dtype=torch.bfloat16)
+    weight_bf16 = torch.randn(N, device=device, dtype=torch.bfloat16)
+
+    # Run rmsnorm with bfloat16 weights
+    out_bf16 = rmsnorm(x, weight_bf16, eps=eps)
+
+    # Verify output shape and dtype
+    assert out_bf16.shape == x.shape
+    assert out_bf16.dtype == torch.bfloat16
+
+    # Convert to float32 for reference comparison
+    x_fp32 = x.to(torch.float32)
+    weight_fp32 = weight_bf16.to(torch.float32)
+
+    # Run reference implementation with float32
+    out_ref = rmsnorm_ref(x_fp32, weight_fp32, eps=eps).to(torch.bfloat16)
+
+    # Verify output values match reference implementation
+    torch.testing.assert_close(out_bf16, out_ref, atol=1e-1, rtol=1e-2)
+
+
+def test_rmsnorm_bf16_weights_backward():
+    """Test that bfloat16 weights work correctly with rmsnorm backward pass."""
+    device = "cuda"
+    M, N = 32, 1024
+    eps = 1e-6
+    atol = 1e-1  # Higher tolerance for bfloat16
+
+    # Create tensors with gradients
+    x = torch.randn(M, N, device=device, dtype=torch.bfloat16, requires_grad=True)
+    weight_bf16 = torch.randn(N, device=device, dtype=torch.bfloat16, requires_grad=True)
+
+    # Create reference tensors with float32 weights for comparison
+    x_ref = x.detach().clone().requires_grad_()
+    weight_fp32 = weight_bf16.to(torch.float32).detach().requires_grad_()
+
+    # Forward pass
+    out_bf16 = rmsnorm(x, weight_bf16, eps=eps)
+    out_ref = rmsnorm(x_ref, weight_fp32, eps=eps)
+
+    # Create gradient for backward pass
+    grad_out = torch.randn_like(out_bf16)
+    grad_out_ref = grad_out.clone()
+
+    # Backward pass
+    torch.cuda.synchronize()
+    out_bf16.backward(grad_out)
+    out_ref.backward(grad_out_ref)
+
+    # Verify gradients
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=1e-2)
+    torch.testing.assert_close(
+        weight_bf16.grad, weight_fp32.grad.to(torch.bfloat16), atol=atol, rtol=1e-2
+    )
+
+    # Test with mixed precision: bfloat16 input and float32 weights
+    x = torch.randn(M, N, device=device, dtype=torch.bfloat16, requires_grad=True)
+    weight_fp32 = torch.randn(N, device=device, dtype=torch.float32, requires_grad=True)
+
+    # Forward pass
+    out_mixed = rmsnorm(x, weight_fp32, eps=eps)
+
+    # Create gradient for backward pass
+    grad_out = torch.randn_like(out_mixed)
+
+    # Backward pass
+    torch.cuda.synchronize()
+    out_mixed.backward(grad_out)
+
+    # Just verify that backward pass completes without errors
+    assert x.grad is not None
+    assert weight_fp32.grad is not None
+
+
+def test_rmsnorm_fp16_weights():
+    """Test that float16 weights work correctly with rmsnorm."""
+    device = "cuda"
+    M, N = 32, 1024
+    eps = 1e-6
+
+    # Test with float16 input and weights
+    x = torch.randn(M, N, device=device, dtype=torch.float16)
+    weight_fp16 = torch.randn(N, device=device, dtype=torch.float16)
+
+    # Run rmsnorm with float16 weights
+    out_fp16 = rmsnorm(x, weight_fp16, eps=eps)
+
+    # Verify output shape and dtype
+    assert out_fp16.shape == x.shape
+    assert out_fp16.dtype == torch.float16
+
+    # Convert to float32 for reference comparison
+    x_fp32 = x.to(torch.float32)
+    weight_fp32 = weight_fp16.to(torch.float32)
+
+    # Run reference implementation with float32
+    out_ref = rmsnorm_ref(x_fp32, weight_fp32, eps=eps).to(torch.float16)
+
+    # Verify output values match reference implementation
+    torch.testing.assert_close(out_fp16, out_ref, atol=1e-2, rtol=1e-2)
+
+
+def test_rmsnorm_fp16_weights_backward():
+    """Test that float16 weights work correctly with rmsnorm backward pass."""
+    device = "cuda"
+    M, N = 32, 1024
+    eps = 1e-6
+    atol = 1e-2  # Tolerance for float16
+
+    # Create tensors with gradients
+    x = torch.randn(M, N, device=device, dtype=torch.float16, requires_grad=True)
+    weight_fp16 = torch.randn(N, device=device, dtype=torch.float16, requires_grad=True)
+
+    # Create reference tensors with float32 weights for comparison
+    x_ref = x.detach().clone().requires_grad_()
+    weight_fp32 = weight_fp16.to(torch.float32).detach().requires_grad_()
+
+    # Forward pass
+    out_fp16 = rmsnorm(x, weight_fp16, eps=eps)
+    out_ref = rmsnorm(x_ref, weight_fp32, eps=eps)
+
+    # Create gradient for backward pass
+    grad_out = torch.randn_like(out_fp16)
+    grad_out_ref = grad_out.clone()
+
+    # Backward pass
+    torch.cuda.synchronize()
+    out_fp16.backward(grad_out)
+    out_ref.backward(grad_out_ref)
+
+    # Verify gradients
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=1e-2)
+    torch.testing.assert_close(
+        weight_fp16.grad, weight_fp32.grad.to(torch.float16), atol=atol, rtol=1e-2
+    )
+
+    # Test with mixed precision: float16 input and float32 weights
+    x = torch.randn(M, N, device=device, dtype=torch.float16, requires_grad=True)
+    weight_fp32 = torch.randn(N, device=device, dtype=torch.float32, requires_grad=True)
+
+    # Forward pass
+    out_mixed = rmsnorm(x, weight_fp32, eps=eps)
+
+    # Create gradient for backward pass
+    grad_out = torch.randn_like(out_mixed)
+
+    # Backward pass
+    torch.cuda.synchronize()
+    out_mixed.backward(grad_out)
+
+    # Just verify that backward pass completes without errors
+    assert x.grad is not None
+    assert weight_fp32.grad is not None
 
 
 def test_rmsnorm_compile_cache():

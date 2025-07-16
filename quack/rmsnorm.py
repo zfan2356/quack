@@ -253,7 +253,13 @@ def _rmsnorm_fwd(
         torch.bfloat16,
         torch.float32,
     ], "Unsupported dtype"
-    assert weight.dtype == torch.float32, "Weight must be float32"
+
+    assert weight.dtype in [
+        torch.float32,
+        torch.bfloat16,
+        torch.float16,
+    ], "Weight must be float32, float16 or bfloat16"
+
     M, N = x.shape
     device = x.device
     out = torch.empty_like(x)
@@ -269,8 +275,10 @@ def _rmsnorm_fwd(
         convert_from_dlpack(t)
         for t in (x, out)
     ]
+    # handle weight divisibility based on weight dtype
+    weight_dtype = torch2cute_dtype_map[weight.dtype]
     weight_tensor = utils.convert_from_dlpack(
-        weight.detach(), leading_dim=0, divisibility=128 // cutlass.Float32.width
+        weight.detach(), leading_dim=0, divisibility=128 // weight_dtype.width
     )
     rstd_tensor = (
         from_dlpack(rstd.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
@@ -278,7 +286,7 @@ def _rmsnorm_fwd(
         else None
     )
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    compile_key = (dtype, N, rstd is not None)
+    compile_key = (dtype, N, rstd is not None, weight.dtype)
     if compile_key not in _rmsnorm_fwd.compile_cache:
         rmsnorm_op = RMSNorm(dtype, N)
         _rmsnorm_fwd.compile_cache[compile_key] = cute.compile(
@@ -481,6 +489,7 @@ class RMSNormBackward(ReductionBase):
 
         gdW = cute.local_tile(mdW, (1, tiler_mn[1]), (bidx_start, cluster_y))
         tdWgdW = thr_copy_dW.partition_D(gdW)
+        # Always compute partial weight gradients in fp32
         tdWrdW = cute.make_fragment_like(tdWgdW, cutlass.Float32)
         tXrdW = thr_copy_X.retile(tdWrdW)
 
@@ -613,6 +622,7 @@ class RMSNormBackward(ReductionBase):
             if row < M or tiler_mn[0] == 1:
                 tXgdX_cur = utils.coord_offset_i64(bidx, tXgdX, dim=3)[None, None, None, 0]
                 cute.copy(copy_atom_store_dX, tXrdX, tXgdX_cur, pred=tXpX)
+            # Accumulate weight gradients in fp32
             tXrdW.store(tXrdW.load() + dout * x_hat)
 
             stage ^= 1
@@ -642,7 +652,9 @@ class RMSNormBackward(ReductionBase):
                     cute.autovec_copy(tXsdW_other, tXrdW_other)
                     tXrdW.store(tXrdW.load() + tXrdW_other.load())
                 cute.copy(copy_atom_store_dW, tdWrdW, tdWgdW, pred=tdWpdW)
+
         else:
+            # dw is already in fp32, so we can directly copy to global memory
             cute.copy(copy_atom_store_dW, tdWrdW, tdWgdW, pred=tdWpdW)
 
 
@@ -672,7 +684,12 @@ def _rmsnorm_backward(
         torch.bfloat16,
         torch.float32,
     ], "Unsupported dtype"
-    assert weight.dtype == torch.float32, "Weight must be float32"
+
+    assert weight.dtype in [
+        torch.float32,
+        torch.bfloat16,
+        torch.float16,
+    ], "Weight must be float32, float16 or bfloat16"
 
     M, N = x.shape
     dx = torch.empty_like(x)
@@ -691,7 +708,9 @@ def _rmsnorm_backward(
     sm_count = (
         sm_count * sm_count_multiple if N <= 8192 else sm_count // 2 if N <= 16384 else sm_count * 2
     )
-    dw_partial = torch.empty(sm_count, N, device=device, dtype=weight.dtype)
+
+    # Always store partial gradients in fp32 for numerical accuracy
+    dw_partial = torch.empty(sm_count, N, device=device, dtype=torch.float32)
 
     dtype = torch2cute_dtype_map[x.dtype]
 
@@ -703,8 +722,10 @@ def _rmsnorm_backward(
 
     x_tensor, dout_tensor, dx_tensor = [convert_from_dlpack(tensor) for tensor in (x, dout, dx)]
 
+    # Handle weight div based on weight dtype
+    weight_dtype = torch2cute_dtype_map[weight.dtype]
     weight_tensor = utils.convert_from_dlpack(
-        weight.detach(), leading_dim=0, divisibility=128 // cutlass.Float32.width
+        weight.detach(), leading_dim=0, divisibility=128 // weight_dtype.width
     )
 
     dw_partial_tensor = convert_from_dlpack(dw_partial)
@@ -712,7 +733,7 @@ def _rmsnorm_backward(
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    compile_key = (dtype, N)
+    compile_key = (dtype, N, weight.dtype)
     if compile_key not in _rmsnorm_backward.compile_cache:
         rmsnorm_backward_op = RMSNormBackward(dtype, N)
         _rmsnorm_backward.compile_cache[compile_key] = cute.compile(
@@ -737,7 +758,7 @@ def _rmsnorm_backward(
         sm_count,
         current_stream,
     )
-
+    # we have summed the partial gradients in fp32, now we convert back to the weight dtype
     dw = dw_partial.sum(dim=0).to(weight.dtype)
     return dx, dw
 
@@ -764,9 +785,13 @@ class RMSNormFunction(torch.autograd.Function):
     def backward(ctx, dout):
         x, weight, rstd = ctx.saved_tensors
         x_shape_start = ctx.x_shape_start
+        # Reshape dout to match the flattened shape used in forward
+        dout = dout.view(-1, dout.shape[-1])
         dx, dw = _rmsnorm_backward(x, weight, dout, rstd)
         dx = dx.view(x_shape_start)
-        # dw is returned for weight gradient, None for eps gradient
+        # dx is returned for input gradient,
+        # dw is returned for weight gradient,
+        # None for eps gradient
         return dx, dw, None
 
 
@@ -782,3 +807,39 @@ def rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.T
         Normalized output tensor of same shape as x
     """
     return RMSNormFunction.apply(x, weight, eps)
+
+
+class QuackRMSNorm(torch.nn.Module):
+    """RMSNorm module that behaves like torch.nn.RMSNorm.
+
+    This class provides a drop-in replacement for torch.nn.RMSNorm that uses
+    the quack.rmsnorm implementation under the hood.
+
+    Args:
+        dim (int): The dimension to normalize over
+        eps (float, optional): A small constant for numerical stability. Default: 1e-6
+
+    Attributes:
+        weight (torch.nn.Parameter): The learnable weight parameter
+        eps (float): A small constant for numerical stability
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply RMSNorm to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor
+
+        Returns:
+            torch.Tensor: Normalized tensor
+        """
+        return rmsnorm(x, self.weight, self.eps)
+
+    def reset_parameters(self):
+        """Reset the weight parameter to ones."""
+        torch.nn.init.ones_(self.weight)
