@@ -1,4 +1,4 @@
-__version__ = "0.1.7"
+__version__ = "0.1.8"
 
 from quack.rmsnorm import rmsnorm
 from quack.softmax import softmax
