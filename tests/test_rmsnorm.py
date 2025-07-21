@@ -67,6 +67,33 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, eps):
     torch.testing.assert_close(weight.grad, weight_ref.grad, atol=atol, rtol=1e-3)
 
 
+def test_rmsnorm_strided_tensor():
+    """Test RMSNorm with strided tensor input where shape is (8, 4096, 512) and stride is (sth, 576, 1)."""
+    device = "cuda"
+    dtype = torch.bfloat16
+    atol = 1e-1
+    eps = 1e-5
+    # Create a larger tensor with 576 features
+    full_tensor = torch.randn(8, 4096, 576, device=device, dtype=dtype)
+    # Take a slice of the top 512 dimensions - this creates a strided view
+    x = full_tensor[:, :, :512].detach().requires_grad_()
+    # Create weight tensor
+    weight = torch.randn(512, device=device, dtype=torch.float32, requires_grad=True)
+    # Reference implementation
+    x_ref = x.detach().clone().requires_grad_()
+    weight_ref = weight.detach().clone().requires_grad_()
+    out = rmsnorm(x, weight, eps=eps)
+    out_ref = rmsnorm_ref(x_ref, weight_ref, eps=eps)
+    assert out.shape == x.shape
+    torch.testing.assert_close(out, out_ref, atol=atol, rtol=1e-3)
+    grad_out = torch.randn_like(out)
+    torch.cuda.synchronize()
+    out_ref.backward(grad_out)
+    out.backward(grad_out)
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=1e-3)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=atol, rtol=1e-3)
+
+
 @pytest.mark.parametrize("eps", [1e-5])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize(

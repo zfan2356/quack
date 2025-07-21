@@ -6,9 +6,11 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cutlass import Float32, Int32
+from cutlass.cute.runtime import from_dlpack
+
 import quack.utils as utils
 import torch
-from cutlass.cute.runtime import from_dlpack
 from quack.reduction_base import ReductionBase, torch2cute_dtype_map
 
 
@@ -78,8 +80,17 @@ class RMSNorm(ReductionBase):
         mO: cute.Tensor,
         mRstd: Optional[cute.Tensor],
         stream: cuda.CUstream,
-        eps: cutlass.Float32 = 1e-6,
+        eps: Float32 = 1e-6,
     ):
+        semistatic_shape = (*mX.shape[:-1], self.N)  # Set last dimension to be statically N
+        new_stride = lambda t: (
+            cute.assume(t.stride[0], divby=128 // t.element_type.width),
+            t.stride[1],
+        )
+        mX, mO = [
+            cute.make_tensor(t.iterator, cute.make_layout(semistatic_shape, stride=new_stride(t)))
+            for t in (mX, mO)
+        ]
         assert mX.element_type == self.dtype
         assert mO.element_type == self.dtype
         self._set_cluster_n()
@@ -265,16 +276,15 @@ def _rmsnorm_fwd(
     out = torch.empty_like(x)
     rstd = torch.empty(M, device=device, dtype=torch.float32) if return_rstd else None
     dtype = torch2cute_dtype_map[x.dtype]
+    # convert_from_dlpack = lambda x: (
+    #     from_dlpack(x.detach(), assumed_align=16).mark_compact_shape_dynamic(
+    #         mode=0, divisibility=128 // dtype.width
+    #     )
+    # )
     convert_from_dlpack = lambda x: (
-        from_dlpack(x.detach(), assumed_align=16).mark_compact_shape_dynamic(
-            mode=0, stride_order=(0, 1)
-        )
+        from_dlpack(x.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
     )
-    x_tensor, out_tensor = [
-        # utils.convert_from_dlpack(t, leading_dim=t.ndim - 1, divisibility=128 // dtype.width)
-        convert_from_dlpack(t)
-        for t in (x, out)
-    ]
+    x_tensor, out_tensor = [convert_from_dlpack(t) for t in (x, out)]
     # handle weight divisibility based on weight dtype
     weight_dtype = torch2cute_dtype_map[weight.dtype]
     weight_tensor = utils.convert_from_dlpack(
@@ -329,7 +339,7 @@ def rmsnorm_bwd_ref(x, w, dout, rstd, eps=1e-6):
 class RMSNormBackward(ReductionBase):
     def __init__(self, dtype: cutlass.Numeric, N: int):
         # 2 stages for double buffering when computing mean of x_hat * wdy
-        super().__init__(dtype, N, stage=2, reduction_dtype=cutlass.Float32)
+        super().__init__(dtype, N, stage=2, reduction_dtype=Float32)
         self.reload_wdy = None if N <= 16 * 1024 else "smem"
         if self.N > 128 * 1024 and self.dtype.width >= 32:
             # Not enough smem
@@ -377,9 +387,18 @@ class RMSNormBackward(ReductionBase):
         mRstd: cute.Tensor,
         mdX: cute.Tensor,
         mdW: cute.Tensor,
-        sm_count: cutlass.Int32,
+        sm_count: Int32,
         stream: cuda.CUstream,
     ):
+        semistatic_shape = (*mX.shape[:-1], self.N)  # Set last dimension to be statically N
+        new_stride = lambda t: (
+            cute.assume(t.stride[0], divby=128 // t.element_type.width),
+            t.stride[1],
+        )
+        mX, mdOut, mdX = [
+            cute.make_tensor(t.iterator, cute.make_layout(semistatic_shape, stride=new_stride(t)))
+            for t in (mX, mdOut, mdX)
+        ]
         self._set_cluster_n()
         tiler_mn, tv_layout = self._get_tv_layout()
         num_threads = cute.size(tv_layout, mode=[0])
@@ -490,7 +509,7 @@ class RMSNormBackward(ReductionBase):
         gdW = cute.local_tile(mdW, (1, tiler_mn[1]), (bidx_start, cluster_y))
         tdWgdW = thr_copy_dW.partition_D(gdW)
         # Always compute partial weight gradients in fp32
-        tdWrdW = cute.make_fragment_like(tdWgdW, cutlass.Float32)
+        tdWrdW = cute.make_fragment_like(tdWgdW, Float32)
         tXrdW = thr_copy_X.retile(tdWrdW)
 
         gX = cute.local_tile(mX, tiler_mn, (None, cluster_y))
@@ -543,9 +562,9 @@ class RMSNormBackward(ReductionBase):
 
         threads_per_row = tv_layout.shape[0][0]
         tXrdW.fill(0.0)
-        stage = cutlass.Int32(0)
-        producer_phase = cutlass.Int32(1)
-        consumer_phase = cutlass.Int32(0)
+        stage = Int32(0)
+        producer_phase = Int32(1)
+        consumer_phase = Int32(0)
         for bidx in cutlass.range(bidx_start, cute.ceil_div(M, tiler_mn[0]), gdim):
             row = tXcX[None, None, None, bidx][0][0]
             rstd = cutlass.Float.zero
@@ -714,12 +733,9 @@ def _rmsnorm_backward(
 
     dtype = torch2cute_dtype_map[x.dtype]
 
-    convert_from_dlpack = lambda tensor: (
-        from_dlpack(tensor.detach(), assumed_align=16).mark_compact_shape_dynamic(
-            mode=0, stride_order=(0, 1)
-        )
+    convert_from_dlpack = lambda x: (
+        from_dlpack(x.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=1)
     )
-
     x_tensor, dout_tensor, dx_tensor = [convert_from_dlpack(tensor) for tensor in (x, dout, dx)]
 
     # Handle weight div based on weight dtype
@@ -728,7 +744,7 @@ def _rmsnorm_backward(
         weight.detach(), leading_dim=0, divisibility=128 // weight_dtype.width
     )
 
-    dw_partial_tensor = convert_from_dlpack(dw_partial)
+    dw_partial_tensor = from_dlpack(dw_partial, assumed_align=16).mark_compact_shape_dynamic(mode=0)
     rstd_tensor = from_dlpack(rstd.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
