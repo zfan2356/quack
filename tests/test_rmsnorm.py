@@ -7,8 +7,10 @@ from quack.rmsnorm import rmsnorm, rmsnorm_ref, rstd_ref, _rmsnorm_fwd
 
 @pytest.mark.parametrize("eps", [1e-5, 1e-6])
 # @pytest.mark.parametrize("eps", [1e-5])
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
+# @pytest.mark.parametrize("weight_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
-# @pytest.mark.parametrize("input_dtype", [torch.float16])
+# @pytest.mark.parametrize("input_dtype", [torch.float32])
 @pytest.mark.parametrize(
     "N",
     [
@@ -31,7 +33,7 @@ from quack.rmsnorm import rmsnorm, rmsnorm_ref, rstd_ref, _rmsnorm_fwd
 )
 @pytest.mark.parametrize("M", [1, 37, 199, 8 * 1024])
 # @pytest.mark.parametrize("M", [1])
-def test_rmsnorm_forward_backward(M, N, input_dtype, eps):
+def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps):
     """Test RMSNorm forward pass against reference implementation."""
     if N >= 256 * 1024 and input_dtype == torch.float32 and M >= 8 * 1024:
         pytest.skip("Skipping large tensor test for float32 to avoid OOM")
@@ -45,7 +47,7 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, eps):
         atol = 1e-4
     torch.random.manual_seed(0)
     x = torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=True)
-    weight = torch.randn(N, device=device, dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(N, device=device, dtype=weight_dtype, requires_grad=True)
     x_ref = x.detach().clone().requires_grad_()
     weight_ref = weight.detach().clone().requires_grad_()
     out = rmsnorm(x, weight, eps=eps)
@@ -64,7 +66,11 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, eps):
     out_ref.backward(grad_out)
     out.backward(grad_out)
     torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=1e-3)
-    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=atol, rtol=1e-3)
+    if weight_dtype == torch.float32:
+        weight_atol = 1e-4
+    else:
+        weight_atol = 2 * (weight_ref.grad + 0.3 - 0.3 - weight_ref.grad).abs().max()
+    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=weight_atol, rtol=1e-3)
 
 
 def test_rmsnorm_strided_tensor():

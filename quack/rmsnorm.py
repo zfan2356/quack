@@ -161,30 +161,33 @@ class RMSNorm(ReductionBase):
         copy_atom_load_X_async = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyG2SOp(), mX.element_type, num_bits_per_copy=128
         )
+        num_bits_per_copy_W = cutlass.const_expr(
+            min(128, 128 // mX.element_type.width * mW.element_type.width)
+        )
         copy_atom_load_W = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), mW.element_type, num_bits_per_copy=128
+            cute.nvgpu.CopyUniversalOp(), mW.element_type, num_bits_per_copy=num_bits_per_copy_W
+        )
+        num_bits_per_copy_O = cutlass.const_expr(
+            min(128, 128 // mX.element_type.width * mO.element_type.width)
         )
         copy_atom_store_O = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), mO.element_type, num_bits_per_copy=128
+            cute.nvgpu.CopyUniversalOp(), mO.element_type, num_bits_per_copy=num_bits_per_copy_O
         )
 
         thr_copy_X = cute.make_tiled_copy(copy_atom_load_X_async, tv_layout, tiler_mn).get_slice(
             tidx
         )
-        thr_copy_W = cute.make_tiled_copy(copy_atom_load_W, tv_layout, tiler_mn).get_slice(tidx)
-        thr_copy_O = cute.make_tiled_copy(copy_atom_store_O, tv_layout, tiler_mn).get_slice(tidx)
 
-        tWgW = thr_copy_W.partition_S(gW)
+        tXgW = thr_copy_X.partition_S(gW)
         tXgX = thr_copy_X.partition_S(gX)
         tXsX = thr_copy_X.partition_D(sX)
-        tXgO = thr_copy_O.partition_D(gO)
-        tXrRstd = thr_copy_O.partition_D(gRstd) if cutlass.const_expr(mRstd is not None) else None
+        tXgO = thr_copy_X.partition_D(gO)
+        tXrRstd = thr_copy_X.partition_D(gRstd) if cutlass.const_expr(mRstd is not None) else None
         tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
 
         # allocate fragments for gmem->rmem
-        tWrW = cute.make_fragment_like(tWgW)
-        tWrW.fill(0.0)
-        tXrW = thr_copy_X.retile(tWrW)
+        tXrW = cute.make_fragment_like(tXgW)
+        tXrW.fill(0.0)
         tXrX, tXrO = [cute.make_fragment_like(thr) for thr in (tXgX, tXgO)]
 
         num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
@@ -196,9 +199,9 @@ class RMSNorm(ReductionBase):
             cute.copy(copy_atom_load_X_async, tXgX, tXsX, pred=tXpX)
         cute.arch.cp_async_commit_group()
 
-        tWpW = utils.predicate_k(thr_copy_W.partition_S(cX), limit=shape[1])
+        tXpW = utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
         if cutlass.const_expr(not delay_w_load):
-            cute.copy(copy_atom_load_W, tWgW, tWrW, pred=tWpW)
+            cute.copy(copy_atom_load_W, tXgW, tXrW, pred=tXpW)
 
         cute.arch.cp_async_wait_group(0)
         cute.autovec_copy(tXsX, tXrX)
@@ -223,7 +226,7 @@ class RMSNorm(ReductionBase):
             ):
                 tXrRstd[0] = rstd
         if cutlass.const_expr(delay_w_load):
-            cute.copy(copy_atom_load_W, tWgW, tWrW, pred=tWpW)
+            cute.copy(copy_atom_load_W, tXgW, tXrW, pred=tXpW)
         if cutlass.const_expr(reload_from == "smem"):
             cute.autovec_copy(tXsX, tXrX)
             x = tXrX.load().to(cute.Float32)
@@ -234,9 +237,9 @@ class RMSNorm(ReductionBase):
         w = tXrW.load().to(cute.Float32)
         y = x_hat * w
         tXrO.store(y.to(tXrO.element_type))
-        tOpO = utils.predicate_k(thr_copy_O.partition_S(cX), limit=shape[1])
+        tXpO = utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
         if row < shape[0]:
-            cute.copy(copy_atom_store_O, tXrO, tXgO, pred=tOpO)
+            cute.copy(copy_atom_store_O, tXrO, tXgO, pred=tXpO)
 
 
 def _rmsnorm_fwd(
@@ -460,39 +463,41 @@ class RMSNormBackward(ReductionBase):
         copy_atom_load_X_async = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyG2SOp(), mX.element_type, num_bits_per_copy=128
         )
+        num_bits_per_copy_W = cutlass.const_expr(
+            min(128, 128 // mX.element_type.width * mW.element_type.width)
+        )
         copy_atom_load_W = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), mW.element_type, num_bits_per_copy=128
+            cute.nvgpu.CopyUniversalOp(), mW.element_type, num_bits_per_copy=num_bits_per_copy_W
+        )
+        num_bits_per_copy_dX = cutlass.const_expr(
+            min(128, 128 // mX.element_type.width * mdX.element_type.width)
         )
         copy_atom_store_dX = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), mdX.element_type, num_bits_per_copy=128
+            cute.nvgpu.CopyUniversalOp(), mdX.element_type, num_bits_per_copy=num_bits_per_copy_dX
+        )
+        num_bits_per_copy_dW = cutlass.const_expr(
+            min(128, 128 // mX.element_type.width * mdW.element_type.width)
         )
         copy_atom_store_dW = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), mdW.element_type, num_bits_per_copy=128
+            cute.nvgpu.CopyUniversalOp(), mdW.element_type, num_bits_per_copy=num_bits_per_copy_dW
         )
 
         thr_copy_X = cute.make_tiled_copy(copy_atom_load_X, tv_layout, tiler_mn).get_slice(tidx)
-        thr_copy_X_async = cute.make_tiled_copy(
-            copy_atom_load_X_async, tv_layout, tiler_mn
-        ).get_slice(tidx)
-        thr_copy_W = cute.make_tiled_copy(copy_atom_load_W, tv_layout, tiler_mn).get_slice(tidx)
-        thr_copy_dW = cute.make_tiled_copy(copy_atom_store_dW, tv_layout, tiler_mn).get_slice(tidx)
-        thr_store_dX = cute.make_tiled_copy(copy_atom_store_dX, tv_layout, tiler_mn).get_slice(tidx)
 
         gW = cute.local_tile(mW, tiler_mn, (0, cluster_y))
-        tWgW = thr_copy_W.partition_S(gW)
-        tWrW = cute.make_fragment_like(tWgW)
+        tXgW = thr_copy_X.partition_S(gW)
+        tXrW = cute.make_fragment_like(tXgW)
         # Need this, otherwise rW can have arbitrary values that changes the reduction
         if not is_even_N:
-            tWrW.fill(0.0)
-        tXrW = thr_copy_X.retile(tWrW)
+            tXrW.fill(0.0)
 
         gW_coord = cute.local_tile(idX, tiler_mn, (0, cluster_y))
-        tWpW = (
-            utils.predicate_k(thr_copy_W.partition_S(gW_coord), limit=shape[1])
+        tXpW = (
+            utils.predicate_k(thr_copy_X.partition_S(gW_coord), limit=shape[1])
             if not is_even_N
             else None
         )
-        cute.copy(copy_atom_load_W, tWgW, tWrW, pred=tWpW)
+        cute.copy(copy_atom_load_W, tXgW, tXrW, pred=tXpW)
         weight = tXrW.load().to(cute.Float32)
 
         num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
@@ -500,17 +505,16 @@ class RMSNormBackward(ReductionBase):
         self._initialize_cluster(tidx, mbar_ptr, num_warps, is_persistent=True)
 
         dw_coord = cute.local_tile(idX, tiler_mn, (0, cluster_y))
-        tdWpdW = (
-            utils.predicate_k(thr_copy_dW.partition_S(dw_coord), limit=shape[1])
+        tXpdW = (
+            utils.predicate_k(thr_copy_X.partition_S(dw_coord), limit=shape[1])
             if not is_even_N
             else None
         )
 
         gdW = cute.local_tile(mdW, (1, tiler_mn[1]), (bidx_start, cluster_y))
-        tdWgdW = thr_copy_dW.partition_D(gdW)
+        tXgdW = thr_copy_X.partition_S(gdW)
         # Always compute partial weight gradients in fp32
-        tdWrdW = cute.make_fragment_like(tdWgdW, Float32)
-        tXrdW = thr_copy_X.retile(tdWrdW)
+        tXrdW = cute.make_fragment_like(tXgdW, Float32)
 
         gX = cute.local_tile(mX, tiler_mn, (None, cluster_y))
         gdOut = cute.local_tile(mdOut, tiler_mn, (None, cluster_y))
@@ -520,7 +524,7 @@ class RMSNormBackward(ReductionBase):
         tXsX = thr_copy_X.partition_D(sX)
         tXgdOut = thr_copy_X.partition_S(gdOut)
         tXsdOut = thr_copy_X.partition_D(sdOut)
-        tXgdX = thr_store_dX.partition_D(gdX)
+        tXgdX = thr_copy_X.partition_D(gdX)
         tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None, None]
         # This doesn't change across iterations
         tXpX = (
@@ -670,11 +674,10 @@ class RMSNormBackward(ReductionBase):
                     tXsdW_other = cute.make_tensor(tXsdW.iterator + i * sdW.stride[0], tXsdW.layout)
                     cute.autovec_copy(tXsdW_other, tXrdW_other)
                     tXrdW.store(tXrdW.load() + tXrdW_other.load())
-                cute.copy(copy_atom_store_dW, tdWrdW, tdWgdW, pred=tdWpdW)
-
+                cute.copy(copy_atom_store_dW, tXrdW, tXgdW, pred=tXpdW)
         else:
             # dw is already in fp32, so we can directly copy to global memory
-            cute.copy(copy_atom_store_dW, tdWrdW, tdWgdW, pred=tdWpdW)
+            cute.copy(copy_atom_store_dW, tXrdW, tXgdW, pred=tXpdW)
 
 
 def _rmsnorm_backward(
