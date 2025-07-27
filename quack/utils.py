@@ -315,7 +315,7 @@ def exp2f(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
     if cutlass.const_expr(isinstance(x, cute.TensorSSA)):
         res = cute.make_fragment(x.shape, Float32)
         res.store(x)
-        for i in cutlass.range_constexpr(cute.size(x.shape)):
+        for i in cutlass.range(cute.size(x.shape), unroll_full=True):
             res[i] = cute.arch.exp2(res[i])
         return res.load()
     else:

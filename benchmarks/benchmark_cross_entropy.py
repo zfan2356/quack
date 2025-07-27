@@ -82,6 +82,19 @@ def run_cross_entropy_backward(
 
     loss = cross_entropy(x, target)
     dloss = torch.randn(M, device=device, dtype=torch.float32)
+    torch.cuda.synchronize()
+
+    # Reference implementation
+    loss_ref = F.cross_entropy(x_ref, target, reduction='none')
+    compiled_func_ref = torch.compile(lambda: torch.autograd.grad(loss_ref, x_ref, grad_outputs=dloss, retain_graph=True))
+
+    for _ in range(5): compiled_func_ref()  # warm up
+    time.sleep(0.5)
+    avg_time_ref = do_bench(compiled_func_ref, warmup=warmup_iterations, rep=iterations)
+    mem_bw_ref = round((2 * x.numel() * x.element_size() + target.numel() * target.element_size() +
+                        dloss.numel() * dloss.element_size()) / (avg_time_ref / 1000) / 1e9)
+    print(f"Ref kernel execution time: {avg_time_ref:.4f} ms")
+    print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
 
     time.sleep(0.5)
     fn = lambda: torch.autograd.grad(loss, x, grad_outputs=dloss, retain_graph=True)
@@ -91,18 +104,6 @@ def run_cross_entropy_backward(
                     dloss.numel() * dloss.element_size()) / (avg_time / 1000) / 1e9)
     print(f"Kernel execution time: {avg_time:.4f} ms")
     print(f"Mem throughput: {mem_bw:.2f} GB/s")
-
-    # Reference implementation
-    loss_ref = F.cross_entropy(x_ref, target, reduction='none')
-    compiled_func_ref = torch.compile(lambda: torch.autograd.grad(loss_ref, x_ref, grad_outputs=dloss, retain_graph=True))
-
-    for _ in range(5): compiled_func_ref()  # warm up
-    time.sleep(0.5)
-    avg_time_ref = do_bench(compiled_func_ref, warmup=warmup_iterations, rep=iterations)
-    mem_bw_ref = round((2 * x.numel() * x.element_size() + target.numel() * target.element_size() + 
-                        dloss.numel() * dloss.element_size()) / (avg_time_ref / 1000) / 1e9)
-    print(f"Ref kernel execution time: {avg_time_ref:.4f} ms")
-    print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
 
     return mem_bw, mem_bw_ref
 

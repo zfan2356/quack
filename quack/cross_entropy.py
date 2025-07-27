@@ -446,13 +446,10 @@ class CrossEntropyBackward:
         log2_e = math.log2(math.e)
         probs = utils.exp2f((x - lse) * log2_e)
         prob_shifted = probs - 1.0
-
         mask = cute.make_fragment_like(tXrX, cutlass.Boolean)
-        for i in cutlass.range_constexpr(cute.size(tXcFull)):
+        for i in cutlass.range(cute.size(tXcFull), unroll_full=True):
             mask[i] = tXcFull[i][1] == label
-
-        mask = mask.load()
-        grad = cute.where(mask, prob_shifted, probs)
+        grad = cute.where(mask.load(), prob_shifted, probs)
         grad = grad * dloss
 
         tXrO.store(grad.to(tXrO.element_type))
