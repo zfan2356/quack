@@ -261,14 +261,12 @@ class HopperWgmmaGemmKernel:
         self.tile_shape_mnk = tuple(tile_shape_mnk)
         tile_M, tile_N = tile_shape_mnk[0], tile_shape_mnk[1]
         # check the cta tile shape
-        # if tile_M not in [64, 128, 192, 256]:
-        # TODO: M=192 currently doesn't work
-        if tile_M not in [64, 128, 256]:
+        if tile_M not in [64, 128, 192, 256]:
             raise ValueError("CTA tile shape M must be 64/128/192/256")
         if tile_M == 192:  # special case
-            if not (tile_N % 32 == 0 and tile_N <= 288):
+            if not (tile_N % 32 == 0 and tile_N <= 256):
                 raise ValueError(
-                    "If tile_m == 192, CTA tile shape N must be divisible by 32 and <= 288"
+                    "If tile_m == 192, CTA tile shape N must be divisible by 32 and <= 256"
                 )
         else:
             if not ((tile_N % 16 == 0 and tile_N <= 256) or (tile_N % 32 == 0 and tile_N <= 512)):
@@ -330,9 +328,10 @@ class HopperWgmmaGemmKernel:
 
         self.cta_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
 
-        is_cooperative = math.prod(self.atom_layout_mnk) > 1
         self.epi_tile = self._sm90_compute_tile_shape_or_override(
-            self.tile_shape_mnk, self.d_dtype, is_cooperative=is_cooperative
+            self.tile_shape_mnk,
+            self.atom_layout_mnk,
+            self.d_dtype,
         )
 
         # Compute stage before compute smem layout
@@ -412,6 +411,21 @@ class HopperWgmmaGemmKernel:
             self.atom_layout_mnk,
             tiler_mn=(64, self.tile_shape_mnk[1] // self.atom_layout_mnk[1]),
         )
+        if cutlass.const_expr(self.atom_layout_mnk[1] > 1):
+            # If N dimension is split among 2 WGs, we need to permute the N dimension so
+            # that in the epilogue, WG0 and WG1 can write to epi smem of size e.g. (64, 32)
+            # containing accumulators that are next to each other in the N dimension.
+            # Without permutation WG0 would write to epi smem of size (64, 16) and
+            # WG1 would write to a separate epi smem of size (64, 16) that's far away.
+            atom_n = self.atom_layout_mnk[1]
+            permutation_n = cute.make_ordered_layout(
+                (8, self.tile_shape_mnk[1] // atom_n // 8, atom_n), order=(0, 2, 1)
+            )
+            tiled_mma = cute.make_tiled_mma(
+                cute.make_mma_atom(tiled_mma.op),
+                self.atom_layout_mnk,
+                permutation_mnk=(None, permutation_n, None),
+            )
 
         tma_atom_a, tma_tensor_a = self._make_tma_atoms_and_tensors(
             mA,
@@ -520,7 +534,6 @@ class HopperWgmmaGemmKernel:
         # /////////////////////////////////////////////////////////////////////////////
         #  Prefetch Tma desc
         # /////////////////////////////////////////////////////////////////////////////
-        # if warp_idx == 0:
         if warp_idx == self.mma_warp_groups * 4:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
@@ -780,12 +793,12 @@ class HopperWgmmaGemmKernel:
                 elem_ty_d=self.d_dtype,
                 elem_ty_acc=self.acc_dtype,
             )
-            copy_atom_D = cute.make_copy_atom(
+            copy_atom_C = cute.make_copy_atom(
                 warp.StMatrix8x8x16bOp(self.d_layout.is_m_major_c(), 4),
                 self.d_dtype,
             )
-            tiled_copy_D_Atom = cute.make_tiled_copy_C_atom(copy_atom_D, tiled_mma)
-            tiled_copy_r2s = cute.make_tiled_copy_S(copy_atom_r2s, tiled_copy_D_Atom)
+            tiled_copy_C_atom = cute.make_tiled_copy_C_atom(copy_atom_C, tiled_mma)
+            tiled_copy_r2s = cute.make_tiled_copy_S(copy_atom_r2s, tiled_copy_C_atom)
             # (R2S, R2S_M, R2S_N, PIPE_D)
             tRS_sD = tiled_copy_r2s.get_slice(tidx).partition_D(sD)
             # (R2S, R2S_M, R2S_N)
@@ -866,7 +879,6 @@ class HopperWgmmaGemmKernel:
         :rtype: Tuple[int, int]
         """
 
-        # epi_stage = 4 if tile_shape_mnk[1] % 32 == 0 else 8
         epi_stage = 4
         # epi_smem will reuse smem ab.
         epi_bytes = 0
@@ -886,8 +898,8 @@ class HopperWgmmaGemmKernel:
     @staticmethod
     def _sm90_compute_tile_shape_or_override(
         tile_shape_mnk: Tuple[int, int, int],
+        atom_layout_mnk: Tuple[int, int, int],
         element_type: Type[cutlass.Numeric],
-        is_cooperative: bool = False,
         epi_tile_override: Tuple[int, int] | None = None,
     ) -> Tuple[int, int]:
         """Compute the epilogue tile shape or use override if provided.
@@ -906,15 +918,17 @@ class HopperWgmmaGemmKernel:
         """
         if epi_tile_override is not None:
             return epi_tile_override
-        if is_cooperative:
-            if cute.size(tile_shape_mnk, mode=[0]) == 192:
-                tile_m = 192
-                tile_n = math.gcd(32, cute.size(tile_shape_mnk, mode=[1]) // 2)
-            else:
-                tile_m = math.gcd(128, cute.size(tile_shape_mnk, mode=[0]))
-                tile_n = math.gcd(32, cute.size(tile_shape_mnk, mode=[1]))
+        if tile_shape_mnk[0] % 128 == 0 and atom_layout_mnk[0] > 1:
+            tile_m = math.gcd(128, cute.size(tile_shape_mnk, mode=[0]))
+            tile_n = math.gcd(32, cute.size(tile_shape_mnk, mode=[1]))
             return (tile_m, tile_n)
         else:
+            # In the case of tile shape 128 x N but atom_layout 1 x 2, we need to set
+            # epi_tile_m = 64. If epi_tile_m = 128, the epilogue would iterate along the
+            # M dimension first, then move to the N dimension. But the accumulator in registers
+            # iterate along the N dimension first, then move to the M dimension.
+            # We could change the epilogue to accommodate this,
+            # but it's easier to just set epi_tile_m = 64.
             n_perf = 64 if element_type.width == 8 else 32
             tile_m = math.gcd(64, cute.size(tile_shape_mnk, mode=[0]))
             tile_n = math.gcd(n_perf, cute.size(tile_shape_mnk, mode=[1]))
