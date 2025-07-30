@@ -810,8 +810,7 @@ class HopperWgmmaGemmKernel:
                 # /////////////////////////////////////////////////////////////////////////////
                 # Wait for all warp groups in the thread block to finish, because smem for tensor A in
                 # the mainloop is reused in the epilogue if not persistent.
-                # if cutlass.const_expr(not self.is_persistent):
-                if cutlass.const_expr(True):
+                if cutlass.const_expr(not self.is_persistent):
                     cute.arch.barrier(barrier_id=1, number_of_threads=self.num_mma_threads)
 
                 copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
@@ -912,7 +911,7 @@ class HopperWgmmaGemmKernel:
 
         epi_stage = 4
         # epi_smem will reuse smem ab if not persistent.
-        epi_bytes = 0 if epi_tile is None else cute.size(epi_tile) * d_dtype.width // 8
+        epi_bytes = 0 if epi_tile is None else cute.size(epi_tile) * d_dtype.width // 8 * epi_stage
 
         a_shape = cute.slice_(tile_shape_mnk, (None, 0, None))
         b_shape = cute.slice_(tile_shape_mnk, (0, None, None))
