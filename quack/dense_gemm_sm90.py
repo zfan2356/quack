@@ -27,7 +27,8 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import argparse
-from typing import Tuple, Type
+from typing import Tuple, Type, Callable
+from functools import partial
 import math
 import cuda.bindings.driver as cuda
 
@@ -42,6 +43,13 @@ import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 import cutlass.utils.hopper_helpers as sm90_utils
+
+from quack.tile_scheduler import (
+    TileSchedulerArguments,
+    SingleTileScheduler,
+    ParamsBase,
+    RasterOrder,
+)
 
 """
 A high-performance batched dense GEMM (C = A * B) example for the NVIDIA Hopper architecture
@@ -447,7 +455,19 @@ class HopperWgmmaGemmKernel:
             self.epi_tile,
         )
 
-        grid = self._compute_grid(mD, self.tile_shape_mnk, self.cluster_shape_mnk)
+        problem_shape_ntile_mnl = cute.ceil_div(mD.shape[:2], self.tile_shape_mnk[:2]) + (
+            mD.shape[2],
+        )
+        TileScheduler = SingleTileScheduler
+        tile_sched_args = TileSchedulerArguments(
+            problem_shape_ntile_mnl=problem_shape_ntile_mnl,
+            raster_order=RasterOrder.AlongM,
+            group_size=8,
+            cluster_shape_mnk=self.cluster_shape_mnk,
+            is_persistent=False,
+        )
+        tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
+        grid = TileScheduler.get_grid_shape(tile_sched_params)
 
         @cute.struct
         class SharedStorage:
@@ -476,6 +496,8 @@ class HopperWgmmaGemmKernel:
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
             self.epi_smem_layout_staged,
+            tile_sched_params,
+            TileScheduler,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -501,6 +523,8 @@ class HopperWgmmaGemmKernel:
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
         epi_smem_layout_staged: cute.ComposedLayout,
+        tile_sched_params: ParamsBase,
+        TileScheduler: cutlass.Constexpr[Callable],
     ):
         """
         GPU device kernel performing the batched GEMM computation.
@@ -578,43 +602,7 @@ class HopperWgmmaGemmKernel:
         sD_ptr = cute.recast_ptr(sA.iterator, epi_smem_layout_staged.inner, dtype=self.d_dtype)
         sD = cute.make_tensor(sD_ptr, epi_smem_layout_staged.outer)
 
-        # ///////////////////////////////////////////////////////////////////////////////
-        #  Get cta/warp/thread idx
-        # ///////////////////////////////////////////////////////////////////////////////
-
-        cidx, cidy, _ = cute.arch.cluster_idx()
-        cdimx, cdimy, _ = cute.arch.cluster_dim()
-        cluster_id = cidx + cdimx * cidy
-
-        # CTA Swizzle to promote L2 data reuse
-        group_size_m = 8
-        s_shape = (
-            (group_size_m, cdimx // group_size_m),
-            cdimy,
-        )
-        s_stride = ((1, cdimy * group_size_m), group_size_m)
-        s_layout = cute.make_layout(s_shape, stride=s_stride)
-        num_reg_cids = cute.size(s_shape)
-        cid_m, cid_n = s_layout.get_flat_coord(cluster_id % num_reg_cids)
-
-        # Deal with the tail part
-        if cluster_id >= num_reg_cids:
-            tail_size_m = cdimx % group_size_m
-            tail_layout = cute.make_layout((tail_size_m, cdimy), stride=(1, tail_size_m))
-            tail_cid = cluster_id - num_reg_cids
-            tail_cid_m, tail_cid_n = tail_layout.get_flat_coord(tail_cid)
-            cid_m = cute.size(s_shape, mode=[0]) + tail_cid_m
-            cid_n = tail_cid_n
-
-        # Get the pid from cluster id
-        bidx_in_cluster = cute.arch.block_in_cluster_idx()
-        pid_m = cid_m * self.cluster_shape_mnk[0] + bidx_in_cluster[0]
-        pid_n = cid_n * self.cluster_shape_mnk[1] + bidx_in_cluster[1]
-
-        _, _, bidz = cute.arch.block_idx()
-        tile_coord_mnkl = (pid_m, pid_n, None, bidz)
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-        cluster_coord_mnk = cta_layout_mnk.get_flat_coord(cta_rank_in_cluster)
+        TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
 
         k_tile_cnt = cute.ceil_div(cute.size(mA_mkl.shape[1]), self.tile_shape_mnk[2])
 
@@ -624,6 +612,8 @@ class HopperWgmmaGemmKernel:
                 # ///////////////////////////////////////////////////////////////////////////////
                 # Get mcast mask
                 # ///////////////////////////////////////////////////////////////////////////////
+                cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+                cluster_coord_mnk = cta_layout_mnk.get_flat_coord(cta_rank_in_cluster)
                 a_mcast_mask = cute.make_layout_image_mask(
                     cta_layout_mnk, cluster_coord_mnk, mode=1
                 )
@@ -635,6 +625,9 @@ class HopperWgmmaGemmKernel:
                 mainloop_producer_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.ab_stage
                 )
+                tile_scheduler = TileSchedulerCls()
+                work_tile = tile_scheduler.initial_work_tile_info()
+                tile_coord_mnkl = work_tile.tile_idx
                 # ///////////////////////////////////////////////////////////////////////////////
                 #  Local_tile partition global tensors
                 # ///////////////////////////////////////////////////////////////////////////////
@@ -725,6 +718,10 @@ class HopperWgmmaGemmKernel:
             mainloop_consumer_release_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.ab_stage
             )
+
+            tile_scheduler = TileSchedulerCls()
+            work_tile = tile_scheduler.initial_work_tile_info()
+            tile_coord_mnkl = work_tile.tile_idx
 
             # /////////////////////////////////////////////////////////////////////////////
             #  Prologue MMAs
@@ -1026,31 +1023,6 @@ class HopperWgmmaGemmKernel:
         )
 
         return a_smem_layout_staged, b_smem_layout_staged, epi_smem_layout_staged
-
-    @staticmethod
-    def _compute_grid(
-        d: cute.Tensor,
-        tile_shape_mnk: Tuple[int, int, int],
-        cluster_shape_mnk: Tuple[int, int, int],
-    ) -> Tuple[int, int, int]:
-        """Compute grid shape for the output tensor C.
-
-        :param d: The output tensor C
-        :type d: cute.Tensor
-        :param tile_shape_mnk: The shape (M, N, K) of the CTA tile.
-        :type tile_shape_mnk: Tuple[int, int, int]
-        :param cluster_shape_mnk: Shape of each cluster in M, N, K dimensions.
-        :type cluster_shape_mnk: Tuple[int, int, int]
-
-        :return: Grid shape for kernel launch.
-        :rtype: Tuple[int, int, int]
-        """
-
-        c_shape = (tile_shape_mnk[0], tile_shape_mnk[1])
-        gc = cute.zipped_divide(d, tiler=c_shape)
-        clusters = cute.ceil_div(cute.get(gc.layout, mode=[1]).shape, cluster_shape_mnk)
-        grid = tuple(x * y for x, y in zip(clusters, cluster_shape_mnk))
-        return grid
 
     @staticmethod
     def _make_tma_store_atoms_and_tensors(
