@@ -219,7 +219,7 @@ class StaticTileScheduler:
         if cutlass.const_expr(self.params.is_persistent):
             num_persistent_clusters = cute.arch.grid_dim()[2]
             self._current_work_linear_idx += advance_count * Int32(num_persistent_clusters)
-        self._num_tiles_executed += Int32(1)
+        self._num_tiles_executed += Int32(advance_count)
 
     @property
     def num_tiles_executed(self) -> Int32:

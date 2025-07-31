@@ -27,6 +27,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import argparse
+import enum
 from typing import Tuple, Type, Callable, Optional
 from functools import partial
 import math
@@ -43,6 +44,7 @@ import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 import cutlass.utils.hopper_helpers as sm90_utils
+from cutlass import Int32, const_expr
 
 from quack.tile_scheduler import (
     TileSchedulerArguments,
@@ -50,6 +52,9 @@ from quack.tile_scheduler import (
     ParamsBase,
     RasterOrderOption,
 )
+
+# return PipelineStateWAdvance instead of PipelineState
+from quack.pipeline import make_pipeline_state
 
 """
 A high-performance batched dense GEMM (C = A * B) example for the NVIDIA Hopper architecture
@@ -179,6 +184,7 @@ def parse_arguments() -> argparse.Namespace:
         help="Number of iterations to run the kernel",
     )
     parser.add_argument("--persistent", action="store_true", help="Persistent kernel")
+    parser.add_argument("--pingpong", action="store_true", help="Pingpong kernel")
     parser.add_argument("--skip_ref_check", action="store_true", help="Skip reference checking")
     parser.add_argument(
         "--use_cold_l2",
@@ -202,6 +208,14 @@ def parse_arguments() -> argparse.Namespace:
 # /////////////////////////////////////////////////////////////////////////////
 #  Host setup and device kernel launch
 # /////////////////////////////////////////////////////////////////////////////
+
+
+class NamedBarrierPingpong(enum.IntEnum):
+    Epilogue = enum.auto()  # starts from 1 as barrier 0 is reserved for sync_threads()
+    MmaWG0 = enum.auto()
+    MmaWG1 = enum.auto()
+    EpiWG0 = enum.auto()
+    EpiWG1 = enum.auto()
 
 
 class HopperWgmmaGemmKernel:
@@ -249,6 +263,7 @@ class HopperWgmmaGemmKernel:
         acc_dtype: Type[cutlass.Numeric],
         tile_shape_mnk: Tuple[int, int, int],
         cluster_shape_mnk: Tuple[int, int, int],
+        pingpong: bool = False,
         is_persistent: bool = True,
     ):
         """
@@ -266,33 +281,48 @@ class HopperWgmmaGemmKernel:
         """
 
         self.acc_dtype = acc_dtype
+        self.pingpong = pingpong
         self.is_persistent = is_persistent
+        if self.pingpong:
+            assert self.is_persistent, "Pingpong gemm requires persistent scheduler"
 
         self.cluster_shape_mnk = cluster_shape_mnk
         self.tile_shape_mnk = tuple(tile_shape_mnk)
         tile_M, tile_N = tile_shape_mnk[0], tile_shape_mnk[1]
         # check the cta tile shape
-        if tile_M not in [64, 128, 192, 256]:
-            raise ValueError("CTA tile shape M must be 64/128/192/256")
-        if tile_M == 192:  # special case
-            if not (tile_N % 32 == 0 and tile_N <= 256):
-                raise ValueError(
-                    "If tile_m == 192, CTA tile shape N must be divisible by 32 and <= 256"
-                )
+        if not self.pingpong:
+            if tile_M not in [64, 128, 192, 256]:
+                raise ValueError("CTA tile shape M must be 64/128/192/256")
+            if tile_M == 192:  # special case
+                if not (tile_N % 32 == 0 and tile_N <= 256):
+                    raise ValueError(
+                        "If tile_m == 192, CTA tile shape N must be divisible by 32 and <= 256"
+                    )
+            else:
+                if not (
+                    (tile_N % 16 == 0 and tile_N <= 256) or (tile_N % 32 == 0 and tile_N <= 512)
+                ):
+                    raise ValueError(
+                        "CTA tile shape N must be divisible by 16 and <= 256, or divisible by 32 and <= 512"
+                    )
         else:
-            if not ((tile_N % 16 == 0 and tile_N <= 256) or (tile_N % 32 == 0 and tile_N <= 512)):
-                raise ValueError(
-                    "CTA tile shape N must be divisible by 16 and <= 256, or divisible by 32 and <= 512"
-                )
+            if tile_M not in [64, 128, 192]:
+                raise ValueError("CTA tile shape M must be 64/128/192 if pingpong")
+            tile_N_max = 256 if tile_M == 64 else (208 if tile_M == 128 else 128)
+            if not (tile_N % 16 == 0 and tile_N <= tile_N_max):
+                raise ValueError(f"CTA tile shape N must be divisible by 16 and <= {tile_N_max}")
         if not self.tile_shape_mnk[2] % 16 == 0:
             raise ValueError("CTA tile shape K must be divisible by 16")
 
-        if tile_M == 192:  # Special case
-            atom_layout_m, atom_layout_n = 1, 2
+        if not self.pingpong:
+            if tile_M == 192:  # Special case
+                atom_layout_m, atom_layout_n = 1, 2
+            else:
+                atom_layout_m = tile_shape_mnk[0] // 64 if tile_shape_mnk[0] < 256 else 2
+                atom_layout_n = 1
+            assert atom_layout_m in [1, 2] and atom_layout_n in [1, 2]
         else:
-            atom_layout_m = tile_shape_mnk[0] // 64 if tile_shape_mnk[0] < 256 else 2
-            atom_layout_n = 1
-        assert atom_layout_m in [1, 2] and atom_layout_n in [1, 2]
+            atom_layout_m, atom_layout_n = 1, 1
         self.atom_layout_mnk = (atom_layout_m, atom_layout_n, 1)
 
         self.num_mcast_ctas_a = self.cluster_shape_mnk[1]
@@ -301,12 +331,19 @@ class HopperWgmmaGemmKernel:
         self.is_b_mcast = self.num_mcast_ctas_b > 1
 
         self.occupancy = 1
-        self.mma_warp_groups = math.prod(self.atom_layout_mnk)
+        self.mma_warp_groups = math.prod(self.atom_layout_mnk) * (1 if not self.pingpong else 2)
+        if self.pingpong:
+            assert self.mma_warp_groups == 2
         self.num_threads_per_warp_group = 128
         self.threads_per_cta = (self.mma_warp_groups + 1) * self.num_threads_per_warp_group
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_90")
-        self.num_mma_threads = self.mma_warp_groups * self.num_threads_per_warp_group
-        self.num_epi_threads = self.mma_warp_groups * self.num_threads_per_warp_group
+        self.num_mma_threads = (
+            self.mma_warp_groups if not self.pingpong else 1
+        ) * self.num_threads_per_warp_group
+        self.num_epi_threads = (
+            self.mma_warp_groups if not self.pingpong else 1
+        ) * self.num_threads_per_warp_group
+        self.tma_warp_id = self.mma_warp_groups * 4
 
         regs_per_thread = math.prod(self.tile_shape_mnk[:2]) // self.num_mma_threads
         heavy_register_pressure = regs_per_thread >= 208
@@ -381,7 +418,7 @@ class HopperWgmmaGemmKernel:
         mA: cute.Tensor,
         mB: cute.Tensor,
         mD: cute.Tensor,
-        max_active_clusters: cutlass.Int32,
+        max_active_clusters: Int32,
         stream: cuda.CUstream,
     ):
         """Execute the GEMM operation in steps:
@@ -409,11 +446,11 @@ class HopperWgmmaGemmKernel:
         self.b_layout = utils.LayoutEnum.from_tensor(mB)
         self.d_layout = utils.LayoutEnum.from_tensor(mD)
 
-        if cutlass.const_expr(self.a_dtype.width == 16 and self.a_dtype != self.b_dtype):
+        if const_expr(self.a_dtype.width == 16 and self.a_dtype != self.b_dtype):
             raise TypeError(f"Type mismatch: {self.a_dtype} != {self.b_dtype}")
-        if cutlass.const_expr(self.a_dtype.width != self.b_dtype.width):
+        if const_expr(self.a_dtype.width != self.b_dtype.width):
             raise TypeError(f"Type width mismatch: {self.a_dtype.width} != {self.b_dtype.width}")
-        if cutlass.const_expr(self.a_dtype.width != 16 and self.a_dtype.width != 8):
+        if const_expr(self.a_dtype.width != 16 and self.a_dtype.width != 8):
             raise TypeError("a_dtype should be float16 or float8")
 
         self._setup_attributes()
@@ -427,7 +464,7 @@ class HopperWgmmaGemmKernel:
             self.atom_layout_mnk,
             tiler_mn=(64, self.tile_shape_mnk[1] // self.atom_layout_mnk[1]),
         )
-        if cutlass.const_expr(self.atom_layout_mnk[1] > 1):
+        if const_expr(self.atom_layout_mnk[1] > 1):
             # If N dimension is split among 2 WGs, we need to permute the N dimension so
             # that in the epilogue, WG0 and WG1 can write to epi smem of size e.g. (64, 32)
             # containing accumulators that are next to each other in the N dimension.
@@ -572,7 +609,7 @@ class HopperWgmmaGemmKernel:
         # /////////////////////////////////////////////////////////////////////////////
         #  Prefetch Tma desc
         # /////////////////////////////////////////////////////////////////////////////
-        if warp_idx == self.mma_warp_groups * 4:
+        if warp_idx == self.tma_warp_id:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
             cpasync.prefetch_descriptor(tma_atom_d)
@@ -613,7 +650,7 @@ class HopperWgmmaGemmKernel:
         # ///////////////////////////////////////////////////////////////////////////////
         sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
         sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
-        if cutlass.const_expr(not self.is_persistent):
+        if const_expr(not self.is_persistent):
             sD_ptr = cute.recast_ptr(sA.iterator, epi_smem_layout_staged.inner, dtype=self.d_dtype)
             sD = cute.make_tensor(sD_ptr, epi_smem_layout_staged.outer)
         else:
@@ -625,9 +662,9 @@ class HopperWgmmaGemmKernel:
 
         k_tile_cnt = cute.ceil_div(cute.size(mA_mkl.shape[1]), self.tile_shape_mnk[2])
 
-        if warp_idx >= self.mma_warp_groups * 4:
+        if warp_idx >= self.tma_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_load)
-            if warp_idx == self.mma_warp_groups * 4:
+            if warp_idx == self.tma_warp_id:
                 # ///////////////////////////////////////////////////////////////////////////////
                 # Get mcast mask
                 # ///////////////////////////////////////////////////////////////////////////////
@@ -641,7 +678,7 @@ class HopperWgmmaGemmKernel:
                 )
                 a_mcast_mask = a_mcast_mask if self.is_a_mcast else 0
                 b_mcast_mask = b_mcast_mask if self.is_b_mcast else 0
-                mainloop_producer_state = pipeline.make_pipeline_state(
+                mainloop_producer_state = make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.ab_stage
                 )
                 tile_scheduler = TileSchedulerCls()
@@ -716,17 +753,22 @@ class HopperWgmmaGemmKernel:
                     # End of persistent scheduler loop
                 mainloop_pipeline.producer_tail(mainloop_producer_state)
 
-        if warp_idx < self.mma_warp_groups * 4:
+        if warp_idx < self.tma_warp_id:
             cute.arch.warpgroup_reg_alloc(self.num_regs_mma)
             # //////////////////////////////////////////////////////////////////////////////
             #  Partition global tensor for TiledMMA_A/B/C
             # //////////////////////////////////////////////////////////////////////////////
             tidx, _, _ = cute.arch.thread_idx()
             warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
+            if const_expr(self.pingpong):
+                tidx = tidx % self.num_threads_per_warp_group
             warp_group_thread_layout = cute.make_layout(
-                self.mma_warp_groups, stride=self.num_threads_per_warp_group
+                self.mma_warp_groups if not self.pingpong else 1,
+                stride=self.num_threads_per_warp_group,
             )
-            thr_mma = tiled_mma.get_slice(warp_group_thread_layout(warp_group_idx))
+            thr_mma = tiled_mma.get_slice(
+                warp_group_thread_layout(warp_group_idx if not self.pingpong else 0)
+            )
 
             # //////////////////////////////////////////////////////////////////////////////
             #  Make fragments
@@ -737,20 +779,32 @@ class HopperWgmmaGemmKernel:
             acc_shape = tiled_mma.partition_shape_C(cute.select(self.tile_shape_mnk, mode=[0, 1]))
             acc = cute.make_fragment(acc_shape, self.acc_dtype)
 
-            mainloop_consumer_read_state = pipeline.make_pipeline_state(
+            if const_expr(self.pingpong):
+                if warp_group_idx == 0:
+                    self.pingpong_barrier_arrive(warp_group_idx=0, stage="mma")
+                    self.pingpong_barrier_arrive(warp_group_idx=0, stage="epi")
+
+            mainloop_consumer_read_state = make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.ab_stage
             )
             tile_scheduler = TileSchedulerCls()
+            if const_expr(self.pingpong):
+                if warp_idx >= 4:
+                    # Advance 2nd Math WG to the next work tile for the startup
+                    tile_scheduler.advance_to_next_work()
+                    # Advance 2nd Math WG pipeline states to the end of 1st Math WG
+                    mainloop_consumer_read_state.advance_iters(k_tile_cnt)
             work_tile = tile_scheduler.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 tile_coord_mnkl = work_tile.tile_idx
-                # if cute.arch.thread_idx()[2] == 0: cute.printf(tile_coord_mnkl)
                 # /////////////////////////////////////////////////////////////////////////////
                 #  Prologue MMAs
                 # /////////////////////////////////////////////////////////////////////////////
                 k_pipe_mmas = 1
                 mainloop_consumer_release_state = mainloop_consumer_read_state.clone()
                 num_prologue_mma = min(k_pipe_mmas, k_tile_cnt)
+                if const_expr(self.pingpong):
+                    self.pingpong_barrier_sync(warp_group_idx, stage="mma")
                 peek_ab_full_status = cutlass.Boolean(1)
                 if 0 < k_tile_cnt:
                     peek_ab_full_status = mainloop_pipeline.consumer_try_wait(
@@ -800,17 +854,25 @@ class HopperWgmmaGemmKernel:
                         peek_ab_full_status = mainloop_pipeline.consumer_try_wait(
                             mainloop_consumer_read_state
                         )
+                if const_expr(self.pingpong):
+                    # Cue for next WG's MMA to start
+                    self.pingpong_barrier_arrive(warp_group_idx, stage="mma")
                 warpgroup.wait_group(0)
                 for k_tile in cutlass.range(k_pipe_mmas, unroll=1):
                     mainloop_pipeline.consumer_release(mainloop_consumer_release_state)
                     mainloop_consumer_release_state.advance()
+                if const_expr(self.pingpong):
+                    # Update starting mainloop pipeline state for the next tile
+                    mainloop_consumer_read_state.advance_iters(k_tile_cnt)
 
                 # /////////////////////////////////////////////////////////////////////////////
                 #  EPILOGUE
                 # /////////////////////////////////////////////////////////////////////////////
+                if const_expr(self.pingpong):
+                    self.pingpong_barrier_sync(warp_group_idx, "epi")
                 # Wait for all warp groups in the thread block to finish, because smem for tensor A in
                 # the mainloop is reused in the epilogue if not persistent.
-                if cutlass.const_expr(not self.is_persistent):
+                if const_expr(not self.is_persistent):
                     cute.arch.barrier(barrier_id=1, number_of_threads=self.num_mma_threads)
 
                 copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
@@ -842,7 +904,7 @@ class HopperWgmmaGemmKernel:
                     tcgc_for_tma_partition,
                 )
 
-                epi_tile_num = cutlass.const_expr(cute.size(tcgc_for_tma_partition, mode=[1]))
+                epi_tile_num = const_expr(cute.size(tcgc_for_tma_partition, mode=[1]))
                 epi_tile_shape = tcgc_for_tma_partition.shape[1]
                 num_prev_subtiles = tile_scheduler.num_tiles_executed * epi_tile_num
                 for epi_idx in cutlass.range_constexpr(epi_tile_num):
@@ -867,19 +929,47 @@ class HopperWgmmaGemmKernel:
                     )
                     gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
                     # Copy from shared memory to global memory
-                    if warp_idx == 0:
+                    if (not self.pingpong and warp_idx == 0) or (
+                        self.pingpong and (warp_idx == 0 or warp_idx == 4)
+                    ):
                         cute.copy(tma_atom_d, bSG_sD[None, epi_buffer], bSG_gD[None, gmem_coord])
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(self.epi_stage - 1, read=True)
                     cute.arch.barrier(barrier_id=1, number_of_threads=self.num_epi_threads)
 
-                tile_scheduler.prefetch_next_work()
-                tile_scheduler.advance_to_next_work()
+                if const_expr(self.pingpong):
+                    # With pingpong, 2 WGs write two different output tiles the same smem,
+                    # so we have to make sure the smem content is done reading before signalling
+                    # the next WG's epilogue.
+                    if warp_idx == 0 or warp_idx == 4:
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                    self.pingpong_barrier_arrive(warp_group_idx, stage="epi")
+
+                tile_scheduler.advance_to_next_work(
+                    advance_count=1 if not self.pingpong else self.mma_warp_groups
+                )
                 work_tile = tile_scheduler.get_current_work()
                 # End of persistent scheduler loop
 
-            if warp_idx == 0:
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
+            if const_expr(not self.pingpong):
+                if warp_idx == 0:
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+
+    def pingpong_barrier_sync(self, warp_group_idx: Int32, stage: str):
+        assert stage in ["mma", "epi"]
+        barrier = NamedBarrierPingpong.MmaWG0 if stage == "mma" else NamedBarrierPingpong.EpiWG0
+        cute.arch.barrier(
+            barrier_id=int(barrier) + warp_group_idx,
+            number_of_threads=2 * self.num_threads_per_warp_group,
+        )
+
+    def pingpong_barrier_arrive(self, warp_group_idx: Int32, stage: str):
+        assert stage in ["mma", "epi"]
+        barrier = NamedBarrierPingpong.MmaWG0 if stage == "mma" else NamedBarrierPingpong.EpiWG0
+        cute.arch.barrier_arrive(
+            barrier_id=int(barrier) + (1 - warp_group_idx),
+            number_of_threads=2 * self.num_threads_per_warp_group,
+        )
 
     @staticmethod
     def _compute_stages(
@@ -1210,6 +1300,7 @@ def run(
     iterations: int,
     skip_ref_check: bool,
     persistent: bool,
+    pingpong: bool,
     use_cold_l2: bool = False,
     **kwargs,
 ):
@@ -1326,7 +1417,11 @@ def run(
     c, mC, c_torch = create_and_permute_tensor(l, m, n, d_major == "m", d_dtype)
 
     gemm = HopperWgmmaGemmKernel(
-        acc_dtype, tile_shape_mnk, cluster_shape_mnk, is_persistent=args.persistent
+        acc_dtype,
+        tile_shape_mnk,
+        cluster_shape_mnk,
+        pingpong=args.pingpong,
+        is_persistent=args.persistent,
     )
 
     # Compute max active clusters on current device
@@ -1458,6 +1553,7 @@ if __name__ == "__main__":
         args.iterations,
         args.skip_ref_check,
         args.persistent,
+        args.pingpong,
         args.use_cold_l2,
     )
     print("PASS")
