@@ -291,12 +291,13 @@ class HopperWgmmaGemmKernel:
         tile_M, tile_N = tile_shape_mnk[0], tile_shape_mnk[1]
         # check the cta tile shape
         if not self.pingpong:
-            if tile_M not in [64, 128, 192, 256]:
-                raise ValueError("CTA tile shape M must be 64/128/192/256")
-            if tile_M == 192:  # special case
-                if not (tile_N % 32 == 0 and tile_N <= 256):
+            if tile_M not in [64, 128, 192, 256, 320]:
+                raise ValueError("CTA tile shape M must be 64/128/192/256/320")
+            if tile_M in [192, 320]:  # special case
+                tile_N_max = 256 if tile_M == 192 else 160
+                if not (tile_N % 32 == 0 and tile_N <= tile_N_max):
                     raise ValueError(
-                        "If tile_m == 192, CTA tile shape N must be divisible by 32 and <= 256"
+                        f"If tile_m == {tile_M}, CTA tile shape N must be divisible by 32 and <= {tile_N_max}"
                     )
             else:
                 if not (
@@ -315,7 +316,7 @@ class HopperWgmmaGemmKernel:
             raise ValueError("CTA tile shape K must be divisible by 16")
 
         if not self.pingpong:
-            if tile_M == 192:  # Special case
+            if tile_M in [192, 320]:  # Special case
                 atom_layout_m, atom_layout_n = 1, 2
             else:
                 atom_layout_m = tile_shape_mnk[0] // 64 if tile_shape_mnk[0] < 256 else 2
