@@ -781,6 +781,7 @@ class HopperWgmmaGemmKernel:
 
             if const_expr(self.pingpong):
                 if warp_group_idx == 0:
+                    # WG0 needs a start signal at the very beginning
                     self.pingpong_barrier_arrive(warp_group_idx=0, stage="mma")
                     self.pingpong_barrier_arrive(warp_group_idx=0, stage="epi")
 
@@ -856,7 +857,7 @@ class HopperWgmmaGemmKernel:
                         )
                 if const_expr(self.pingpong):
                     # Cue for next WG's MMA to start
-                    self.pingpong_barrier_arrive(warp_group_idx, stage="mma")
+                    self.pingpong_barrier_arrive(1 - warp_group_idx, stage="mma")
                 warpgroup.wait_group(0)
                 for k_tile in cutlass.range(k_pipe_mmas, unroll=1):
                     mainloop_pipeline.consumer_release(mainloop_consumer_release_state)
@@ -938,12 +939,12 @@ class HopperWgmmaGemmKernel:
                     cute.arch.barrier(barrier_id=1, number_of_threads=self.num_epi_threads)
 
                 if const_expr(self.pingpong):
-                    # With pingpong, 2 WGs write two different output tiles the same smem,
+                    # With pingpong, 2 WGs write two different output tiles to the same smem,
                     # so we have to make sure the smem content is done reading before signalling
                     # the next WG's epilogue.
                     if warp_idx == 0 or warp_idx == 4:
                         cute.arch.cp_async_bulk_wait_group(0, read=True)
-                    self.pingpong_barrier_arrive(warp_group_idx, stage="epi")
+                    self.pingpong_barrier_arrive(1 - warp_group_idx, stage="epi")
 
                 tile_scheduler.advance_to_next_work(
                     advance_count=1 if not self.pingpong else self.mma_warp_groups
@@ -967,7 +968,7 @@ class HopperWgmmaGemmKernel:
         assert stage in ["mma", "epi"]
         barrier = NamedBarrierPingpong.MmaWG0 if stage == "mma" else NamedBarrierPingpong.EpiWG0
         cute.arch.barrier_arrive(
-            barrier_id=int(barrier) + (1 - warp_group_idx),
+            barrier_id=int(barrier) + warp_group_idx,
             number_of_threads=2 * self.num_threads_per_warp_group,
         )
 
