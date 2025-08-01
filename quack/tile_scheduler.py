@@ -73,11 +73,20 @@ class StaticTileScheduler:
         def create(
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "StaticTileScheduler.Params":
+            assert args.cluster_shape_mnk[2] == 1
             cluster_shape_mn = cutlass.const_expr(cute.select(args.cluster_shape_mnk, mode=[0, 1]))
             problem_shape_ntile_mn = cute.select(args.problem_shape_ntile_mnl, mode=[0, 1])
             problem_shape_ncluster_mn = cute.ceil_div(problem_shape_ntile_mn, cluster_shape_mn)
-            raster_order = RasterOrder.AlongM
-            if raster_order == RasterOrderOption.Heuristic:
+            problem_shape_ncluster_mnl = problem_shape_ncluster_mn + (
+                args.problem_shape_ntile_mnl[2],
+            )
+            num_clusters_per_problem = cute.size(problem_shape_ncluster_mn)
+            raster_order = (
+                RasterOrder.AlongM
+                if args.raster_order == RasterOrderOption.AlongM
+                else RasterOrder.AlongN
+            )
+            if args.raster_order == RasterOrderOption.Heuristic:
                 problem_blocks_m = cute.round_up(problem_shape_ncluster_mn[0], args.group_size)
                 problem_blocks_n = cute.round_up(problem_shape_ncluster_mn[1], args.group_size)
                 raster_order = (
@@ -95,11 +104,7 @@ class StaticTileScheduler:
                 if raster_order == RasterOrder.AlongM
                 else problem_shape_ncluster_mn[0]
             )
-            num_clusters_per_problem = cute.size(problem_shape_ncluster_mn)
             group_size = min(args.group_size, ncluster_fast)
-            problem_shape_ncluster_mnl = problem_shape_ncluster_mn + (
-                args.problem_shape_ntile_mnl[2],
-            )
             group_size_tail = ncluster_fast % group_size
             num_groups_regular = ncluster_fast // group_size
             num_clusters_in_group = group_size * ncluster_slow
@@ -196,7 +201,7 @@ class StaticTileScheduler:
         cid_fast = group_id * params.group_size_divmod.divisor + cid_fast_in_group
         cid_m, cid_n = cid_fast, cid_slow
         if params.raster_order == RasterOrder.AlongN:
-            cid_n, cid_m = cid_fast, cid_slow
+            cid_m, cid_n = cid_slow, cid_fast
 
         # Get the pid from cluster id
         bidx_in_cluster = cute.arch.block_in_cluster_idx()
