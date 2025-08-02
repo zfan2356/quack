@@ -184,6 +184,7 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--persistent", action="store_true", help="Persistent kernel")
     parser.add_argument("--pingpong", action="store_true", help="Pingpong kernel")
+    parser.add_argument("--fp8_fast_accum", action="store_true", help="FP8 fast accum")
     parser.add_argument("--skip_ref_check", action="store_true", help="Skip reference checking")
 
     args = parser.parse_args()
@@ -237,9 +238,6 @@ class HopperWgmmaGemmKernel:
         - Float32 (for all floating point inputs)
 
     :note: Constraints:
-        - CTA tile M must be 64/128
-        - CTA tile N must be 64/128/256
-        - CTA tile K must be 64
         - Cluster shape M/N must be positive and power of 2, total cluster size <= 4
 
     Example:
@@ -254,10 +252,12 @@ class HopperWgmmaGemmKernel:
     def __init__(
         self,
         acc_dtype: Type[cutlass.Numeric],
+        a_dtype: Type[cutlass.Numeric],
         tile_shape_mnk: Tuple[int, int, int],
         cluster_shape_mnk: Tuple[int, int, int],
         pingpong: bool = False,
         is_persistent: bool = True,
+        fp8_fast_accum: bool = False,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -278,6 +278,7 @@ class HopperWgmmaGemmKernel:
         self.is_persistent = is_persistent
         if self.pingpong:
             assert self.is_persistent, "Pingpong gemm requires persistent scheduler"
+        self.fp8_slow_accum = not fp8_fast_accum and a_dtype.width == 8
 
         self.cluster_shape_mnk = cluster_shape_mnk
         self.tile_shape_mnk = tuple(tile_shape_mnk)
@@ -309,12 +310,17 @@ class HopperWgmmaGemmKernel:
             raise ValueError("CTA tile shape K must be divisible by 16")
 
         if not self.pingpong:
-            if tile_M in [192, 320]:  # tile_M / 64 is not even so we have to split along N
+            if tile_M == 320:  # tile_M / 64 is not even so we have to split along N
                 atom_layout_m, atom_layout_n = 1, 2
+            elif tile_M == 192:
+                if tile_N <= 128:
+                    atom_layout_m, atom_layout_n = 3, 1
+                else:
+                    atom_layout_m, atom_layout_n = 1, 2
             else:
                 atom_layout_m = tile_shape_mnk[0] // 64 if tile_shape_mnk[0] < 256 else 2
                 atom_layout_n = 1
-            assert atom_layout_m in [1, 2] and atom_layout_n in [1, 2]
+            assert atom_layout_m in [1, 2, 3] and atom_layout_n in [1, 2]
         else:
             atom_layout_m, atom_layout_n = 1, 1
         self.atom_layout_mnk = (atom_layout_m, atom_layout_n, 1)
@@ -328,6 +334,7 @@ class HopperWgmmaGemmKernel:
         self.mma_warp_groups = math.prod(self.atom_layout_mnk) * (1 if not self.pingpong else 2)
         if self.pingpong:
             assert self.mma_warp_groups == 2
+        assert self.mma_warp_groups in [1, 2, 3]
         self.num_threads_per_warp_group = 128
         self.threads_per_cta = (self.mma_warp_groups + 1) * self.num_threads_per_warp_group
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_90")
@@ -340,9 +347,15 @@ class HopperWgmmaGemmKernel:
         self.tma_warp_id = self.mma_warp_groups * 4
 
         regs_per_thread = math.prod(self.tile_shape_mnk[:2]) // self.num_mma_threads
-        heavy_register_pressure = regs_per_thread >= 208
-        self.num_regs_load = 40 if not heavy_register_pressure else 24
-        self.num_regs_mma = 232 if not heavy_register_pressure else 240
+        if self.fp8_slow_accum:
+            regs_per_thread *= 2
+        if self.mma_warp_groups == 3:
+            self.num_regs_load, self.num_regs_mma = 32, 160
+        else:
+            heavy_register_pressure = regs_per_thread >= 208
+            self.num_regs_load, self.num_regs_mma = (
+                (40, 232) if not heavy_register_pressure else (24, 240)
+            )
 
         self.ab_stage = None
         self.epi_stage = None
@@ -772,6 +785,8 @@ class HopperWgmmaGemmKernel:
 
             acc_shape = tiled_mma.partition_shape_C(cute.select(self.tile_shape_mnk, mode=[0, 1]))
             acc = cute.make_fragment(acc_shape, self.acc_dtype)
+            if const_expr(self.fp8_slow_accum):
+                acc_slow = cute.make_fragment(acc_shape, self.acc_dtype)
 
             if const_expr(self.pingpong):
                 if warp_group_idx == 0:
@@ -779,7 +794,7 @@ class HopperWgmmaGemmKernel:
                     self.pingpong_barrier_arrive(warp_group_idx=0, stage="mma")
                     self.pingpong_barrier_arrive(warp_group_idx=0, stage="epi")
 
-            mainloop_consumer_read_state = make_pipeline_state(
+            mainloop_read_state = make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.ab_stage
             )
             tile_scheduler = TileSchedulerCls()
@@ -788,7 +803,7 @@ class HopperWgmmaGemmKernel:
                     # Advance 2nd Math WG to the next work tile for the startup
                     tile_scheduler.advance_to_next_work()
                     # Advance 2nd Math WG pipeline states to the end of 1st Math WG
-                    mainloop_consumer_read_state.advance_iters(k_tile_cnt)
+                    mainloop_read_state.advance_iters(k_tile_cnt)
             work_tile = tile_scheduler.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 tile_coord_mnkl = work_tile.tile_idx
@@ -796,69 +811,78 @@ class HopperWgmmaGemmKernel:
                 #  Prologue MMAs
                 # /////////////////////////////////////////////////////////////////////////////
                 k_pipe_mmas = 1
-                mainloop_consumer_release_state = mainloop_consumer_read_state.clone()
+                mainloop_release_state = mainloop_read_state.clone()
                 num_prologue_mma = min(k_pipe_mmas, k_tile_cnt)
                 if const_expr(self.pingpong):
                     self.pingpong_barrier_sync(warp_group_idx, stage="mma")
                 peek_ab_full_status = cutlass.Boolean(1)
                 if 0 < k_tile_cnt:
-                    peek_ab_full_status = mainloop_pipeline.consumer_try_wait(
-                        mainloop_consumer_read_state
-                    )
+                    peek_ab_full_status = mainloop_pipeline.consumer_try_wait(mainloop_read_state)
                 tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
                 num_k_blocks = cute.size(tCrA, mode=[2])
+                # TODO: this is probably not correct if k_tile_cnt == 0
                 for k_tile in cutlass.range(num_prologue_mma):
                     # Wait for A/B buffer to be ready
-                    mainloop_pipeline.consumer_wait(
-                        mainloop_consumer_read_state, peek_ab_full_status
-                    )
+                    mainloop_pipeline.consumer_wait(mainloop_read_state, peek_ab_full_status)
                     warpgroup.fence()
                     for k_blk_idx in cutlass.range(num_k_blocks, unroll_full=True):
-                        k_blk_coord = (None, None, k_blk_idx, mainloop_consumer_read_state.index)
+                        k_blk_coord = (None, None, k_blk_idx, mainloop_read_state.index)
                         cute.gemm(tiled_mma, acc, tCrA[k_blk_coord], tCrB[k_blk_coord], acc)
                         tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
                     warpgroup.commit_group()
-                    mainloop_consumer_read_state.advance()
+                    mainloop_read_state.advance()
                     peek_ab_full_status = cutlass.Boolean(1)
                     if k_tile + 1 < k_tile_cnt:
                         peek_ab_full_status = mainloop_pipeline.consumer_try_wait(
-                            mainloop_consumer_read_state
+                            mainloop_read_state
                         )
+                if const_expr(self.fp8_slow_accum):
+                    warpgroup.wait_group(0)
+                    acc_slow.store(acc.load())
 
                 # /////////////////////////////////////////////////////////////////////////////
                 #  MAINLOOP
                 # /////////////////////////////////////////////////////////////////////////////
                 for k_tile in cutlass.range(num_prologue_mma, k_tile_cnt, unroll=1):
                     # Wait for TMA copies to complete
-                    mainloop_pipeline.consumer_wait(
-                        mainloop_consumer_read_state, peek_ab_full_status
-                    )
+                    mainloop_pipeline.consumer_wait(mainloop_read_state, peek_ab_full_status)
                     # WGMMA
                     warpgroup.fence()
+                    if const_expr(self.fp8_slow_accum):
+                        tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
                     for k_blk_idx in cutlass.range(num_k_blocks, unroll_full=True):
-                        k_blk_coord = (None, None, k_blk_idx, mainloop_consumer_read_state.index)
+                        k_blk_coord = (None, None, k_blk_idx, mainloop_read_state.index)
                         cute.gemm(tiled_mma, acc, tCrA[k_blk_coord], tCrB[k_blk_coord], acc)
+                        tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
                     warpgroup.commit_group()
                     # Wait on the wgmma barrier for previous k_pipe_mmas wgmmas to complete
-                    warpgroup.wait_group(k_pipe_mmas)
-                    mainloop_pipeline.consumer_release(mainloop_consumer_release_state)
-                    mainloop_consumer_read_state.advance()
-                    mainloop_consumer_release_state.advance()
+                    if const_expr(not self.fp8_slow_accum):
+                        warpgroup.wait_group(k_pipe_mmas)
+                    else:
+                        warpgroup.wait_group(0)
+                        acc_slow.store(acc_slow.load() + acc.load())
+                    mainloop_pipeline.consumer_release(mainloop_release_state)
+                    mainloop_read_state.advance()
+                    mainloop_release_state.advance()
                     peek_ab_full_status = cutlass.Boolean(1)
                     if k_tile + 1 < k_tile_cnt:
                         peek_ab_full_status = mainloop_pipeline.consumer_try_wait(
-                            mainloop_consumer_read_state
+                            mainloop_read_state
                         )
                 if const_expr(self.pingpong):
                     # Cue for next WG's MMA to start
                     self.pingpong_barrier_arrive(1 - warp_group_idx, stage="mma")
-                warpgroup.wait_group(0)
+                if const_expr(not self.fp8_slow_accum):
+                    # fp8_slow_accum would already called wait_group(0) inside the loop
+                    warpgroup.wait_group(0)
                 for k_tile in cutlass.range(k_pipe_mmas, unroll=1):
-                    mainloop_pipeline.consumer_release(mainloop_consumer_release_state)
-                    mainloop_consumer_release_state.advance()
+                    mainloop_pipeline.consumer_release(mainloop_release_state)
+                    mainloop_release_state.advance()
+                if const_expr(self.fp8_slow_accum):
+                    acc.store(acc_slow.load())
                 if const_expr(self.pingpong):
                     # Update starting mainloop pipeline state for the next tile
-                    mainloop_consumer_read_state.advance_iters(k_tile_cnt)
+                    mainloop_read_state.advance_iters(k_tile_cnt)
 
                 # /////////////////////////////////////////////////////////////////////////////
                 #  EPILOGUE
@@ -1036,7 +1060,9 @@ class HopperWgmmaGemmKernel:
         if tile_shape_mnk[0] % 128 == 0 and atom_layout_mnk[0] > 1:
             tile_m = math.gcd(128, cute.size(tile_shape_mnk, mode=[0]))
             tile_n = math.gcd(32, cute.size(tile_shape_mnk, mode=[1]))
-            return (tile_m, tile_n)
+        elif tile_shape_mnk[0] % 192 == 0 and atom_layout_mnk[0] > 1:
+            tile_m = math.gcd(192, cute.size(tile_shape_mnk, mode=[0]))
+            tile_n = math.gcd(32, cute.size(tile_shape_mnk, mode=[1]))
         else:
             # In the case of tile shape 128 x N but atom_layout 1 x 2, we need to set
             # epi_tile_m = 64. If epi_tile_m = 128, the epilogue would iterate along the
@@ -1047,7 +1073,7 @@ class HopperWgmmaGemmKernel:
             n_perf = 64 if element_type.width == 8 else 32
             tile_m = math.gcd(64, cute.size(tile_shape_mnk, mode=[0]))
             tile_n = math.gcd(n_perf, cute.size(tile_shape_mnk, mode=[1]))
-            return (tile_m, tile_n)
+        return (tile_m, tile_n)
 
     @staticmethod
     def _make_smem_layouts(
@@ -1294,6 +1320,7 @@ def run(
     skip_ref_check: bool,
     persistent: bool,
     pingpong: bool,
+    fp8_fast_accum: bool,
     **kwargs,
 ):
     """
@@ -1361,16 +1388,17 @@ def run(
         permute_order = (2, 1, 0) if is_mode0_major else (1, 2, 0)
         is_unsigned = dtype in {cutlass.Uint8}
         # Temporarily use uint8 as torch does not support fp8 type
-        torch_dtype = (
-            cutlass_torch.dtype(dtype)
+        torch_dtype = cutlass_torch.dtype(dtype)
+        gen_dtype = (
+            torch_dtype
             if dtype not in {cutlass.Float8E5M2, cutlass.Float8E4M3FN}
-            else torch.uint8
+            else torch.bfloat16
         )
 
         # Create dtype torch tensor (cpu)
         torch_tensor_cpu = cutlass.torch.create_and_permute_torch_tensor(
             shape,
-            torch_dtype,
+            gen_dtype,
             permute_order=permute_order,
             # init_type=cutlass.torch.TensorInitType.RANDOM,
             # init_config=cutlass.torch.RandomInitConfig(
@@ -1378,7 +1406,7 @@ def run(
             # ),
             init_type=cutlass.torch.TensorInitType.GAUSSIAN,
             init_config=cutlass.torch.GaussianInitConfig(std=k ** (-0.5), scale=1),
-        )
+        ).to(torch_dtype)
         # Create dtype torch tensor (gpu)
         torch_tensor = torch_tensor_cpu.cuda()
 
@@ -1386,7 +1414,12 @@ def run(
         f32_torch_tensor = torch_tensor_cpu.to(dtype=torch.float32)
 
         # Create dtype cute tensor (gpu)
-        cute_tensor = from_dlpack(torch_tensor, assumed_align=16)
+        torch_tensor_view = (
+            torch_tensor
+            if dtype not in {cutlass.Float8E5M2, cutlass.Float8E4M3FN}
+            else torch_tensor.view(torch.uint8)
+        )
+        cute_tensor = from_dlpack(torch_tensor_view, assumed_align=16)
         cute_tensor.element_type = dtype
         if is_dynamic_layout:
             cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=(0 if is_mode0_major else 1))
@@ -1405,10 +1438,12 @@ def run(
 
     gemm = HopperWgmmaGemmKernel(
         acc_dtype,
+        a_dtype,
         tile_shape_mnk,
         cluster_shape_mnk,
         pingpong=pingpong,
         is_persistent=persistent,
+        fp8_fast_accum=fp8_fast_accum,
     )
 
     # Compute max active clusters on current device
@@ -1473,8 +1508,20 @@ def run(
     import time
 
     time.sleep(0.5)
-    fn = lambda: torch.matmul(a_torch.permute(2, 0, 1), b_torch.permute(2, 0, 1).mT)
-    timing_cublas = do_bench(fn, warmup=warmup, rep=repeats)
+    if a_dtype.width == 8:
+        assert l == 1
+        scale_ab = torch.ones((1,), dtype=torch.float32, device="cuda")
+        fn_cublas = lambda: torch._scaled_mm(
+            a_torch[:, :, 0],
+            b_torch[:, :, 0].mT,
+            scale_a=scale_ab,
+            scale_b=scale_ab,
+            out_dtype=torch.bfloat16,
+            use_fast_accum=fp8_fast_accum,
+        )
+    else:
+        fn_cublas = lambda: torch.matmul(a_torch.permute(2, 0, 1), b_torch.permute(2, 0, 1).mT)
+    timing_cublas = do_bench(fn_cublas, warmup=warmup, rep=repeats)
     tflops_cublas = flops / (timing_cublas * 1e9)  # Convert to TFlops
     print(f"CuBLAS Average time: {timing_cublas:.3f} ms, TFLOPS: {tflops_cublas:.1f}")
 
@@ -1485,8 +1532,7 @@ def run(
     print(f"Cute-DSL Average time: {timing:.3f} ms, TFLOPS: {tflops:.1f}")
 
     time.sleep(0.5)
-    fn = lambda: torch.matmul(a_torch.permute(2, 0, 1), b_torch.permute(2, 0, 1).mT)
-    timing_cublas = do_bench(fn, warmup=warmup, rep=repeats)
+    timing_cublas = do_bench(fn_cublas, warmup=warmup, rep=repeats)
     tflops_cublas = flops / (timing_cublas * 1e9)  # Convert to TFlops
     print(f"CuBLAS Average time: {timing_cublas:.3f} ms, TFLOPS: {tflops_cublas:.1f}")
 
@@ -1510,5 +1556,6 @@ if __name__ == "__main__":
         args.skip_ref_check,
         args.persistent,
         args.pingpong,
+        args.fp8_fast_accum,
     )
     print("PASS")
