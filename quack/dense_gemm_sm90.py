@@ -37,7 +37,6 @@ import torch
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.cute.testing as testing
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.torch as cutlass_torch
@@ -176,22 +175,16 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--b_major", choices=["k", "n"], type=str, default="k")
     parser.add_argument("--d_major", choices=["n", "m"], type=str, default="n")
     parser.add_argument("--tolerance", type=float, default=1e-01, help="Tolerance for validation")
-    parser.add_argument("--warmup_iterations", type=int, default=0, help="Warmup iterations")
+    parser.add_argument("--warmup_iterations", type=int, default=5, help="Warmup iterations")
     parser.add_argument(
         "--iterations",
         type=int,
-        default=1,
+        default=30,
         help="Number of iterations to run the kernel",
     )
     parser.add_argument("--persistent", action="store_true", help="Persistent kernel")
     parser.add_argument("--pingpong", action="store_true", help="Pingpong kernel")
     parser.add_argument("--skip_ref_check", action="store_true", help="Skip reference checking")
-    parser.add_argument(
-        "--use_cold_l2",
-        action="store_true",
-        default=False,
-        help="Use circular buffer tensor sets to ensure L2 cold cache",
-    )
 
     args = parser.parse_args()
 
@@ -316,7 +309,7 @@ class HopperWgmmaGemmKernel:
             raise ValueError("CTA tile shape K must be divisible by 16")
 
         if not self.pingpong:
-            if tile_M in [192, 320]:  # Special case
+            if tile_M in [192, 320]:  # tile_M / 64 is not even so we have to split along N
                 atom_layout_m, atom_layout_n = 1, 2
             else:
                 atom_layout_m = tile_shape_mnk[0] // 64 if tile_shape_mnk[0] < 256 else 2
@@ -1244,7 +1237,6 @@ class HopperWgmmaGemmKernel:
         :rtype: bool
         """
         is_valid = True
-        # tested a_dtype
         if a_dtype not in {
             cutlass.Float16,
             cutlass.BFloat16,
@@ -1260,7 +1252,6 @@ class HopperWgmmaGemmKernel:
             cutlass.Float8E5M2,
         }:
             is_valid = False
-        # tested acc_dtype
         if acc_dtype not in {cutlass.Float32, cutlass.Float16}:
             is_valid = False
         # tested d_dtype
@@ -1303,7 +1294,6 @@ def run(
     skip_ref_check: bool,
     persistent: bool,
     pingpong: bool,
-    use_cold_l2: bool = False,
     **kwargs,
 ):
     """
@@ -1333,10 +1323,6 @@ def run(
     :type iterations: int, optional
     :param skip_ref_check: Whether to skip reference result validation, defaults to False
     :type skip_ref_check: bool, optional
-    :param use_cold_l2: Whether to use circular buffer strategy to ensure cold L2 cache, defaults to False
-    :type use_cold_l2: bool, optional
-    :return: Execution time of the GEMM kernel in microseconds
-    :rtype: float
     """
 
     print("Running Hopper Dense GEMM with:")
@@ -1348,7 +1334,6 @@ def run(
     print(f"Warmup iterations: {warmup_iterations}")
     print(f"Iterations: {iterations}")
     print(f"Skip reference checking: {skip_ref_check}")
-    print(f"Use cold L2: {use_cold_l2}")
 
     # Unpack parameters
     m, n, k, l = mnkl
@@ -1422,12 +1407,12 @@ def run(
         acc_dtype,
         tile_shape_mnk,
         cluster_shape_mnk,
-        pingpong=args.pingpong,
-        is_persistent=args.persistent,
+        pingpong=pingpong,
+        is_persistent=persistent,
     )
 
     # Compute max active clusters on current device
-    if args.persistent:
+    if persistent:
         max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(
             cluster_shape_mn[0] * cluster_shape_mn[1]
         )
@@ -1476,43 +1461,14 @@ def run(
 
         torch.testing.assert_close(c_torch.cpu(), ref_c, atol=tolerance, rtol=1e-03)
 
-    def generate_tensors():
-        _, mA_workspace, _ = create_and_permute_tensor(l, m, k, a_major == "m", a_dtype)
-        _, mB_workspace, _ = create_and_permute_tensor(l, n, k, b_major == "n", b_dtype)
-        _, mC_workspace, _ = create_and_permute_tensor(l, m, n, d_major == "m", d_dtype)
-        return testing.JitArguments(
-            mA_workspace, mB_workspace, mC_workspace, max_active_clusters, stream
-        )
-
-    workspace_count = 1
-    if use_cold_l2:
-        one_workspace_bytes = (
-            a_torch.numel() * a_torch.element_size()
-            + b_torch.numel() * b_torch.element_size()
-            + c_torch.numel() * c_torch.element_size()
-        )
-        workspace_count = testing.get_workspace_count(
-            one_workspace_bytes, warmup_iterations, iterations
-        )
-
-    exec_time = testing.benchmark(
-        compiled_gemm,
-        workspace_generator=generate_tensors,
-        workspace_count=workspace_count,
-        stream=stream,
-        warmup_iterations=warmup_iterations,
-        iterations=iterations,
-    )
-
     from triton.testing import do_bench
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     flops = 2 * m * n * k * l
 
-    repeats = 30
-    # repeats = 1
-    warmup = 5
+    repeats = iterations
+    warmup = warmup_iterations
 
     import time
 
@@ -1534,8 +1490,6 @@ def run(
     tflops_cublas = flops / (timing_cublas * 1e9)  # Convert to TFlops
     print(f"CuBLAS Average time: {timing_cublas:.3f} ms, TFLOPS: {tflops_cublas:.1f}")
 
-    return exec_time  # Return execution time in microseconds
-
 
 if __name__ == "__main__":
     args = parse_arguments()
@@ -1556,6 +1510,5 @@ if __name__ == "__main__":
         args.skip_ref_check,
         args.persistent,
         args.pingpong,
-        args.use_cold_l2,
     )
     print("PASS")
