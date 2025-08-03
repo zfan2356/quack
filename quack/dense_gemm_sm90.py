@@ -37,7 +37,6 @@ import torch
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
@@ -337,7 +336,7 @@ class HopperWgmmaGemmKernel:
         assert self.mma_warp_groups in [1, 2, 3]
         self.num_threads_per_warp_group = 128
         self.threads_per_cta = (self.mma_warp_groups + 1) * self.num_threads_per_warp_group
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_90")
+        self.smem_capacity = cutlass.utils.get_smem_capacity_in_bytes("sm_90")
         self.num_mma_threads = (
             self.mma_warp_groups if not self.pingpong else 1
         ) * self.num_threads_per_warp_group
@@ -449,9 +448,9 @@ class HopperWgmmaGemmKernel:
         self.a_dtype = mA.element_type
         self.b_dtype = mB.element_type
         self.d_dtype = mD.element_type
-        self.a_layout = utils.LayoutEnum.from_tensor(mA)
-        self.b_layout = utils.LayoutEnum.from_tensor(mB)
-        self.d_layout = utils.LayoutEnum.from_tensor(mD)
+        self.a_layout = cutlass.utils.LayoutEnum.from_tensor(mA)
+        self.b_layout = cutlass.utils.LayoutEnum.from_tensor(mB)
+        self.d_layout = cutlass.utils.LayoutEnum.from_tensor(mD)
 
         if const_expr(self.a_dtype.width == 16 and self.a_dtype != self.b_dtype):
             raise TypeError(f"Type mismatch: {self.a_dtype} != {self.b_dtype}")
@@ -906,7 +905,8 @@ class HopperWgmmaGemmKernel:
                 tiled_copy_C_atom = cute.make_tiled_copy_C_atom(copy_atom_C, tiled_mma)
                 tiled_copy_r2s = cute.make_tiled_copy_S(copy_atom_r2s, tiled_copy_C_atom)
                 # (R2S, R2S_M, R2S_N, PIPE_D)
-                tRS_sD = tiled_copy_r2s.get_slice(tidx).partition_D(sD)
+                thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
+                tRS_sD = thr_copy_r2s.partition_D(sD)
                 # (R2S, R2S_M, R2S_N)
                 tRS_rAcc = tiled_copy_r2s.retile(acc)
 
@@ -929,7 +929,7 @@ class HopperWgmmaGemmKernel:
                 for epi_idx in cutlass.range_constexpr(epi_tile_num):
                     # Copy from acc to D registers
                     tRS_rD = cute.make_fragment_like(tRS_sD[None, None, None, 0], self.acc_dtype)
-                    for epi_v in cutlass.range_constexpr(cute.size(tRS_rD)):
+                    for epi_v in cutlass.range(cute.size(tRS_rD), unroll_full=True):
                         tRS_rD[epi_v] = tRS_rAcc[epi_idx * cute.size(tRS_rD) + epi_v]
                     # Type conversion
                     tRS_rD_out = cute.make_fragment_like(tRS_rD, self.d_dtype)
@@ -1080,12 +1080,12 @@ class HopperWgmmaGemmKernel:
         tile_shape_mnk: Tuple[int, int, int],
         epi_tile: Tuple[int, int],
         a_dtype: Type[cutlass.Numeric],
-        a_layout: utils.LayoutEnum,
+        a_layout: cutlass.utils.LayoutEnum,
         b_dtype: Type[cutlass.Numeric],
-        b_layout: utils.LayoutEnum,
+        b_layout: cutlass.utils.LayoutEnum,
         ab_stage: int,
         d_dtype: Type[cutlass.Numeric],
-        d_layout: utils.LayoutEnum,
+        d_layout: cutlass.utils.LayoutEnum,
         epi_stage: int,
     ) -> Tuple[cute.ComposedLayout, cute.ComposedLayout, cute.ComposedLayout]:
         """Create shared memory layouts for A, B, and C tensors.
@@ -1097,17 +1097,17 @@ class HopperWgmmaGemmKernel:
         :param a_dtype: Data type for matrix A
         :type a_dtype: type[cutlass.Numeric]
         :param a_layout: Layout enum for matrix A
-        :type a_layout: utils.LayoutEnum
+        :type a_layout: cutlass.utils.LayoutEnum
         :param b_dtype: Data type for matrix B
         :type b_dtype: type[cutlass.Numeric]
         :param b_layout: Layout enum for matrix B
-        :type b_layout: utils.LayoutEnum
+        :type b_layout: cutlass.utils.LayoutEnum
         :param ab_stage: Number of stages for A/B tensors
         :type ab_stage: int
         :param d_dtype: Data type for output matrix C
         :type d_dtype: type[cutlass.Numeric]
         :param d_layout: Layout enum for the output matrix C
-        :type d_layout: utils.LayoutEnum
+        :type d_layout: cutlass.utils.LayoutEnum
         :param epi_stage: Number of epilogue stages
         :type epi_stage: int
 

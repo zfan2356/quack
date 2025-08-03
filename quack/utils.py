@@ -7,7 +7,7 @@ from typing import Callable, Optional, Tuple
 import cutlass
 import cutlass.cute as cute
 
-from cutlass import Float32
+from cutlass import Float32, Int32
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm, vector
 from cutlass.cute.runtime import from_dlpack
@@ -352,6 +352,83 @@ def rsqrt(a: float | Float32, *, loc=None, ip=None) -> Float32:
     )
 
 
+@dsl_user_op
+def tanh(a: float | Float32, *, loc=None, ip=None) -> Float32:
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip)],
+            "tanh.approx.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def silu(a: float | Float32, *, loc=None, ip=None) -> Float32:
+    """
+    silu(a) = a * sigmoid(a) = a * (1 + tanh(a / 2)) / 2 = (0.5 * a) * tanh(0.5 * a) + (0.5 * a)
+    This compiles down to 3 SASS instructions: FMUL to get 0.5 * a, MUFU.TANH, and FFMA.
+    """
+    a_half = 0.5 * a
+    return a_half * tanh(a_half) + a_half
+
+
+@dsl_user_op
+def prmt(a: int | Int32, b: int | Int32, c: int | Int32, *, loc=None, ip=None) -> Int32:
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Int32(a).ir_value(loc=loc, ip=ip),
+                Int32(b).ir_value(loc=loc, ip=ip),
+                Int32(c).ir_value(loc=loc, ip=ip),
+            ],
+            "prmt.b32 $0, $1, $2, $3;",
+            "=r,r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
+def permute_gated_Cregs_b16(t: cute.Tensor) -> None:
+    assert t.element_type.width == 16
+    assert cute.size(t.shape) % 4 == 0, "Tensor size must be a multiple of 4 for b16 permutation"
+    t_u32 = cute.recast_tensor(t, Int32)
+
+    quad_idx = cute.arch.lane_idx() % 4
+    lane_03 = quad_idx == 0 or quad_idx == 3
+    selector_upper = Int32(0x5410) if lane_03 else Int32(0x1054)
+    selector_lower = Int32(0x7632) if lane_03 else Int32(0x3276)
+    # upper_map = [0, 3, 1, 2]
+    # lower_map = [1, 2, 0, 3]
+    # upper_idx = upper_map[quad_idx]
+    # indexing isn't supported so we have to do arithmetic
+    upper_idx = quad_idx // 2 if quad_idx % 2 == 0 else 3 - quad_idx // 2
+    lower_idx = upper_idx ^ 1
+
+    # 1 -> 0b11111, 2 -> 0b11110, 4 -> 0b11100, 8 -> 0b11000, 16 -> 0b10000, 32 -> 0b00000
+    width = 4
+    mask = cute.arch.WARP_SIZE - width
+    clamp = cute.arch.WARP_SIZE - 1
+    mask_and_clamp = mask << 8 | clamp
+
+    for i in cutlass.range(cute.size(t_u32.shape) // 2, unroll_full=True):
+        upper, lower = t_u32[i * 2 + 0], t_u32[i * 2 + 1]
+        upper0 = upper if lane_03 else lower
+        lower0 = lower if lane_03 else upper
+        upper0 = cute.arch.shuffle_sync(upper0, offset=upper_idx, mask_and_clamp=mask_and_clamp)
+        lower0 = cute.arch.shuffle_sync(lower0, offset=lower_idx, mask_and_clamp=mask_and_clamp)
+        t_u32[i * 2 + 0] = prmt(upper0, lower0, selector_upper)
+        t_u32[i * 2 + 1] = prmt(upper0, lower0, selector_lower)
+
+
 @cute.jit
 def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
     # Only compute predicates for the "k" dimension. For the mn dimension, we will use "if"
@@ -446,3 +523,36 @@ def coord_offset_i64(
         assumed_align=tensor.iterator.max_alignment,
     )
     return cute.make_tensor(new_ptr, tensor.layout)
+
+
+def convert_layout_acc_mn(acc_layout: cute.Layout) -> cute.Layout:
+    """
+    For Sm80, convert ((2, 2), MMA_M, MMA_N, ...) to ((2, MMA_M), (2, MMA_N), ...).
+    For Sm90, convert ((2, 2, V), MMA_M, MMA_N, ...) to ((2, MMA_M), (2, V, MMA_N), ...).
+    """
+    acc_layout_col_major = cute.make_layout(acc_layout.shape)
+    acc_layout_mn = cute.make_layout(
+        (
+            (acc_layout_col_major.shape[0][1], acc_layout_col_major.shape[1]),  # MMA_M
+            (
+                acc_layout_col_major.shape[0][0],
+                *acc_layout_col_major.shape[0][2:],
+                acc_layout_col_major.shape[2],
+            ),  # MMA_N
+            *acc_layout_col_major.shape[3:],
+        ),
+        stride=(
+            (acc_layout_col_major.stride[0][1], acc_layout_col_major.stride[1]),  # MMA_M
+            (
+                acc_layout_col_major.stride[0][0],
+                *acc_layout_col_major.stride[0][2:],
+                acc_layout_col_major.stride[2],
+            ),  # MMA_N
+            *acc_layout_col_major.stride[3:],
+        ),
+    )
+    return cute.composition(acc_layout, acc_layout_mn)
+
+
+def make_acc_tensor_mn_view(acc: cute.Tensor) -> cute.Tensor:
+    return cute.make_tensor(acc.iterator, convert_layout_acc_mn(acc.layout))
