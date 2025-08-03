@@ -898,12 +898,12 @@ class HopperWgmmaGemmKernel:
                     elem_ty_d=self.d_dtype,
                     elem_ty_acc=self.acc_dtype,
                 )
-                copy_atom_C = cute.make_copy_atom(
+                copy_atom_D = cute.make_copy_atom(
                     warp.StMatrix8x8x16bOp(self.d_layout.is_m_major_c(), 4),
                     self.d_dtype,
                 )
-                tiled_copy_C_atom = cute.make_tiled_copy_C_atom(copy_atom_C, tiled_mma)
-                tiled_copy_r2s = cute.make_tiled_copy_S(copy_atom_r2s, tiled_copy_C_atom)
+                tiled_copy_D_atom = cute.make_tiled_copy_C_atom(copy_atom_D, tiled_mma)
+                tiled_copy_r2s = cute.make_tiled_copy_S(copy_atom_r2s, tiled_copy_D_atom)
                 # (R2S, R2S_M, R2S_N, PIPE_D)
                 thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
                 tRS_sD = thr_copy_r2s.partition_D(sD)
@@ -1020,7 +1020,10 @@ class HopperWgmmaGemmKernel:
 
         epi_stage = 4
         # epi_smem will reuse smem ab if not persistent.
-        epi_bytes = 0 if epi_tile is None else cute.size(epi_tile) * d_dtype.width // 8 * epi_stage
+        if epi_tile is None:
+            epi_bytes = 0
+        else:
+            epi_bytes = cute.size(epi_tile) * d_dtype.width // 8 * epi_stage
 
         a_shape = cute.slice_(tile_shape_mnk, (None, 0, None))
         b_shape = cute.slice_(tile_shape_mnk, (0, None, None))
@@ -1153,11 +1156,7 @@ class HopperWgmmaGemmKernel:
         d_smem_shape = epi_tile
         d_major_mode_size = epi_tile[1] if d_layout.is_n_major_c() else epi_tile[0]
         d_smem_layout_atom = warpgroup.make_smem_layout_atom(
-            sm90_utils.get_smem_layout_atom(
-                d_layout,
-                d_dtype,
-                d_major_mode_size,
-            ),
+            sm90_utils.get_smem_layout_atom(d_layout, d_dtype, d_major_mode_size),
             d_dtype,
         )
         epi_smem_layout_staged = cute.tile_to_shape(
@@ -1187,12 +1186,12 @@ class HopperWgmmaGemmKernel:
         :rtype: Tuple[cute.CopyAtom, cute.Tensor]
         """
         epi_smem_layout = cute.slice_(epi_smem_layout_staged, (None, None, 0))
-        c_cta_v_layout = cute.composition(cute.make_identity_layout(tensor_d.shape), epi_tile)
+        d_cta_v_layout = cute.composition(cute.make_identity_layout(tensor_d.shape), epi_tile)
         tma_atom_d, tma_tensor_d = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileS2GOp(),
             tensor_d,
             epi_smem_layout,
-            c_cta_v_layout,
+            d_cta_v_layout,
         )
 
         return tma_atom_d, tma_tensor_d
@@ -1324,7 +1323,7 @@ def run(
     **kwargs,
 ):
     """
-    Prepare A/B/C tensors, launch GPU kernel, and reference checking.
+    Prepare A/B/D tensors, launch GPU kernel, and reference checking.
 
     :param mnkl: Problem size (M, N, K, L)
     :type mnkl: Tuple[int, int, int, int]
@@ -1434,7 +1433,7 @@ def run(
 
     a, mA, a_torch = create_and_permute_tensor(l, m, k, a_major == "m", a_dtype)
     b, mB, b_torch = create_and_permute_tensor(l, n, k, b_major == "n", b_dtype)
-    c, mC, c_torch = create_and_permute_tensor(l, m, n, d_major == "m", d_dtype)
+    d, mD, d_torch = create_and_permute_tensor(l, m, n, d_major == "m", d_dtype)
 
     gemm = HopperWgmmaGemmKernel(
         acc_dtype,
@@ -1457,11 +1456,11 @@ def run(
     torch_stream = torch.cuda.Stream()
     stream = cuda.CUstream(torch_stream.cuda_stream)
     # compile gemm kernel
-    compiled_gemm = cute.compile(gemm, mA, mB, mC, max_active_clusters, stream)
+    compiled_gemm = cute.compile(gemm, mA, mB, mD, max_active_clusters, stream)
 
     if not skip_ref_check:
         # execution
-        compiled_gemm(mA, mB, mC, max_active_clusters, stream)
+        compiled_gemm(mA, mB, mD, max_active_clusters, stream)
 
         torch.cuda.synchronize()
 
@@ -1480,21 +1479,21 @@ def run(
                 init_type=cutlass_torch.TensorInitType.SKIP,
             ).cuda()
             # Create dtype cute tensor (gpu)
-            ref_c_tensor = from_dlpack(f8_torch_tensor, assumed_align=16).mark_layout_dynamic(
+            ref_d_tensor = from_dlpack(f8_torch_tensor, assumed_align=16).mark_layout_dynamic(
                 leading_dim=(1 if d_major == "n" else 0)
             )
-            ref_c_tensor.element_type = d_dtype
-            ref_c_tensor = cutlass_torch.convert_cute_tensor(
+            ref_d_tensor.element_type = d_dtype
+            ref_d_tensor = cutlass_torch.convert_cute_tensor(
                 ref,
-                ref_c_tensor,
+                ref_d_tensor,
                 d_dtype,
                 is_dynamic_layout=True,
             )
-            ref_c = f8_torch_tensor.cpu()
+            ref_d = f8_torch_tensor.cpu()
         else:
-            ref_c = ref.to(cutlass_torch.dtype(d_dtype))
+            ref_d = ref.to(cutlass_torch.dtype(d_dtype))
 
-        torch.testing.assert_close(c_torch.cpu(), ref_c, atol=tolerance, rtol=1e-03)
+        torch.testing.assert_close(d_torch.cpu(), ref_d, atol=tolerance, rtol=1e-03)
 
     from triton.testing import do_bench
 
@@ -1526,7 +1525,7 @@ def run(
     print(f"CuBLAS Average time: {timing_cublas:.3f} ms, TFLOPS: {tflops_cublas:.1f}")
 
     time.sleep(0.5)
-    fn = lambda: compiled_gemm(mA, mB, mC, max_active_clusters, current_stream)
+    fn = lambda: compiled_gemm(mA, mB, mD, max_active_clusters, current_stream)
     timing = do_bench(fn, warmup=warmup, rep=repeats)
     tflops = flops / (timing * 1e9)  # Convert to TFlops
     print(f"Cute-DSL Average time: {timing:.3f} ms, TFLOPS: {tflops:.1f}")
