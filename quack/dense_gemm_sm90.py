@@ -1036,17 +1036,22 @@ class HopperWgmmaGemmKernel:
                 if const_expr(not self.is_persistent):
                     epilogue_barrier.arrive_and_wait()
 
+                # Doesn't work with tile_N % 8 == 0 but tile_n % 16 != since this always
+                # get st.matrix with num_matrices=4
                 copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
                     self.d_layout,
                     elem_ty_d=self.d_dtype,
                     elem_ty_acc=self.acc_dtype,
                 )
-                copy_atom_D = cute.make_copy_atom(
-                    warp.StMatrix8x8x16bOp(self.d_layout.is_m_major_c(), 4),
-                    self.d_dtype,
+                copy_atom_C = cute.make_copy_atom(
+                    warp.StMatrix8x8x16bOp(
+                        self.d_layout.is_m_major_c(),
+                        num_matrices=4 if self.epi_tile[1] % 16 == 0 else 2,
+                    ),
+                    cutlass.Float16,  # this is just to get the right source layout
                 )
-                tiled_copy_D_atom = cute.make_tiled_copy_C_atom(copy_atom_D, tiled_mma)
-                tiled_copy_r2s = cute.make_tiled_copy_S(copy_atom_r2s, tiled_copy_D_atom)
+                tiled_copy_C_atom = cute.make_tiled_copy_C_atom(copy_atom_C, tiled_mma)
+                tiled_copy_r2s = cute.make_tiled_copy_S(copy_atom_r2s, tiled_copy_C_atom)
                 # (R2S, R2S_M, R2S_N, PIPE_D)
                 thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
                 tRS_sD = thr_copy_r2s.partition_D(sD)
@@ -1055,11 +1060,11 @@ class HopperWgmmaGemmKernel:
 
                 if const_expr(mC_mnl is not None):
                     copy_atom_s2r = utils.sm90_get_smem_load_op(self.c_layout, self.c_dtype)
-                    tiled_copy_s2r = cute.make_tiled_copy_S(copy_atom_s2r, tiled_copy_D_atom)
+                    tiled_copy_s2r = cute.make_tiled_copy_S(copy_atom_s2r, tiled_copy_C_atom)
                     thr_copy_s2r = tiled_copy_s2r.get_slice(tidx)
-                    tRS_sC = thr_copy_s2r.partition_S(sC)
+                    tSR_sC = thr_copy_s2r.partition_S(sC)
                 else:
-                    thr_copy_s2r, tRS_sC = None, None
+                    thr_copy_s2r, tSR_sC = None, None
 
                 # (bM, bN)
                 gD_mnl = cute.local_tile(
@@ -1079,14 +1084,16 @@ class HopperWgmmaGemmKernel:
                 num_prev_subtiles = tile_scheduler.num_tiles_executed * epi_tile_num
                 for epi_idx in cutlass.range_constexpr(epi_tile_num):
                     # Copy from acc to D registers
-                    tRS_rD = cute.make_fragment_like(tRS_sD[None, None, None, 0], self.acc_dtype)
-                    for epi_v in cutlass.range(cute.size(tRS_rD), unroll_full=True):
+                    tRS_rD_layout = cute.make_layout(thr_copy_r2s.partition_S(sD).shape[:3])
+                    tRS_rD = cute.make_fragment(tRS_rD_layout, self.acc_dtype)
+                    for epi_v in cutlass.range_constexpr(cute.size(tRS_rD)):
                         tRS_rD[epi_v] = tRS_rAcc[epi_idx * cute.size(tRS_rD) + epi_v]
                     if const_expr(mC_mnl is not None):
                         epi_pipeline.consumer_wait(epi_read_state)
-                        tRS_rC = cute.make_fragment_like(tRS_sC[None, None, None, 0], self.c_dtype)
+                        tRS_rC = cute.make_fragment(tRS_rD_layout, self.c_dtype)
+                        tSR_rC = thr_copy_s2r.retile(tRS_rC)
                         cute.copy(
-                            thr_copy_s2r, tRS_sC[None, None, None, epi_read_state.index], tRS_rC
+                            thr_copy_s2r, tSR_sC[None, None, None, epi_read_state.index], tSR_rC
                         )
                         # Fence to make sure shared memory read is visible to TMA load
                         cute.arch.fence_proxy(
@@ -1348,7 +1355,7 @@ class HopperWgmmaGemmKernel:
             c_major_mode_size = epi_tile[1] if c_layout.is_n_major_c() else epi_tile[0]
             c_smem_layout_atom = warpgroup.make_smem_layout_atom(
                 sm90_utils.get_smem_layout_atom(c_layout, c_dtype, c_major_mode_size),
-                d_dtype,
+                c_dtype,
             )
             epi_c_smem_layout_staged = cute.tile_to_shape(
                 c_smem_layout_atom,
@@ -1565,8 +1572,6 @@ def run(
     print(f"Warmup iterations: {warmup_iterations}")
     print(f"Iterations: {iterations}")
     print(f"Skip reference checking: {skip_ref_check}")
-    # TODO: relax this
-    assert c_dtype is None or c_dtype == d_dtype, "C dtype must match output dtype"
 
     # Unpack parameters
     m, n, k, l = mnkl
