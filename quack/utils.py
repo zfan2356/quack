@@ -2,7 +2,7 @@
 
 import operator
 import math
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, Type
 
 import cutlass
 import cutlass.cute as cute
@@ -556,3 +556,38 @@ def convert_layout_acc_mn(acc_layout: cute.Layout) -> cute.Layout:
 
 def make_acc_tensor_mn_view(acc: cute.Tensor) -> cute.Tensor:
     return cute.make_tensor(acc.iterator, convert_layout_acc_mn(acc.layout))
+
+
+@dsl_user_op
+def sm90_get_smem_load_op(
+    layout_c: cutlass.utils.LayoutEnum,
+    elem_ty_c: Type[cutlass.Numeric],
+    *,
+    loc=None,
+    ip=None,
+) -> cute.CopyAtom:
+    """
+    Selects the largest vectorized smem load atom available subject to constraint of gmem layout.
+
+    Parameters:
+    -----------
+    layout_c : LayoutEnum
+        The layout enum of the output tensor D.
+
+    elem_ty_c : Type[Numeric]
+        The element type for output tensor D.
+
+    Returns:
+    --------
+    Either SmemLoadMatrix or SimtSyncCopy, based on the input parameters.
+    """
+
+    if not isinstance(elem_ty_c, cutlass.cutlass_dsl.NumericMeta):
+        raise TypeError(f"elem_ty_c must be a Numeric, but got {elem_ty_c}")
+    is_m_major = layout_c.is_m_major_c()
+    if elem_ty_c.width == 16:
+        return cute.make_copy_atom(
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(is_m_major, 4), elem_ty_c, loc=loc, ip=ip
+        )
+    else:
+        return cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), elem_ty_c, loc=loc, ip=ip)
