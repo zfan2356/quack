@@ -338,6 +338,21 @@ def log2f(a: float | Float32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
+def sqrt(a: float | Float32, *, loc=None, ip=None) -> Float32:
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip)],
+            "sqrt.approx.ftz.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def rsqrt(a: float | Float32, *, loc=None, ip=None) -> Float32:
     return Float32(
         llvm.inline_asm(
@@ -360,6 +375,21 @@ def tanh(a: float | Float32, *, loc=None, ip=None) -> Float32:
             [Float32(a).ir_value(loc=loc, ip=ip)],
             "tanh.approx.f32 $0, $1;",
             "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def ceil(a: float | Float32, *, loc=None, ip=None) -> Int32:
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(a).ir_value(loc=loc, ip=ip)],
+            "cvt.rpi.ftz.s32.f32 $0, $1;",
+            "=r,f",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
