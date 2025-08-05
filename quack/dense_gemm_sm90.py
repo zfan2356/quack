@@ -1195,11 +1195,12 @@ class HopperWgmmaGemmKernel:
         :rtype: Tuple[int, int]
         """
 
-        epi_stage = 4
+        epi_stage = 2
         if overlap_sD_sA:
             epi_bytes = 0
         else:
-            epi_bytes = cute.size(epi_tile) * d_dtype.width // 8 * epi_stage
+            d_bytes_per_stage = cute.size(epi_tile) * d_dtype.width // 8
+            epi_bytes = d_bytes_per_stage * epi_stage
         epi_c_stage = 0 if c_dtype is None else 2
         if c_dtype is not None:
             epi_bytes += cute.size(epi_tile) * c_dtype.width // 8 * epi_c_stage
@@ -1214,6 +1215,17 @@ class HopperWgmmaGemmKernel:
         ab_stage = (
             (smem_capacity - occupancy * 1024) // occupancy - mbar_helpers_bytes - epi_bytes
         ) // ab_bytes_per_stage
+
+        # Refine epilogue stages:
+        # Calculate remaining smem after allocating for A/B stages and reserved bytes
+        # Add remaining unused smem to epilogue
+        if not overlap_sD_sA:
+            epi_stage += (
+                (smem_capacity - occupancy * 1024) // occupancy
+                - mbar_helpers_bytes
+                - epi_bytes
+                - ab_bytes_per_stage * ab_stage
+            ) // (d_bytes_per_stage)
         return ab_stage, epi_stage, epi_c_stage
 
     @staticmethod
