@@ -1975,12 +1975,12 @@ if __name__ == "__main__":
     parser.add_argument("--b_major", choices=["k", "n"], type=str, default="k")
     parser.add_argument("--c_major", choices=["n", "m"], type=str, default="n")
     parser.add_argument("--use_tma_store", action="store_true", help="Use tma store or not")
-    parser.add_argument("--tolerance", type=float, default=1e-01, help="Tolerance for validation")
-    parser.add_argument("--warmup_iterations", type=int, default=0, help="Warmup iterations")
+    parser.add_argument("--tolerance", type=float, default=3e-02, help="Tolerance for validation")
+    parser.add_argument("--warmup_iterations", type=int, default=5, help="Warmup iterations")
     parser.add_argument(
         "--iterations",
         type=int,
-        default=1,
+        default=30,
         help="Number of iterations to run the kernel",
     )
     parser.add_argument("--skip_ref_check", action="store_true", help="Skip reference checking")
