@@ -199,6 +199,13 @@ class StaticTileScheduler:
             cid_slow, cid_fast_in_group = params.group_size_divmod.divmod(id_in_group)
         else:  # tail part
             cid_slow, cid_fast_in_group = params.group_size_tail_divmod.divmod(id_in_group)
+        if group_id % 2 == 1:  # serpentine order
+            ncluster_slow = (
+                params.problem_shape_ncluster_mnl[1]
+                if params.raster_order == RasterOrder.AlongM
+                else params.problem_shape_ncluster_mnl[0]
+            )
+            cid_slow = ncluster_slow - 1 - cid_slow
         cid_fast = group_id * params.group_size_divmod.divisor + cid_fast_in_group
         cid_m, cid_n = cid_fast, cid_slow
         if params.raster_order == RasterOrder.AlongN:
