@@ -53,7 +53,7 @@ from quack.tile_scheduler import (
 )
 
 # return PipelineStateWAdvance instead of PipelineState
-from quack.pipeline import make_pipeline_state
+from quack.pipeline import make_pipeline_state, PipelineTmaCpAsync
 import quack.utils as utils
 
 """
@@ -268,6 +268,7 @@ class HopperWgmmaGemmKernel:
         pingpong: bool = False,
         is_persistent: bool = True,
         fp8_fast_accum: bool = False,
+        load_A_cpasync: bool = False,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -289,6 +290,7 @@ class HopperWgmmaGemmKernel:
         if self.pingpong:
             assert self.is_persistent, "Pingpong gemm requires persistent scheduler"
         self.fp8_slow_accum = not fp8_fast_accum and a_dtype.width == 8
+        self.load_A_cpasync = load_A_cpasync
 
         self.cluster_shape_mnk = cluster_shape_mnk
         self.tile_shape_mnk = tuple(tile_shape_mnk)
@@ -335,7 +337,7 @@ class HopperWgmmaGemmKernel:
             atom_layout_m, atom_layout_n = 1, 1
         self.atom_layout_mnk = (atom_layout_m, atom_layout_n, 1)
 
-        self.num_mcast_ctas_a = self.cluster_shape_mnk[1]
+        self.num_mcast_ctas_a = self.cluster_shape_mnk[1] if not self.load_A_cpasync else 1
         self.num_mcast_ctas_b = self.cluster_shape_mnk[0]
         self.is_a_mcast = self.num_mcast_ctas_a > 1
         self.is_b_mcast = self.num_mcast_ctas_b > 1
@@ -354,10 +356,11 @@ class HopperWgmmaGemmKernel:
         self.num_epi_threads = (
             self.mma_warp_groups if not self.pingpong else 1
         ) * self.num_threads_per_warp_group
-        self.num_ab_load_threads = cute.arch.WARP_SIZE * 1
+        self.num_ab_load_warps = 1 if not self.load_A_cpasync else 2
+        self.num_ab_load_threads = cute.arch.WARP_SIZE * self.num_ab_load_warps
         self.num_epi_load_threads = cute.arch.WARP_SIZE * 1
         self.ab_load_warp_id = self.mma_warp_groups * 4
-        self.epi_load_warp_id = self.ab_load_warp_id + 1
+        self.epi_load_warp_id = self.ab_load_warp_id + self.num_ab_load_warps
 
         regs_per_thread = math.prod(self.tile_shape_mnk[:2]) // self.num_mma_threads
         if self.fp8_slow_accum:
@@ -509,12 +512,15 @@ class HopperWgmmaGemmKernel:
                 permutation_mnk=(None, permutation_n, None),
             )
 
-        tma_atom_a, tma_tensor_a = self._make_tma_atoms_and_tensors(
-            mA,
-            self.a_smem_layout_staged,
-            (self.tile_shape_mnk[0], self.tile_shape_mnk[2]),
-            self.cluster_shape_mnk[1],
-        )
+        if const_expr(not self.load_A_cpasync):
+            tma_atom_a, tma_tensor_a = self._make_tma_atoms_and_tensors(
+                mA,
+                self.a_smem_layout_staged,
+                (self.tile_shape_mnk[0], self.tile_shape_mnk[2]),
+                self.cluster_shape_mnk[1],
+            )
+        else:
+            tma_atom_a, tma_tensor_a = None, None
 
         tma_atom_b, tma_tensor_b = self._make_tma_atoms_and_tensors(
             mB,
@@ -579,7 +585,7 @@ class HopperWgmmaGemmKernel:
         # Launch the kernel synchronously
         self.kernel(
             tma_atom_a,
-            tma_tensor_a,
+            tma_tensor_a if const_expr(not self.load_A_cpasync) else mA,
             tma_atom_b,
             tma_tensor_b,
             tma_atom_d,
@@ -608,7 +614,7 @@ class HopperWgmmaGemmKernel:
     @cute.kernel
     def kernel(
         self,
-        tma_atom_a: cute.CopyAtom,
+        tma_atom_a: Optional[cute.CopyAtom],
         mA_mkl: cute.Tensor,
         tma_atom_b: cute.CopyAtom,
         mB_nkl: cute.Tensor,
@@ -658,7 +664,8 @@ class HopperWgmmaGemmKernel:
         #  Prefetch Tma desc
         # /////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.ab_load_warp_id:
-            cpasync.prefetch_descriptor(tma_atom_a)
+            if const_expr(tma_atom_a is not None):
+                cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
             cpasync.prefetch_descriptor(tma_atom_d)
             if const_expr(tma_atom_c is not None):
@@ -669,6 +676,8 @@ class HopperWgmmaGemmKernel:
         tma_copy_bytes = cute.size_in_bytes(self.a_dtype, a_smem_layout) + cute.size_in_bytes(
             self.b_dtype, b_smem_layout
         )
+        if const_expr(self.load_A_cpasync):
+            tma_copy_bytes = cute.size_in_bytes(self.b_dtype, b_smem_layout)
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Alloc and init AB full/empty + ACC full mbar (pipeline)
@@ -677,7 +686,8 @@ class HopperWgmmaGemmKernel:
         storage = smem.allocate(self.shared_storage)
 
         # Threads/warps participating in this pipeline
-        ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        producer_cnt = 1 if const_expr(not self.load_A_cpasync) else 1 + self.num_ab_load_threads
+        ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, producer_cnt)
         # Each warp will contribute to the arrive count with the number of mcast size
         mcast_size = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
         consumer_arrive_cnt = mcast_size * (self.num_mma_threads // cute.arch.WARP_SIZE)
@@ -686,7 +696,8 @@ class HopperWgmmaGemmKernel:
         )
 
         cta_layout_vmnk = cute.make_layout((1, *cluster_layout_mnk.shape))
-        ab_pipeline = pipeline.PipelineTmaAsync.create(
+        pipeline_cls = pipeline.PipelineTmaAsync if not self.load_A_cpasync else PipelineTmaCpAsync
+        ab_pipeline = pipeline_cls.create(
             barrier_storage=storage.ab_pipeline_array_ptr.data_ptr(),
             num_stages=self.ab_stage,
             producer_group=ab_pipeline_producer_group,
@@ -748,7 +759,10 @@ class HopperWgmmaGemmKernel:
                 )
             else:
                 epi_load_barrier = None
-            if warp_idx == self.ab_load_warp_id:
+            if (
+                warp_idx >= self.ab_load_warp_id
+                and warp_idx < self.ab_load_warp_id + self.num_ab_load_warps
+            ):
                 # ///////////////////////////////////////////////////////////////////////////////
                 # Get mcast mask
                 # ///////////////////////////////////////////////////////////////////////////////
@@ -781,13 +795,35 @@ class HopperWgmmaGemmKernel:
                 a_cta_crd = cluster_coord_mnk[1]
                 # ((atom_v, rest_v), STAGE)
                 # ((atom_v, rest_v), RestM, RestK, RestL)
-                tAsA, tAgA_mkl = cpasync.tma_partition(
-                    tma_atom_a,
-                    a_cta_crd,
-                    a_cta_layout,
-                    cute.group_modes(sA, 0, 2),
-                    cute.group_modes(gA_mkl, 0, 2),
-                )
+                if const_expr(not self.load_A_cpasync):
+                    tAsA, tAgA_mkl = cpasync.tma_partition(
+                        tma_atom_a,
+                        a_cta_crd,
+                        a_cta_layout,
+                        cute.group_modes(sA, 0, 2),
+                        cute.group_modes(gA_mkl, 0, 2),
+                    )
+                else:
+                    tiled_copy_A = self._make_gmem_tiled_copy_A(
+                        mA_mkl.element_type,
+                        self.a_layout,
+                        self.num_ab_load_threads,
+                    )
+                    tidx = (
+                        cute.arch.thread_idx()[0]
+                        - self.mma_warp_groups * self.num_threads_per_warp_group
+                    )
+                    thr_copy_A = tiled_copy_A.get_slice(tidx)
+                    # (atom_v, rest_v, 1, RestM, RestK, RestL)
+                    tAgA_mkl = thr_copy_A.partition_S(gA_mkl)
+                    assert tAgA_mkl.shape[2] == 1
+                    tAgA_mkl = cute.group_modes(
+                        cute.slice_(tAgA_mkl, (None, None, 0, None, None, None)), 0, 2
+                    )
+                    # (atom_v, rest_v, 1, STAGE)
+                    tAsA = thr_copy_A.partition_D(sA)
+                    assert tAsA.shape[2] == 1
+                    tAsA = cute.group_modes(cute.slice_(tAsA, (None, None, 0, None)), 0, 2)
                 # TMA load B partition_S/D
                 b_cta_layout = cute.make_layout(cute.slice_(cluster_layout_mnk, (None, 0, 0)).shape)
                 b_cta_crd = cluster_coord_mnk[0]
@@ -815,18 +851,31 @@ class HopperWgmmaGemmKernel:
                     tAgA_slice = tAgA_mkl[None, tile_coord_mnkl[0], None, tile_coord_mnkl[3]]
                     # ((atom_v, rest_v), RestK)
                     tBgB_slice = tBgB_nkl[None, tile_coord_mnkl[1], None, tile_coord_mnkl[3]]
-                    ab_producer_state = self.load_AB(
-                        ab_pipeline,
-                        ab_producer_state,
-                        tma_atom_a,
-                        tAgA_slice,
-                        tAsA,
-                        a_mcast_mask,
-                        tma_atom_b,
-                        tBgB_slice,
-                        tBsB,
-                        b_mcast_mask,
-                    )
+                    if const_expr(not self.load_A_cpasync):
+                        ab_producer_state = self.load_AB(
+                            ab_pipeline,
+                            ab_producer_state,
+                            tma_atom_a,
+                            tAgA_slice,
+                            tAsA,
+                            a_mcast_mask,
+                            tma_atom_b,
+                            tBgB_slice,
+                            tBsB,
+                            b_mcast_mask,
+                        )
+                    else:
+                        ab_producer_state = self.load_AB_cpasync_A(
+                            ab_pipeline,
+                            ab_producer_state,
+                            tiled_copy_A,
+                            tAgA_slice,
+                            tAsA,
+                            tma_atom_b,
+                            tBgB_slice,
+                            tBsB,
+                            b_mcast_mask,
+                        )
                     if const_expr(epi_load_barrier is not None):
                         # In the first work tile, the epi load warp will wait for the signal
                         # from the mainloop load warp to start loading C, to avoid interfering
@@ -1125,6 +1174,58 @@ class HopperWgmmaGemmKernel:
                 mcast_mask=b_mcast_mask,
             )
             # Mainloop pipeline's producer commit is a NOP
+            ab_pipeline.producer_commit(ab_producer_state)
+            ab_producer_state.advance()
+            peek_ab_empty_status = cutlass.Boolean(True)
+            if k_tile + 1 < k_tile_cnt:
+                peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
+        return ab_producer_state
+
+    @cute.jit
+    def load_AB_cpasync_A(
+        self,
+        ab_pipeline: cutlass.pipeline.PipelineAsync,
+        ab_producer_state: cutlass.pipeline.PipelineState,
+        tiled_copy_A: cute.TiledCopy,
+        tAgA: cute.Tensor,
+        tAsA: cute.Tensor,
+        tma_atom_b: cute.CopyAtom,
+        tBgB: cute.Tensor,
+        tBsB: cute.Tensor,
+        b_mcast_mask: cutlass.Int16,
+    ) -> cutlass.pipeline.PipelineState:
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        k_tile_cnt = cute.size(tAgA, mode=[1])
+        # Peek (try_wait) AB buffer empty for k_block = prefetch_k_tile_cnt
+        peek_ab_empty_status = cutlass.Boolean(True)
+        if 0 < k_tile_cnt:
+            peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
+        # /////////////////////////////////////////////////////////////////////////
+        # TMA load
+        # /////////////////////////////////////////////////////////////////////////
+        for k_tile in cutlass.range(k_tile_cnt, unroll=1):
+            # Wait for A/B buffers to be empty before loading into them
+            # Also sets the transaction barrier for the A/B buffers
+            ab_pipeline.producer_acquire(
+                ab_producer_state,
+                peek_ab_empty_status,
+                is_tma_warp=warp_idx == self.ab_load_warp_id,
+            )
+            # TODO: need bound checking
+            cute.copy(
+                tiled_copy_A,
+                tAgA[None, k_tile],
+                tAsA[None, ab_producer_state.index],
+            )
+            if warp_idx == self.ab_load_warp_id:
+                cute.copy(
+                    tma_atom_b,
+                    tBgB[None, k_tile],
+                    tBsB[None, ab_producer_state.index],
+                    tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                    mcast_mask=b_mcast_mask,
+                )
+            # This tells mbarrier to track the completion of cp.async
             ab_pipeline.producer_commit(ab_producer_state)
             ab_producer_state.advance()
             peek_ab_empty_status = cutlass.Boolean(True)
@@ -1518,6 +1619,31 @@ class HopperWgmmaGemmKernel:
         )
         return tma_atom, tma_tensor
 
+    def _make_gmem_tiled_copy_A(self, dtype, major_mode, num_threads, copy_bits=128):
+        atom_async_copy = cute.make_copy_atom(
+            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+            dtype,
+            num_bits_per_copy=copy_bits,
+        )
+        copy_elems = copy_bits // dtype.width
+        shape_dim_1 = cute.size(self.tile_shape_mnk[2]) // copy_elems
+        # thread layout for copy
+        thread_layout = cute.make_layout(
+            (num_threads // shape_dim_1, shape_dim_1), stride=(shape_dim_1, 1)
+        )
+        if major_mode != cutlass.utils.LayoutEnum.ROW_MAJOR:
+            shape_dim_0 = cute.size(self.tile_shape_mnk[0]) // copy_elems
+            thread_layout = cute.make_layout(
+                (shape_dim_0, num_threads // shape_dim_0), stride=(1, shape_dim_0)
+            )
+        # Value layout for copy
+        value_layout = (
+            cute.make_layout((1, copy_elems))
+            if major_mode == cutlass.utils.LayoutEnum.ROW_MAJOR
+            else cute.make_layout((copy_elems, 1))
+        )
+        return cute.make_tiled_copy_tv(atom_async_copy, thread_layout, value_layout)
+
     @staticmethod
     def is_valid_dtypes(
         a_dtype: Type[cutlass.Numeric],
@@ -1711,6 +1837,11 @@ def run(
         cute_tensor.element_type = dtype
         if is_dynamic_layout:
             cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=(0 if is_mode0_major else 1))
+            cute_tensor = cute_tensor.mark_compact_shape_dynamic(
+                mode=(1 if not is_mode0_major else 0),
+                stride_order=(2, 0, 1) if not is_mode0_major else (2, 1, 0),
+                divisibility=(128 // dtype.width),
+            )
         cute_tensor = cutlass.torch.convert_cute_tensor(
             f32_torch_tensor,
             cute_tensor,
