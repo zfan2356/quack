@@ -291,6 +291,8 @@ class HopperWgmmaGemmKernel:
             assert self.is_persistent, "Pingpong gemm requires persistent scheduler"
         self.fp8_slow_accum = not fp8_fast_accum and a_dtype.width == 8
         self.load_A_cpasync = load_A_cpasync
+        if load_A_cpasync:
+            assert cluster_shape_mnk[1] == 1, "Cluster shape N must be 1 for cpasync A load"
 
         self.cluster_shape_mnk = cluster_shape_mnk
         self.tile_shape_mnk = tuple(tile_shape_mnk)
