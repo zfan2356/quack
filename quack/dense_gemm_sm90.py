@@ -807,9 +807,7 @@ class HopperWgmmaGemmKernel:
                     )
                 else:
                     tiled_copy_A = self._make_gmem_tiled_copy_A(
-                        mA_mkl.element_type,
-                        self.a_layout,
-                        self.num_ab_load_threads,
+                        mA_mkl.element_type, self.a_layout, self.num_ab_load_threads
                     )
                     tidx = (
                         cute.arch.thread_idx()[0]
@@ -1023,9 +1021,7 @@ class HopperWgmmaGemmKernel:
                 # Doesn't work with tile_N % 8 == 0 but tile_n % 16 != since this always
                 # get st.matrix with num_matrices=4
                 copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
-                    self.d_layout,
-                    elem_ty_d=self.d_dtype,
-                    elem_ty_acc=self.acc_dtype,
+                    self.d_layout, elem_ty_d=self.d_dtype, elem_ty_acc=self.acc_dtype
                 )
                 copy_atom_C = cute.make_copy_atom(
                     warp.StMatrix8x8x16bOp(
@@ -1095,7 +1091,7 @@ class HopperWgmmaGemmKernel:
                     tRS_rD_out.store(tRS_rD.load().to(self.d_dtype))
                     # Copy from D registers to shared memory
                     epi_buffer = (num_prev_subtiles + epi_idx) % cute.size(tRS_sD, mode=[3])
-                    cute.copy(tiled_copy_r2s, tRS_rD_out, tRS_sD[(None, None, None, epi_buffer)])
+                    cute.copy(tiled_copy_r2s, tRS_rD_out, tRS_sD[None, None, None, epi_buffer])
                     # Fence and barrier to make sure shared memory store is visible to TMA store
                     cute.arch.fence_proxy(
                         cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta

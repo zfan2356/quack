@@ -47,6 +47,24 @@ class RasterOrder(IntEnum):
     AlongN = 1
 
 
+@cute.jit
+def get_raster_order_from_option(
+    raster_order_option: RasterOrderOption, problem_shape_ncluster_mn: cute.Shape, group_size: Int32
+) -> RasterOrder:
+    raster_order = (
+        RasterOrder.AlongM
+        if raster_order_option == RasterOrderOption.AlongM
+        else RasterOrder.AlongN
+    )
+    if raster_order_option == RasterOrderOption.Heuristic:
+        problem_blocks_m = cute.round_up(problem_shape_ncluster_mn[0], group_size)
+        problem_blocks_n = cute.round_up(problem_shape_ncluster_mn[1], group_size)
+        raster_order = (
+            RasterOrder.AlongM if problem_blocks_n > problem_blocks_m else RasterOrder.AlongN
+        )
+    return raster_order
+
+
 @dataclass
 class TileSchedulerArguments(ParamsBase):
     problem_shape_ntile_mnl: cute.Shape
@@ -82,19 +100,9 @@ class StaticTileScheduler:
                 args.problem_shape_ntile_mnl[2],
             )
             num_clusters_per_problem = cute.size(problem_shape_ncluster_mn)
-            raster_order = (
-                RasterOrder.AlongM
-                if args.raster_order == RasterOrderOption.AlongM
-                else RasterOrder.AlongN
+            raster_order = get_raster_order_from_option(
+                args.raster_order, problem_shape_ncluster_mn, args.group_size
             )
-            if args.raster_order == RasterOrderOption.Heuristic:
-                problem_blocks_m = cute.round_up(problem_shape_ncluster_mn[0], args.group_size)
-                problem_blocks_n = cute.round_up(problem_shape_ncluster_mn[1], args.group_size)
-                raster_order = (
-                    RasterOrder.AlongM
-                    if problem_blocks_n > problem_blocks_m
-                    else RasterOrder.AlongN
-                )
             ncluster_fast = (
                 problem_shape_ncluster_mn[0]
                 if raster_order == RasterOrder.AlongM
@@ -262,7 +270,7 @@ class StaticTileScheduler:
         ):
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
-        return StaticTileScheduler(*(tuple(obj_list)), loc=self._loc)
+        return self.__class__(*(tuple(obj_list)), loc=self._loc)
 
 
 @cute.jit
@@ -276,7 +284,7 @@ def triangular_idx_to_coord(idx: Int32) -> Tuple[Int32, Int32]:
     return row, col
 
 
-class TriangularStaticTileScheduler:
+class TriangularStaticTileScheduler(StaticTileScheduler):
     """We assume the tile size per cluster is square (e.g., 128 x 256 per CTA, with cluster 2 x 1)"""
 
     @dataclass
@@ -323,21 +331,6 @@ class TriangularStaticTileScheduler:
                 cluster_shape_mn,
                 args.is_persistent,
             )
-
-    def __init__(
-        self,
-        current_work_linear_idx: Int32,
-        num_tiles_executed: Int32,
-        params: Params,
-        *,
-        loc=None,
-        ip=None,
-    ):
-        self._current_work_linear_idx = current_work_linear_idx
-        self._num_tiles_executed = num_tiles_executed
-        self.params = params
-        self._loc = loc
-        self._ip = ip
 
     @staticmethod
     def to_underlying_arguments(args: TileSchedulerArguments, *, loc=None, ip=None) -> Params:
@@ -412,18 +405,14 @@ class TriangularStaticTileScheduler:
             if group_id < params.num_groups_regular
             else params.group_size_tail_divmod.divisor
         )
-        group_col, group_remainder, cid_m_in_group, cid_n_in_group = (
-            Int32(0),
-            Int32(0),
-            Int32(0),
-            Int32(0),
-        )
+        group_col, group_remainder = Int32(0), Int32(0)
         if group_id < params.num_groups_regular:
             group_col, group_remainder = params.group_size_mul_group_size_divmod.divmod(id_in_group)
         else:  # tail part
             group_col, group_remainder = params.group_size_tail_mul_group_size_divmod.divmod(
                 id_in_group
             )
+        cid_m_in_group, cid_n_in_group = Int32(0), Int32(0)
         if id_in_group >= group_size_actual * group_size * group_id:  # triangular tail
             cid_m_in_group, cid_n_in_group = triangular_idx_to_coord(group_remainder)
         else:
@@ -455,45 +444,3 @@ class TriangularStaticTileScheduler:
         #     cute.printf("bidx = {}, bidy = {}, group_id = {}, id_in_group = {}, group_size_actual = {}, group_col = {}, group_remainder = {}, cid_n_in_group = {}, cid_m_in_group = {}, cid_m = {}, cid_n = {}, is_valid = {}",
         #                 bidx, bidy, group_id, id_in_group, group_size_actual, group_col, group_remainder, cid_n_in_group, cid_m_in_group, cid_m, cid_n, is_valid)
         return cutlass.utils.WorkTileInfo(tile_coord_mnkl, is_valid)
-
-    def initial_work_tile_info(self, *, loc=None, ip=None):
-        return self.get_current_work(loc=loc, ip=ip)
-
-    def prefetch_next_work(self, *, loc=None, ip=None):
-        pass
-
-    def advance_to_next_work(self, *, advance_count: int = 1, loc=None, ip=None):
-        if cutlass.const_expr(self.params.is_persistent):
-            num_persistent_clusters = cute.arch.grid_dim()[2]
-            self._current_work_linear_idx += advance_count * Int32(num_persistent_clusters)
-        self._num_tiles_executed += Int32(advance_count)
-
-    @property
-    def num_tiles_executed(self) -> Int32:
-        return self._num_tiles_executed
-
-    def __extract_mlir_values__(self):
-        values, self._values_pos = [], []
-        for obj in [
-            self._current_work_linear_idx,
-            self._num_tiles_executed,
-            self.params,
-        ]:
-            obj_values = cutlass.extract_mlir_values(obj)
-            values += obj_values
-            self._values_pos.append(len(obj_values))
-        return values
-
-    def __new_from_mlir_values__(self, values):
-        obj_list = []
-        for obj, n_items in zip(
-            [
-                self._current_work_linear_idx,
-                self._num_tiles_executed,
-                self.params,
-            ],
-            self._values_pos,
-        ):
-            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
-            values = values[n_items:]
-        return TriangularStaticTileScheduler(*(tuple(obj_list)), loc=self._loc)

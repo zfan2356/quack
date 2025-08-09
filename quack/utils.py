@@ -555,6 +555,19 @@ def coord_offset_i64(
     return cute.make_tensor(new_ptr, tensor.layout)
 
 
+@cute.jit
+def warp_prefix_sum(val: cutlass.Int32, lane: Optional[cutlass.Int32] = None) -> cutlass.Int32:
+    if cutlass.const_expr(lane is None):
+        lane = cute.arch.lane_idx()
+    for i in cutlass.range_constexpr(int(math.log2(cute.arch.WARP_SIZE))):
+        offset = 1 << i
+        # Very important that we set mask_and_clamp to 0
+        partial_sum = cute.arch.shuffle_sync_up(val, offset=offset, mask_and_clamp=0)
+        if lane >= offset:
+            val += partial_sum
+    return val
+
+
 def convert_layout_acc_mn(acc_layout: cute.Layout) -> cute.Layout:
     """
     For Sm80, convert ((2, 2), MMA_M, MMA_N, ...) to ((2, MMA_M), (2, MMA_N), ...).
