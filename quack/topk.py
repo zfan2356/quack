@@ -119,9 +119,9 @@ class TopK:
         for i in cutlass.range(cute.size(tXrX_u32), unroll_full=True):
             # tXcX only keeps track of the indices for every @vecsize elements
             col_idx = cutlass.Uint32(tXcX[i // vecsize][1] + i % vecsize)
-            # If negative, invert the bits of the index, so that if there's a tie,
+            # If positive, invert the bits of the index, so that if there's a tie,
             # indices coming from a earlier column will win.
-            encoded_idx = ~col_idx if tXrX_f32[i] < 0 else col_idx
+            encoded_idx = ~col_idx if tXrX_f32[i] >= 0 else col_idx
             # Mask to keep only the last log_N bits of the encoded index
             encoded_idx = encoded_idx & idx_mask
             # Clear the last log_N bits and set them to our encoded index
@@ -139,10 +139,10 @@ class TopK:
         for i in cutlass.range(self.k):
             # Extract the encoded index from the last log_N bits
             encoded_idx = topk_vals_u32[i] & idx_mask
-            # Check if original value was negative by looking at the cleaned value
+            # Check if original value was positive by looking at the cleaned value
             topk_vals_u32[i] = topk_vals_u32[i] & ~idx_mask  # Clear last log_N bits
-            # If negative, we need to invert the bits back to get original index
-            col_idx = ~encoded_idx if topk_vals[i] < 0 else encoded_idx
+            # If positive, we need to invert the bits back to get original index
+            col_idx = ~encoded_idx if topk_vals[i] >= 0 else encoded_idx
             topk_indices[i] = cutlass.Int32(col_idx & idx_mask)
 
         # Convert cleaned values to output type

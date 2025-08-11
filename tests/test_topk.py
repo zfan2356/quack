@@ -95,29 +95,3 @@ def test_topk(M, N, k, input_dtype):
 #     torch.testing.assert_close(out_neg, out_ref_neg, atol=1e-6, rtol=1e-6)
 
 
-# def test_topk_properties():
-#     """Test mathematical properties of TopK."""
-#     device = "cuda"
-#     M, N, k = 16, 128, 16
-
-#     torch.random.manual_seed(42)
-#     x = torch.randn(M, N, device=device, dtype=torch.float32)
-#     out_val = topk(x, k)
-
-#     # Property 1: Maximum element should be the first element of top-k
-#     x_max = torch.max(x, dim=-1)[0]
-#     out_max = out_val[:, 0]
-#     torch.testing.assert_close(out_max, x_max, atol=1e-6, rtol=1e-6)
-
-#     # Property 2: All elements in top-k should be >= minimum of top-k
-#     min_topk = out_val[:, -1:]  # Last element (minimum of top-k)
-#     assert torch.all(out_val >= min_topk)
-
-#     # Property 3: No element outside top-k should be larger than minimum of top-k
-#     # This is harder to test without indices, but we can check that there are at most
-#     # N-k elements in x that are smaller than the minimum of top-k
-#     for i in range(M):
-#         min_val = out_val[i, -1]  # minimum in top-k
-#         smaller_count = torch.sum(x[i] < min_val)
-#         # Allow for equality cases due to floating point precision
-#         assert smaller_count >= N - k - k, f"Too few elements smaller than top-k minimum in row {i}"
