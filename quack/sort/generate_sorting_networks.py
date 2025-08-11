@@ -239,7 +239,7 @@ def generate_sorting_networks_file(max_size: int = 64):
     output_file = os.path.join(os.path.dirname(__file__), "sorting_networks.py")
 
     # Header
-    header = '''# Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
+    header = '''# Copyright (c) 2025, Wentao Guo, Mayank Mishra, Tri Dao.
 """
 Optimal sorting networks generated from: https://bertdobbelaere.github.io/sorting_networks.html
 

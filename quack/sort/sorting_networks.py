@@ -1,4 +1,4 @@
-# Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
+# Copyright (c) 2025, Wentao Guo, Mayank Mishra, Tri Dao.
 """
 Optimal sorting networks generated from: https://bertdobbelaere.github.io/sorting_networks.html
 
