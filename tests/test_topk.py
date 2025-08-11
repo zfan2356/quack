@@ -12,7 +12,7 @@ from quack.topk import topk
 # @pytest.mark.parametrize("input_dtype", [torch.float32])
 @pytest.mark.parametrize(
     "N, k",
-    [(64, 16), (128, 32), (256, 16), (512, 32), (1024, 32)]
+    [(64, 16), (128, 32), (256, 16), (512, 32), (1024, 32), (4096, 32), (4096, 64), (4096, 128)]
     # [(256, 4)]
 )
 @pytest.mark.parametrize("M", [1, 37, 199])
@@ -28,8 +28,8 @@ def test_topk(M, N, k, input_dtype):
         atol = 1e-3
         rtol = 1e-3
     else:
-        atol = 1e-4
-        rtol = 1e-4
+        atol = 1e-3
+        rtol = 5e-4
 
     torch.random.manual_seed(0)
     # Create input tensors

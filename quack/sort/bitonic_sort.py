@@ -76,7 +76,7 @@ def bitonic_topk_merge(
         k = cute.size(arr0.shape)
     minmax_fn = cute.arch.fmin if ascending else cute.arch.fmax
     # Write the top k elements to the first half of the array
-    for i in cutlass.range_constexpr(k):
+    for i in cutlass.range(k, unfoll_full=True):
         arr0[start0 + i] = minmax_fn(arr0[start0 + i], arr1[start1 + k - 1 - i])
     # Now the 1st half is bitonic, we just need to merge it
     bitonic_merge(arr0, k, start0, ascending)
@@ -91,7 +91,6 @@ def bitonic_topk(
 ) -> cute.Tensor:
     """
     Bitonic top-k for small arrays of size N (power of 2, N <= 128).
-    Top-k elements are written to the first k elements of the array.
 
     Args:
         arr: Array to sort

@@ -24,8 +24,8 @@ class TopK:
         self.k = k
         assert N == 2 ** int(math.log2(N)), "N must be a power of 2"
         assert k == 2 ** int(math.log2(k)), "N must be a power of 2"
-        assert k <= 64
-        assert N <= 2048
+        assert k <= 128
+        assert N <= 4096
 
     def _calculate_threads_per_row(self):
         # we want num_elems_per_thread >= self.k
