@@ -6,6 +6,7 @@ from typing import Optional
 import cutlass
 import cutlass.cute as cute
 
+import quack.utils as utils
 from quack.sort.utils import compare_and_swap
 from quack.sort.sorting_networks import optimal_sort
 
@@ -75,7 +76,7 @@ def bitonic_topk_merge(
     if cutlass.const_expr(k is None):
         k = cute.size(arr0.shape)
     if cutlass.const_expr(arr0.element_type == cutlass.Float32):
-        minmax_fn = cute.arch.fmin if ascending else cute.arch.fmax
+        minmax_fn = utils.fmin if ascending else cute.arch.fmax
     else:
         minmax_fn = min if ascending else max
     # Write the top k elements to the first half of the array

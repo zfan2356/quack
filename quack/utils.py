@@ -2,14 +2,14 @@
 
 import operator
 import math
-from typing import Callable, Optional, Tuple, Type
+from typing import Callable, Optional, Tuple, Type, Union
 
 import cutlass
 import cutlass.cute as cute
 
 from cutlass import Float32, Int32
 from cutlass.cutlass_dsl import T, dsl_user_op
-from cutlass._mlir.dialects import llvm, vector
+from cutlass._mlir.dialects import llvm, nvvm, vector
 from cutlass.cute.runtime import from_dlpack
 
 
@@ -302,6 +302,19 @@ def online_softmax_reduce(
                     exp_x *= exp2f((max_x - max_x_final) * log2_e)
                 max_x = max_x_final
     return max_x, sum_exp_x, (exp_x if cutlass.const_expr(return_exp_x) else None)
+
+
+@dsl_user_op
+def fmin(a: Union[float, Float32], b: Union[float, Float32], *, loc=None, ip=None) -> Float32:
+    return Float32(
+        nvvm.fmin(
+            T.f32(),
+            Float32(a).ir_value(loc=loc, ip=ip),
+            Float32(b).ir_value(loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @cute.jit

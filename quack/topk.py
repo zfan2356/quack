@@ -152,9 +152,18 @@ class TopK:
         row = tXcX[0][0]
         # Only the 1st thread in this row writes the top-k values and indices
         if row < shape[0] and tXcX[0][1] == 0:
-            for i in cutlass.range(self.k):
-                mValues[row, i] = topk_vals_out[i]
-                mIndices[row, i] = topk_indices[i]
+            # for i in cutlass.range(self.k):
+            #     mValues[row, i] = topk_vals_out[i]
+            #     mIndices[row, i] = topk_indices[i]
+            # Vectorized write
+            elems_per_store = const_expr(math.gcd(vecsize, self.k))
+            mValues_store = cute.tiled_divide(mValues[row, None], (elems_per_store,))
+            mIndices_store = cute.tiled_divide(mIndices[row, None], (elems_per_store,))
+            topk_vals_out_store = cute.tiled_divide(topk_vals_out, (elems_per_store,))
+            topk_indices_store = cute.tiled_divide(topk_indices, (elems_per_store,))
+            for i in cutlass.range(cute.size(topk_vals_out_store.shape, [1]), unroll_full=True):
+                cute.autovec_copy(topk_vals_out_store[None, i], mValues_store[None, i])
+                cute.autovec_copy(topk_indices_store[None, i], mIndices_store[None, i])
 
 
 def _topk_fwd(x: torch.Tensor, k: int):
