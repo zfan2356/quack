@@ -1,12 +1,12 @@
 # Copyright (c) 2025, Tri Dao.
 
-from typing import Tuple
+from typing import Tuple, Optional
 from dataclasses import dataclass, fields
 from enum import IntEnum
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32
+from cutlass import Int32, const_expr
 
 from quack.fast_math import FastDivmod
 import quack.utils as utils
@@ -93,7 +93,7 @@ class StaticTileScheduler:
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "StaticTileScheduler.Params":
             assert args.cluster_shape_mnk[2] == 1
-            cluster_shape_mn = cutlass.const_expr(cute.select(args.cluster_shape_mnk, mode=[0, 1]))
+            cluster_shape_mn = const_expr(cute.select(args.cluster_shape_mnk, mode=[0, 1]))
             problem_shape_ntile_mn = cute.select(args.problem_shape_ntile_mnl, mode=[0, 1])
             problem_shape_ncluster_mn = cute.ceil_div(problem_shape_ntile_mn, cluster_shape_mn)
             problem_shape_ncluster_mnl = problem_shape_ncluster_mn + (
@@ -151,7 +151,7 @@ class StaticTileScheduler:
 
     @staticmethod
     def create(params: Params, *, loc=None, ip=None) -> "StaticTileScheduler":
-        if cutlass.const_expr(not params.is_persistent):
+        if const_expr(not params.is_persistent):
             cidx, cidy, _ = cute.arch.cluster_idx()
             cdimx, _, _ = cute.arch.cluster_dim()
             cluster_id = cidx + cidy * cdimx
@@ -179,7 +179,7 @@ class StaticTileScheduler:
         num_ctas_mnl = tuple(
             x * y for x, y in zip(params.problem_shape_ncluster_mnl, params.cluster_shape_mn)
         ) + (params.problem_shape_ncluster_mnl[2],)
-        if cutlass.const_expr(not params.is_persistent):
+        if const_expr(not params.is_persistent):
             return num_ctas_mnl
         else:
             num_ctas_in_problem = cute.size(num_ctas_mnl, loc=loc, ip=ip)
@@ -193,7 +193,7 @@ class StaticTileScheduler:
     @cute.jit
     def get_current_work(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:
         params = self.params
-        if cutlass.const_expr(not params.is_persistent):
+        if const_expr(not params.is_persistent):
             cluster_id_in_problem = self._current_work_linear_idx
             _, _, bidz = cute.arch.block_idx()
         else:
@@ -224,7 +224,7 @@ class StaticTileScheduler:
         pid_m = cid_m * params.cluster_shape_mn[0] + bidx_in_cluster[0]
         pid_n = cid_n * params.cluster_shape_mn[1] + bidx_in_cluster[1]
         tile_coord_mnkl = (pid_m, pid_n, None, bidz)
-        if cutlass.const_expr(not params.is_persistent):
+        if const_expr(not params.is_persistent):
             is_valid = self._num_tiles_executed == 0
         else:
             is_valid = self._current_work_linear_idx < cute.size(params.problem_shape_ncluster_mnl)
@@ -237,7 +237,7 @@ class StaticTileScheduler:
         pass
 
     def advance_to_next_work(self, *, advance_count: int = 1, loc=None, ip=None):
-        if cutlass.const_expr(self.params.is_persistent):
+        if const_expr(self.params.is_persistent):
             num_persistent_clusters = cute.arch.grid_dim()[2]
             self._current_work_linear_idx += advance_count * Int32(num_persistent_clusters)
         self._num_tiles_executed += Int32(advance_count)
@@ -306,7 +306,7 @@ class TriangularStaticTileScheduler(StaticTileScheduler):
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "TriangularStaticTileScheduler.Params":
             assert args.cluster_shape_mnk[2] == 1
-            cluster_shape_mn = cutlass.const_expr(cute.select(args.cluster_shape_mnk, mode=[0, 1]))
+            cluster_shape_mn = const_expr(cute.select(args.cluster_shape_mnk, mode=[0, 1]))
             problem_shape_ntile_mn = cute.select(args.problem_shape_ntile_mnl, mode=[0, 1])
             problem_shape_ncluster_mn = cute.ceil_div(problem_shape_ntile_mn, cluster_shape_mn)
             problem_shape_ncluster_mnl = problem_shape_ncluster_mn + (
@@ -338,7 +338,7 @@ class TriangularStaticTileScheduler(StaticTileScheduler):
 
     @staticmethod
     def create(params: Params, *, loc=None, ip=None) -> "TriangularStaticTileScheduler":
-        if cutlass.const_expr(not params.is_persistent):
+        if const_expr(not params.is_persistent):
             cluster_id, _, _ = cute.arch.cluster_idx()
             current_work_linear_idx = Int32(cluster_id)
         else:
@@ -369,7 +369,7 @@ class TriangularStaticTileScheduler(StaticTileScheduler):
         num_ctas_mnl = tuple(x * y for x, y in zip(clusters, params.cluster_shape_mn)) + (
             params.problem_shape_ncluster_mnl[2],
         )
-        if cutlass.const_expr(not params.is_persistent):
+        if const_expr(not params.is_persistent):
             return num_ctas_mnl
         else:
             num_ctas_in_problem = cute.size(num_ctas_mnl, loc=loc, ip=ip)
@@ -383,7 +383,7 @@ class TriangularStaticTileScheduler(StaticTileScheduler):
     @cute.jit
     def get_current_work(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:
         params = self.params
-        if cutlass.const_expr(not params.is_persistent):
+        if const_expr(not params.is_persistent):
             cluster_id_in_problem = self._current_work_linear_idx
             _, _, bidz = cute.arch.block_idx()
         else:
@@ -430,7 +430,7 @@ class TriangularStaticTileScheduler(StaticTileScheduler):
         pid_m = cid_m * params.cluster_shape_mn[0] + bidx_in_cluster[0]
         pid_n = cid_n * params.cluster_shape_mn[1] + bidx_in_cluster[1]
         tile_coord_mnkl = (pid_m, pid_n, None, bidz)
-        if cutlass.const_expr(not params.is_persistent):
+        if const_expr(not params.is_persistent):
             is_valid = self._num_tiles_executed == 0
         else:
             is_valid = (
@@ -444,3 +444,293 @@ class TriangularStaticTileScheduler(StaticTileScheduler):
         #     cute.printf("bidx = {}, bidy = {}, group_id = {}, id_in_group = {}, group_size_actual = {}, group_col = {}, group_remainder = {}, cid_n_in_group = {}, cid_m_in_group = {}, cid_m = {}, cid_n = {}, is_valid = {}",
         #                 bidx, bidy, group_id, id_in_group, group_size_actual, group_col, group_remainder, cid_n_in_group, cid_m_in_group, cid_m, cid_n, is_valid)
         return cutlass.utils.WorkTileInfo(tile_coord_mnkl, is_valid)
+
+
+@dataclass
+class VarlenMTileSchedulerArguments(ParamsBase):
+    problem_shape_ntile_mnl: cute.Shape
+    total_m: Int32
+    cu_seqlens_m: cute.Tensor
+    raster_order: cutlass.Constexpr[RasterOrderOption]
+    group_size: Int32
+    tile_shape_mnk: cutlass.Constexpr[cute.Shape]
+    cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
+    is_persistent: cutlass.Constexpr[bool] = False
+
+
+class VarlenMStaticTileScheduler(StaticTileScheduler):
+    @dataclass
+    class Params(ParamsBase):
+        problem_shape_ncluster_mnl: cute.Shape
+        total_m: Int32
+        cu_seqlens_m: cute.Tensor
+        raster_order: cutlass.Constexpr[RasterOrder]
+        group_size: Int32
+        group_size_divmod: Optional[FastDivmod]
+        group_size_tail_divmod: Optional[FastDivmod]
+        num_clusters_in_group_divmod: FastDivmod
+        tile_shape_mn: cutlass.Constexpr[cute.Shape]
+        cluster_shape_mn: cutlass.Constexpr[cute.Shape]
+        is_persistent: cutlass.Constexpr[bool]
+
+        @staticmethod
+        @cute.jit
+        def create(
+            args: TileSchedulerArguments, *, loc=None, ip=None
+        ) -> "VarlenMStaticTileScheduler.Params":
+            assert args.cluster_shape_mnk[2] == 1
+            cluster_shape_mn = const_expr(cute.select(args.cluster_shape_mnk, mode=[0, 1]))
+            tile_shape_mn = const_expr(cute.select(args.tile_shape_mnk, mode=[0, 1]))
+            # problem_shape_ntile_mnl[0] will be None for VarlenM
+            problem_shape_ntile_mn = cute.select(args.problem_shape_ntile_mnl, mode=[0, 1])
+            problem_shape_ncluster_mn = (
+                None,
+                cute.ceil_div(problem_shape_ntile_mn[1], cluster_shape_mn[1]),
+            )
+            problem_shape_ncluster_mnl = problem_shape_ncluster_mn + (
+                args.problem_shape_ntile_mnl[2],
+            )
+            raster_order = const_expr(
+                RasterOrder.AlongM
+                if args.raster_order == RasterOrderOption.AlongM
+                else RasterOrder.AlongN  # For Heuristic we also use AlongN
+            )
+            ncluster_fast = (
+                problem_shape_ncluster_mn[0]
+                if raster_order == RasterOrder.AlongM
+                else problem_shape_ncluster_mn[1]
+            )
+            ncluster_slow = (
+                problem_shape_ncluster_mn[1]
+                if raster_order == RasterOrder.AlongM
+                else problem_shape_ncluster_mn[0]
+            )
+            if const_expr(ncluster_fast is not None):
+                group_size = min(args.group_size, ncluster_fast)
+                group_size_tail = ncluster_fast % group_size
+            else:
+                group_size, group_size_tail = args.group_size, None
+            if const_expr(ncluster_slow is not None):
+                num_clusters_in_group = group_size * ncluster_slow
+            else:
+                num_clusters_in_group = None
+            return VarlenMStaticTileScheduler.Params(
+                problem_shape_ncluster_mnl,
+                args.total_m,
+                args.cu_seqlens_m,
+                raster_order,
+                group_size,
+                FastDivmod.create(group_size) if ncluster_fast is not None else None,
+                # Don't divide by 0
+                FastDivmod.create(group_size_tail if group_size_tail > 0 else 1)
+                if group_size_tail is not None
+                else None,
+                FastDivmod.create(num_clusters_in_group)
+                if num_clusters_in_group is not None
+                else None,
+                tile_shape_mn,
+                cluster_shape_mn,
+                args.is_persistent,
+            )
+
+    def __init__(
+        self,
+        current_work_linear_idx: Int32,
+        num_tiles_executed: Int32,
+        params: Params,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        self._current_work_linear_idx = current_work_linear_idx
+        self._num_tiles_executed = num_tiles_executed
+        self.params = params
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    def to_underlying_arguments(args: TileSchedulerArguments, *, loc=None, ip=None) -> Params:
+        return VarlenMStaticTileScheduler.Params.create(args, loc=loc, ip=ip)
+
+    @staticmethod
+    def create(params: Params, *, loc=None, ip=None) -> "VarlenMStaticTileScheduler":
+        assert not params.is_persistent, "VarlenMStaticTileScheduler is not persistent yet"
+        _, _, bidz = cute.arch.block_idx()
+        current_work_linear_idx = Int32(bidz)
+        return VarlenMStaticTileScheduler(
+            current_work_linear_idx,
+            Int32(0),  # num_tiles_executed
+            params,
+            loc=loc,
+            ip=ip,
+        )
+
+    # called by host
+    @staticmethod
+    def get_grid_shape(
+        params: Params,
+        max_active_clusters: Int32,
+        *,
+        loc=None,
+        ip=None,
+    ) -> Tuple[Int32, Int32, Int32]:
+        block_size = params.tile_shape_mn[0] * params.cluster_shape_mn[0]
+        num_batch = params.problem_shape_ncluster_mnl[2]
+        total_clusters_m_max = (params.total_m + num_batch * (block_size - 1)) // block_size
+        total_clusters_max = total_clusters_m_max * params.problem_shape_ncluster_mnl[1]
+        if const_expr(not params.is_persistent):
+            return (*params.cluster_shape_mn, total_clusters_max)
+        else:
+            num_persistent_clusters = cutlass.min(max_active_clusters, total_clusters_max)
+            return (*params.cluster_shape_mn, num_persistent_clusters)
+
+    @cute.jit
+    def _get_num_m_blocks(
+        self, lane: Int32, bidb_start: Int32, block_size: cutlass.Constexpr[int]
+    ) -> Int32:
+        num_batch = self.params.problem_shape_ncluster_mnl[2]
+        batch_idx = lane + bidb_start
+        cur_cu_seqlen = Int32(0)
+        if batch_idx <= num_batch:
+            cur_cu_seqlen = self.params.cu_seqlens_m[batch_idx]
+        next_cu_seqlen = cute.arch.shuffle_sync_down(cur_cu_seqlen, offset=1)
+        seqlen = next_cu_seqlen - cur_cu_seqlen
+        return (
+            cute.ceil_div(seqlen, block_size)
+            if batch_idx < num_batch and lane < cute.arch.WARP_SIZE - 1
+            else Int32(0)
+        )
+
+    @cute.jit
+    def get_current_work(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:
+        params = self.params
+        lane_idx = cute.arch.lane_idx()
+        num_batch = self.params.problem_shape_ncluster_mnl[2]
+        block_size = params.tile_shape_mn[0] * params.cluster_shape_mn[0]
+        num_clusters_m = self._get_num_m_blocks(lane_idx, bidb_start=0, block_size=block_size)
+        num_clusters = num_clusters_m * params.problem_shape_ncluster_mnl[1]
+        num_clusters_cumulative = utils.warp_prefix_sum(num_clusters, lane_idx)
+        # Total number of blocks for the next 31 problems, same for all lanes
+        clusters_in_problems = cute.arch.shuffle_sync(
+            num_clusters_cumulative, cute.arch.WARP_SIZE - 1
+        )
+        problems_end_tile = clusters_in_problems
+        # if cute.arch.thread_idx()[0] == 128 + 31: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, problems_end_tile = %d, num_clusters_m=%d, num_clusters_cumulative = %d, problems_end_tile = %d", self._tile_idx, problems_end_tile, num_clusters_m, num_clusters_cumulative, problems_end_tile)
+        cid_m, cid_n, batch_idx = Int32(0), Int32(0), Int32(0)
+        next_tile_idx = self._current_work_linear_idx
+        while problems_end_tile <= next_tile_idx:
+            batch_idx += cute.arch.WARP_SIZE - 1
+            if batch_idx >= num_batch:
+                batch_idx = Int32(num_batch)
+                problems_end_tile = next_tile_idx + 1
+            else:
+                num_clusters_m = self._get_num_m_blocks(
+                    lane_idx, bidb_start=batch_idx, block_size=block_size
+                )
+                num_clusters = num_clusters_m * params.problem_shape_ncluster_mnl[1]
+                num_clusters_cumulative = utils.warp_prefix_sum(num_clusters, lane_idx)
+                clusters_in_problems = cute.arch.shuffle_sync(
+                    num_clusters_cumulative, cute.arch.WARP_SIZE - 1
+                )
+                problems_end_tile += clusters_in_problems
+        if batch_idx >= num_batch:
+            cid_m, cid_n, batch_idx = Int32(0), Int32(0), Int32(num_batch)
+        else:
+            problems_start_tile = problems_end_tile - clusters_in_problems
+            # if cute.arch.thread_idx()[0] == 128 + 31: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, problems_end_tile = %d, num_clusters_m=%d, batch_idx = %d", self._tile_idx, problems_end_tile, num_clusters_m, batch_idx)
+            # The next problem to process is the first one that does not have ending tile position
+            # that is greater than or equal to tile index.
+            batch_idx_in_problems = cute.arch.popc(
+                cute.arch.vote_ballot_sync(
+                    problems_start_tile + num_clusters_cumulative <= next_tile_idx
+                )
+            )
+            batch_idx += batch_idx_in_problems
+            num_clusters_prev_lane = (
+                0
+                if batch_idx_in_problems == 0
+                else cute.arch.shuffle_sync(num_clusters_cumulative, batch_idx_in_problems - 1)
+            )
+            num_clusters_m = cute.arch.shuffle_sync(num_clusters_m, batch_idx_in_problems)
+            num_clusters = num_clusters_m * params.problem_shape_ncluster_mnl[1]
+            cluster_id_in_problem = next_tile_idx - problems_start_tile - num_clusters_prev_lane
+            # cid_n = cluster_id_in_problem // num_clusters_m
+            # cid_m = cluster_id_in_problem - cid_n * num_clusters_m
+            # if cute.arch.thread_idx()[0] == 128: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, batch_idx=%d, cid_n=%d, cid_m=%d, is_valid = %d", self._tile_idx, batch_idx, cid_n, cid_m, is_valid)
+            # CTA Swizzle to promote L2 data reuse
+            if const_expr(params.num_clusters_in_group_divmod is not None):
+                group_id, id_in_group = params.num_clusters_in_group_divmod.divmod(
+                    cluster_id_in_problem
+                )
+                num_clusters_in_group = params.num_clusters_in_group_divmod.divisor
+            else:
+                assert params.raster_order == RasterOrder.AlongN
+                num_clusters_in_group = params.group_size * num_clusters_m
+                group_id = cluster_id_in_problem // num_clusters_in_group
+                id_in_group = cluster_id_in_problem - group_id * num_clusters_in_group
+            cid_fast_in_group, cid_slow = Int32(0), Int32(0)
+            if const_expr(
+                params.group_size_divmod is not None and params.group_size_tail_divmod is not None
+            ):
+                if (group_id + 1) * num_clusters_in_group <= num_clusters:
+                    cid_slow, cid_fast_in_group = params.group_size_divmod.divmod(id_in_group)
+                else:  # tail part
+                    cid_slow, cid_fast_in_group = params.group_size_tail_divmod.divmod(id_in_group)
+            else:
+                assert params.raster_order == RasterOrder.AlongM
+                group_size_actual = cutlass.min(
+                    params.group_size, num_clusters_m - group_id * params.group_size
+                )
+                cid_slow = id_in_group // group_size_actual
+                cid_fast_in_group = id_in_group - cid_slow * group_size_actual
+            if group_id % 2 == 1:  # serpentine order
+                ncluster_slow = (
+                    params.problem_shape_ncluster_mnl[1]
+                    if params.raster_order == RasterOrder.AlongM
+                    else num_clusters_m
+                )
+                cid_slow = ncluster_slow - 1 - cid_slow
+            cid_fast = group_id * params.group_size + cid_fast_in_group
+            cid_m, cid_n = cid_fast, cid_slow
+            if params.raster_order == RasterOrder.AlongN:
+                cid_m, cid_n = cid_slow, cid_fast
+
+        # Get the pid from cluster id
+        bidx_in_cluster = cute.arch.block_in_cluster_idx()
+        pid_m = cid_m * params.cluster_shape_mn[0] + bidx_in_cluster[0]
+        pid_n = cid_n * params.cluster_shape_mn[1] + bidx_in_cluster[1]
+        tile_coord_mnkl = (pid_m, pid_n, None, batch_idx)
+        if const_expr(not params.is_persistent):
+            is_valid = self._num_tiles_executed == 0 and batch_idx < num_batch
+        else:
+            is_valid = batch_idx < num_batch
+        return cutlass.utils.WorkTileInfo(tile_coord_mnkl, is_valid)
+
+    # def initial_work_tile_info(self, *, loc=None, ip=None):
+    #     return self.get_current_work(loc=loc, ip=ip)
+
+    # def __extract_mlir_values__(self):
+    #     values, self._values_pos = [], []
+    #     for obj in [
+    #         self._current_work_linear_idx,
+    #         self._num_tiles_executed,
+    #         self.params,
+    #     ]:
+    #         obj_values = cutlass.extract_mlir_values(obj)
+    #         values += obj_values
+    #         self._values_pos.append(len(obj_values))
+    #     return values
+
+    # def __new_from_mlir_values__(self, values):
+    #     obj_list = []
+    #     for obj, n_items in zip(
+    #         [
+    #             self._current_work_linear_idx,
+    #             self._num_tiles_executed,
+    #             self.params,
+    #         ],
+    #         self._values_pos,
+    #     ):
+    #         obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+    #         values = values[n_items:]
+    #     return self.__class__(*(tuple(obj_list)), loc=self._loc)

@@ -48,6 +48,8 @@ from cutlass import Int32, const_expr
 from quack.tile_scheduler import (
     TileSchedulerArguments,
     StaticTileScheduler,
+    VarlenMTileSchedulerArguments,
+    VarlenMStaticTileScheduler,
     ParamsBase,
     RasterOrderOption,
 )
@@ -191,6 +193,7 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--persistent", action="store_true", help="Persistent kernel")
     parser.add_argument("--pingpong", action="store_true", help="Pingpong kernel")
+    parser.add_argument("--varlen_m", action="store_true", help="Variable length M dimension")
     parser.add_argument("--fp8_fast_accum", action="store_true", help="FP8 fast accum")
     parser.add_argument("--skip_ref_check", action="store_true", help="Skip reference checking")
 
@@ -450,6 +453,7 @@ class HopperWgmmaGemmKernel:
         mB: cute.Tensor,
         mD: cute.Tensor,
         mC: Optional[cute.Tensor],
+        mCuSeqlensM: Optional[cute.Tensor],
         max_active_clusters: Int32,
         stream: cuda.CUstream,
     ):
@@ -542,17 +546,35 @@ class HopperWgmmaGemmKernel:
         else:
             tma_atom_c, tma_tensor_c = None, None
 
-        problem_shape_ntile_mnl = cute.ceil_div(mD.shape[:2], self.tile_shape_mnk[:2]) + (
-            mD.shape[2],
-        )
-        TileScheduler = StaticTileScheduler
-        tile_sched_args = TileSchedulerArguments(
-            problem_shape_ntile_mnl=problem_shape_ntile_mnl,
-            raster_order=RasterOrderOption.Heuristic,
-            group_size=8,
-            cluster_shape_mnk=self.cluster_shape_mnk,
-            is_persistent=self.is_persistent,
-        )
+        if const_expr(mCuSeqlensM is None):
+            problem_shape_ntile_mnl = cute.ceil_div(mD.shape[:2], self.tile_shape_mnk[:2]) + (
+                mD.shape[2],
+            )
+            TileScheduler = StaticTileScheduler
+            tile_sched_args = TileSchedulerArguments(
+                problem_shape_ntile_mnl=problem_shape_ntile_mnl,
+                raster_order=RasterOrderOption.Heuristic,
+                group_size=8,
+                cluster_shape_mnk=self.cluster_shape_mnk,
+                is_persistent=self.is_persistent,
+            )
+        else:
+            problem_shape_ntile_mnl = (
+                None,
+                cute.ceil_div(mD.shape[1], self.tile_shape_mnk[1]),
+                mCuSeqlensM.shape[0] - 1,
+            )
+            TileScheduler = VarlenMStaticTileScheduler
+            tile_sched_args = VarlenMTileSchedulerArguments(
+                problem_shape_ntile_mnl=problem_shape_ntile_mnl,
+                total_m=mD.shape[0],
+                cu_seqlens_m=mCuSeqlensM,
+                raster_order=RasterOrderOption.Heuristic,
+                group_size=8,
+                tile_shape_mnk=self.tile_shape_mnk,
+                cluster_shape_mnk=self.cluster_shape_mnk,
+                is_persistent=self.is_persistent,
+            )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid = TileScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
 
@@ -594,6 +616,7 @@ class HopperWgmmaGemmKernel:
             tma_tensor_d,
             tma_atom_c,
             tma_tensor_c,
+            mCuSeqlensM,
             tiled_mma,
             self.cluster_layout_mnk,
             self.a_smem_layout_staged,
@@ -624,6 +647,7 @@ class HopperWgmmaGemmKernel:
         mD_mnl: cute.Tensor,
         tma_atom_c: Optional[cute.CopyAtom],
         mC_mnl: Optional[cute.Tensor],
+        cu_seqlens_m: Optional[cute.Tensor],
         tiled_mma: cute.TiledMma,
         cluster_layout_mnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -778,64 +802,6 @@ class HopperWgmmaGemmKernel:
                 )
                 a_mcast_mask = a_mcast_mask if self.is_a_mcast else 0
                 b_mcast_mask = b_mcast_mask if self.is_b_mcast else 0
-                # ///////////////////////////////////////////////////////////////////////////
-                #  Local_tile partition global tensors
-                # ///////////////////////////////////////////////////////////////////////////
-                # (bM, bK, RestM, RestK, RestL)
-                gA_mkl = cute.local_tile(
-                    mA_mkl, cute.select(self.tile_shape_mnk, [0, 2]), (None, None, None)
-                )
-                # (bN, bK, RestN, RestK, RestL)
-                gB_nkl = cute.local_tile(
-                    mB_nkl, cute.select(self.tile_shape_mnk, [1, 2]), (None, None, None)
-                )
-                # //////////////////////////////////////////////////////////////////////////
-                #  Partition shared tensor for TMA load A/B
-                # //////////////////////////////////////////////////////////////////////////
-                #  TMA load A partition_S/D
-                a_cta_layout = cute.make_layout(cute.slice_(cluster_layout_mnk, (0, None, 0)).shape)
-                a_cta_crd = cluster_coord_mnk[1]
-                # ((atom_v, rest_v), STAGE)
-                # ((atom_v, rest_v), RestM, RestK, RestL)
-                if const_expr(not self.load_A_cpasync):
-                    tAsA, tAgA_mkl = cpasync.tma_partition(
-                        tma_atom_a,
-                        a_cta_crd,
-                        a_cta_layout,
-                        cute.group_modes(sA, 0, 2),
-                        cute.group_modes(gA_mkl, 0, 2),
-                    )
-                else:
-                    tiled_copy_A = self._make_gmem_tiled_copy_A(
-                        mA_mkl.element_type, self.a_layout, self.num_ab_load_threads
-                    )
-                    tidx = (
-                        cute.arch.thread_idx()[0]
-                        - self.mma_warp_groups * self.num_threads_per_warp_group
-                    )
-                    thr_copy_A = tiled_copy_A.get_slice(tidx)
-                    # (atom_v, rest_v, 1, RestM, RestK, RestL)
-                    tAgA_mkl = thr_copy_A.partition_S(gA_mkl)
-                    assert tAgA_mkl.shape[2] == 1
-                    tAgA_mkl = cute.group_modes(
-                        cute.slice_(tAgA_mkl, (None, None, 0, None, None, None)), 0, 2
-                    )
-                    # (atom_v, rest_v, 1, STAGE)
-                    tAsA = thr_copy_A.partition_D(sA)
-                    assert tAsA.shape[2] == 1
-                    tAsA = cute.group_modes(cute.slice_(tAsA, (None, None, 0, None)), 0, 2)
-                # TMA load B partition_S/D
-                b_cta_layout = cute.make_layout(cute.slice_(cluster_layout_mnk, (None, 0, 0)).shape)
-                b_cta_crd = cluster_coord_mnk[0]
-                # ((atom_v, rest_v), STAGE)
-                # ((atom_v, rest_v), RestM, RestK, RestL)
-                tBsB, tBgB_nkl = cpasync.tma_partition(
-                    tma_atom_b,
-                    b_cta_crd,
-                    b_cta_layout,
-                    cute.group_modes(sB, 0, 2),
-                    cute.group_modes(gB_nkl, 0, 2),
-                )
 
                 # Persistent tile scheduling loop
                 tile_scheduler = TileSchedulerCls()
@@ -846,21 +812,81 @@ class HopperWgmmaGemmKernel:
                 do_epi_load_barrier_arrive = cutlass.Boolean(True)
                 while work_tile.is_valid_tile:
                     tile_coord_mnkl = work_tile.tile_idx
-                    # Slice to per mma tile index
+                    batch_idx = tile_coord_mnkl[3]
+                    # ///////////////////////////////////////////////////////////////////////////
+                    #  Local_tile partition global tensors
+                    # ///////////////////////////////////////////////////////////////////////////
+                    if const_expr(cu_seqlens_m is not None):
+                        mA_mk = cute.domain_offset((cu_seqlens_m[batch_idx], 0), mA_mkl)
+                    else:
+                        mA_mk = mA_mkl[None, None, batch_idx]
+                    # (bM, bK, RestK)
+                    gA_k = cute.local_tile(
+                        mA_mk, cute.select(self.tile_shape_mnk, [0, 2]), (tile_coord_mnkl[0], None)
+                    )
+                    # (bN, bK, RestK)
+                    gB_k = cute.local_tile(
+                        mB_nkl, self.tile_shape_mnk, tile_coord_mnkl, proj=(None, 1, 1)
+                    )
+                    # //////////////////////////////////////////////////////////////////////////
+                    #  Partition shared tensor for TMA load A/B
+                    # //////////////////////////////////////////////////////////////////////////
+                    #  TMA load A partition_S/D
+                    a_cta_layout = cute.make_layout(
+                        cute.slice_(cluster_layout_mnk, (0, None, 0)).shape
+                    )
+                    a_cta_crd = cluster_coord_mnk[1]
+                    if const_expr(not self.load_A_cpasync):
+                        # ((atom_v, rest_v), STAGE)
+                        # ((atom_v, rest_v), RestK)
+                        tAsA, tAgA_k = cpasync.tma_partition(
+                            tma_atom_a,
+                            a_cta_crd,
+                            a_cta_layout,
+                            cute.group_modes(sA, 0, 2),
+                            cute.group_modes(gA_k, 0, 2),
+                        )
+                    else:
+                        tiled_copy_A = self._make_gmem_tiled_copy_A(
+                            mA_mkl.element_type, self.a_layout, self.num_ab_load_threads
+                        )
+                        tidx = (
+                            cute.arch.thread_idx()[0]
+                            - self.mma_warp_groups * self.num_threads_per_warp_group
+                        )
+                        thr_copy_A = tiled_copy_A.get_slice(tidx)
+                        # (atom_v, rest_v, 1, RestK)
+                        tAgA_k = thr_copy_A.partition_S(gA_k)
+                        assert tAgA_k.shape[2] == 1
+                        tAgA_k = cute.group_modes(cute.slice_(tAgA_k, (None, None, 0, None)), 0, 2)
+                        # (atom_v, rest_v, 1, STAGE)
+                        tAsA = thr_copy_A.partition_D(sA)
+                        assert tAsA.shape[2] == 1
+                        tAsA = cute.group_modes(cute.slice_(tAsA, (None, None, 0, None)), 0, 2)
+                    # TMA load B partition_S/D
+                    b_cta_layout = cute.make_layout(
+                        cute.slice_(cluster_layout_mnk, (None, 0, 0)).shape
+                    )
+                    b_cta_crd = cluster_coord_mnk[0]
+                    # ((atom_v, rest_v), STAGE)
                     # ((atom_v, rest_v), RestK)
-                    tAgA_slice = tAgA_mkl[None, tile_coord_mnkl[0], None, tile_coord_mnkl[3]]
-                    # ((atom_v, rest_v), RestK)
-                    tBgB_slice = tBgB_nkl[None, tile_coord_mnkl[1], None, tile_coord_mnkl[3]]
+                    tBsB, tBgB_k = cpasync.tma_partition(
+                        tma_atom_b,
+                        b_cta_crd,
+                        b_cta_layout,
+                        cute.group_modes(sB, 0, 2),
+                        cute.group_modes(gB_k, 0, 2),
+                    )
                     if const_expr(not self.load_A_cpasync):
                         ab_producer_state = self.load_AB(
                             ab_pipeline,
                             ab_producer_state,
                             tma_atom_a,
-                            tAgA_slice,
+                            tAgA_k,
                             tAsA,
                             a_mcast_mask,
                             tma_atom_b,
-                            tBgB_slice,
+                            tBgB_k,
                             tBsB,
                             b_mcast_mask,
                         )
@@ -869,10 +895,10 @@ class HopperWgmmaGemmKernel:
                             ab_pipeline,
                             ab_producer_state,
                             tiled_copy_A,
-                            tAgA_slice,
+                            tAgA_k,
                             tAsA,
                             tma_atom_b,
-                            tBgB_slice,
+                            tBgB_k,
                             tBsB,
                             b_mcast_mask,
                         )
@@ -899,11 +925,16 @@ class HopperWgmmaGemmKernel:
                     work_tile = tile_scheduler.initial_work_tile_info()
                     while work_tile.is_valid_tile:
                         tile_coord_mnkl = work_tile.tile_idx
+                        batch_idx = tile_coord_mnkl[3]
+                        if const_expr(cu_seqlens_m is not None):
+                            mC_mn = cute.domain_offset((cu_seqlens_m[batch_idx], 0), mC_mnl)
+                        else:
+                            mC_mn = mC_mnl[None, None, batch_idx]
                         # (bM, bN)
-                        gC_mnl = cute.local_tile(
-                            mC_mnl, self.tile_shape_mnk, tile_coord_mnkl, proj=(1, 1, None)
+                        gC = cute.local_tile(
+                            mC_mn, cute.select(self.tile_shape_mnk, [0, 1]), tile_coord_mnkl[:2]
                         )
-                        tCgC_for_tma_partition = cute.zipped_divide(gC_mnl, self.epi_tile)
+                        tCgC_for_tma_partition = cute.zipped_divide(gC, self.epi_tile)
                         bGS_sC, bGS_gC = cpasync.tma_partition(
                             tma_atom_c,
                             0,
@@ -1052,11 +1083,16 @@ class HopperWgmmaGemmKernel:
                 else:
                     thr_copy_s2r, tSR_sC, tRS_rC, tSR_rC = None, None, None, None
 
+                batch_idx = tile_coord_mnkl[3]
+                if const_expr(cu_seqlens_m is not None):
+                    mD_mn = cute.domain_offset((cu_seqlens_m[batch_idx], 0), mD_mnl)
+                else:
+                    mD_mn = mD_mnl[None, None, batch_idx]
                 # (bM, bN)
-                gD_mnl = cute.local_tile(
-                    mD_mnl, self.tile_shape_mnk, tile_coord_mnkl, proj=(1, 1, None)
+                gD = cute.local_tile(
+                    mD_mn, cute.select(self.tile_shape_mnk, [0, 1]), tile_coord_mnkl[:2]
                 )
-                tDgD_for_tma_partition = cute.zipped_divide(gD_mnl, self.epi_tile)
+                tDgD_for_tma_partition = cute.zipped_divide(gD, self.epi_tile)
                 bSG_sD, bSG_gD = cpasync.tma_partition(
                     tma_atom_d,
                     0,
@@ -1730,6 +1766,7 @@ def run(
     skip_ref_check: bool,
     persistent: bool,
     pingpong: bool,
+    varlen_m: bool,
     fp8_fast_accum: bool,
     **kwargs,
 ):
@@ -1851,11 +1888,23 @@ def run(
 
     a, mA, a_torch = create_and_permute_tensor(l, m, k, a_major == "m", a_dtype)
     b, mB, b_torch = create_and_permute_tensor(l, n, k, b_major == "n", b_dtype)
-    d, mD, d_torch = create_and_permute_tensor(l, m, n, d_major == "m", d_dtype)
+    _, mD, d_torch = create_and_permute_tensor(l, m, n, d_major == "m", d_dtype)
     if c_dtype is not None:
         c, mC, c_torch = create_and_permute_tensor(l, m, n, c_major == "m", c_dtype)
     else:
         c, mC, c_torch = None, None, None
+    if varlen_m:
+        assert a_major == "k"
+        assert d_major == "n"
+        from einops import rearrange
+
+        a, a_torch, d_torch = [rearrange(t, "m x l -> (l m) x") for t in (a, a_torch, d_torch)]
+        mA = from_dlpack(a_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        mD = from_dlpack(d_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        cu_seqlens_m = torch.arange(0, l + 1, dtype=torch.int32, device="cuda") * m
+        mCuSeqlensM = from_dlpack(cu_seqlens_m, assumed_align=64).mark_layout_dynamic(leading_dim=0)
+    else:
+        cu_seqlens_m, mCuSeqlensM = None, None
 
     gemm = HopperWgmmaGemmKernel(
         acc_dtype,
@@ -1878,16 +1927,25 @@ def run(
     torch_stream = torch.cuda.Stream()
     stream = cuda.CUstream(torch_stream.cuda_stream)
     # compile gemm kernel
-    compiled_gemm = cute.compile(gemm, mA, mB, mD, mC, max_active_clusters, stream)
+    compiled_gemm = cute.compile(gemm, mA, mB, mD, mC, mCuSeqlensM, max_active_clusters, stream)
 
     if not skip_ref_check:
         # execution
-        compiled_gemm(mA, mB, mD, mC, max_active_clusters, stream)
+        compiled_gemm(mA, mB, mD, mC, mCuSeqlensM, max_active_clusters, stream)
 
         torch.cuda.synchronize()
 
         # Ref check
-        ref = torch.einsum("mkl,nkl->mnl", a, b)
+        if not varlen_m:
+            ref = torch.einsum("mkl,nkl->mnl", a, b)
+        else:
+            ref = torch.cat(
+                [
+                    torch.einsum("mk,nk->mn", a[cu_seqlens_m[i] : cu_seqlens_m[i + 1]], b[:, :, i])
+                    for i in range(l)
+                ],
+                dim=0,
+            )
         if c is not None:
             ref = ref + c
         ref = ref.cpu()
@@ -1931,42 +1989,55 @@ def run(
 
     import time
 
-    time.sleep(0.5)
-    if a_dtype.width == 8:
-        assert l == 1
-        scale_ab = torch.ones((1,), dtype=torch.float32, device="cuda")
-        fn_cublas = lambda: torch._scaled_mm(
-            a_torch[:, :, 0],
-            b_torch[:, :, 0].mT,
-            scale_a=scale_ab,
-            scale_b=scale_ab,
-            out_dtype=torch.bfloat16,
-            use_fast_accum=fp8_fast_accum,
-        )
-    else:
-        if c_torch is None:
-            fn_cublas = lambda: torch.matmul(a_torch.permute(2, 0, 1), b_torch.permute(2, 0, 1).mT)
-        else:
-            c_torch_convert = c_torch.to(a_torch.dtype)  # In case C is in FP32
-            fn_cublas = lambda: torch.baddbmm(
-                c_torch_convert.permute(2, 0, 1),
-                a_torch.permute(2, 0, 1),
-                b_torch.permute(2, 0, 1).mT,
+    if not varlen_m:
+        time.sleep(0.5)
+        if a_dtype.width == 8:
+            assert l == 1
+            scale_ab = torch.ones((1,), dtype=torch.float32, device="cuda")
+            fn_cublas = lambda: torch._scaled_mm(
+                a_torch[:, :, 0],
+                b_torch[:, :, 0].mT,
+                scale_a=scale_ab,
+                scale_b=scale_ab,
+                out_dtype=torch.bfloat16,
+                use_fast_accum=fp8_fast_accum,
             )
-    timing_cublas = do_bench(fn_cublas, warmup=warmup, rep=repeats)
-    tflops_cublas = flops / (timing_cublas * 1e9)  # Convert to TFlops
-    print(f"CuBLAS Average time: {timing_cublas:.3f} ms, TFLOPS: {tflops_cublas:.1f}")
+        else:
+            if c_torch is None:
+                fn_cublas = lambda: torch.matmul(
+                    a_torch.permute(2, 0, 1), b_torch.permute(2, 0, 1).mT
+                )
+            else:
+                c_torch_convert = c_torch.to(a_torch.dtype)  # In case C is in FP32
+                fn_cublas = lambda: torch.baddbmm(
+                    c_torch_convert.permute(2, 0, 1),
+                    a_torch.permute(2, 0, 1),
+                    b_torch.permute(2, 0, 1).mT,
+                )
+        timing_cublas = do_bench(fn_cublas, warmup=warmup, rep=repeats)
+        tflops_cublas = flops / (timing_cublas * 1e9)  # Convert to TFlops
+        print(f"CuBLAS Average time: {timing_cublas:.3f} ms, TFLOPS: {tflops_cublas:.1f}")
 
     time.sleep(0.5)
-    fn = lambda: compiled_gemm(mA, mB, mD, mC, max_active_clusters, current_stream)
+    fn = lambda: compiled_gemm(mA, mB, mD, mC, mCuSeqlensM, max_active_clusters, current_stream)
     timing = do_bench(fn, warmup=warmup, rep=repeats)
     tflops = flops / (timing * 1e9)  # Convert to TFlops
     print(f"Cute-DSL Average time: {timing:.3f} ms, TFLOPS: {tflops:.1f}")
 
-    time.sleep(0.5)
-    timing_cublas = do_bench(fn_cublas, warmup=warmup, rep=repeats)
-    tflops_cublas = flops / (timing_cublas * 1e9)  # Convert to TFlops
-    print(f"CuBLAS Average time: {timing_cublas:.3f} ms, TFLOPS: {tflops_cublas:.1f}")
+    if not varlen_m:
+        time.sleep(0.5)
+        timing_cublas = do_bench(fn_cublas, warmup=warmup, rep=repeats)
+        tflops_cublas = flops / (timing_cublas * 1e9)  # Convert to TFlops
+        print(f"CuBLAS Average time: {timing_cublas:.3f} ms, TFLOPS: {tflops_cublas:.1f}")
+
+        from flash_attn.utils.benchmark import pytorch_profiler
+
+        pytorch_profiler(fn_cublas)
+        # pytorch_profiler(torch.sort, d_torch.squeeze(), dim=-1)
+        # pytorch_profiler(torch.compile(torch.sort), d_torch.squeeze(), dim=-1)
+        # pytorch_profiler(torch.topk, d_torch.squeeze(), dim=-1, k=1)
+        # pytorch_profiler(torch.compile(torch.topk), d_torch.squeeze(), dim=-1, k=1)
+        # pytorch_profiler(torch.square, d_torch.squeeze())
 
 
 if __name__ == "__main__":
@@ -1990,6 +2061,7 @@ if __name__ == "__main__":
         args.skip_ref_check,
         args.persistent,
         args.pingpong,
+        args.varlen_m,
         args.fp8_fast_accum,
     )
     print("PASS")
