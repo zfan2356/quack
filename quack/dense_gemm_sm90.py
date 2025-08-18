@@ -264,6 +264,7 @@ class HopperWgmmaGemmKernel:
     """
 
     bytes_per_tensormap = 128
+    num_tensormaps = 1  # For D only
 
     def __init__(
         self,
@@ -299,7 +300,7 @@ class HopperWgmmaGemmKernel:
         self.load_A_cpasync = load_A_cpasync
         if load_A_cpasync:
             assert cluster_shape_mnk[1] == 1, "Cluster shape N must be 1 for cpasync A load"
-        self.tensormap_update_mode = cutlass.utils.TensorMapUpdateMode.GMEM
+        self.tensormap_update_mode = cutlass.utils.TensorMapUpdateMode.SMEM
 
         self.cluster_shape_mnk = cluster_shape_mnk
         self.tile_shape_mnk = tuple(tile_shape_mnk)
@@ -587,8 +588,21 @@ class HopperWgmmaGemmKernel:
         epi_smem_size = cute.cosize(self.epi_smem_layout_staged) if self.is_persistent else 0
         epi_c_smem_size = cute.cosize(self.epi_c_smem_layout_staged) if mC is not None else 0
 
+        size_tensormap_in_i64 = (
+            0
+            if mCuSeqlensM is None
+            or self.tensormap_update_mode == cutlass.utils.TensorMapUpdateMode.GMEM
+            else HopperWgmmaGemmKernel.num_tensormaps
+            * HopperWgmmaGemmKernel.bytes_per_tensormap
+            // 8
+        ) * (1 if not self.pingpong else 2)
+
         @cute.struct
         class SharedStorage:
+            tensormap_buffer: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int64, size_tensormap_in_i64],
+                64,
+            ]
             ab_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             epi_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.epi_c_stage * 2]
             sD: cute.struct.Align[
@@ -798,8 +812,24 @@ class HopperWgmmaGemmKernel:
             tensormap_d_ptr = tensormap_manager.get_tensormap_ptr(
                 tensormaps[tensormap_workspace_idx, None].iterator
             )
-            tensormap_d_init_ptr = tensormap_d_ptr
+            if const_expr(self.tensormap_update_mode == cutlass.utils.TensorMapUpdateMode.SMEM):
+                tensormap_smem_ptr = storage.tensormap_buffer.data_ptr()
+                tensormap_d_smem_ptr = tensormap_smem_ptr + (warp_idx // 4) * (
+                    HopperWgmmaGemmKernel.bytes_per_tensormap // 8
+                )
+                # Need this, otherwise "expected tma descriptor pointer to have alignment at least 64, but got 8"
+                tensormap_d_smem_ptr = cute.make_ptr(
+                    cutlass.Int64,
+                    tensormap_d_smem_ptr.toint(),
+                    cute.AddressSpace.smem,
+                    assumed_align=64,
+                )
+                tensormap_d_init_ptr = tensormap_d_smem_ptr
+            else:
+                tensormap_d_smem_ptr = None
+                tensormap_d_init_ptr = tensormap_d_ptr
         else:
+            tensormap_d_smem_ptr = None
             tensormap_manager, tensormap_d_ptr, tensormap_d_init_ptr = None, None, None
 
         TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
@@ -1069,6 +1099,7 @@ class HopperWgmmaGemmKernel:
                 batch_idx = tile_coord_mnkl[3]
                 if const_expr(varlen):
                     is_group_changed = batch_idx != last_batch_idx
+                    last_batch_idx = batch_idx
                     if is_group_changed:
                         # construct tensor D based on real address, shape and stride information
                         offset, offset_next = cu_seqlens_m[batch_idx], cu_seqlens_m[batch_idx + 1]
@@ -1088,7 +1119,7 @@ class HopperWgmmaGemmKernel:
                             ((tma_atom_d),),
                             ((tensormap_d_ptr),),
                             is_manager_warp=is_tma_warp,
-                            tensormap_smem_ptr=None,
+                            tensormap_smem_ptr=(tensormap_d_smem_ptr,),
                         )
 
                 ab_read_state, tiled_mma = self.mma(
