@@ -53,6 +53,7 @@ from quack.tile_scheduler import (
     ParamsBase,
     RasterOrderOption,
 )
+from quack.tensormap_manager import TensorMapManagerSm90
 
 # return PipelineStateWAdvance instead of PipelineState
 from quack.pipeline import make_pipeline_state, PipelineTmaCpAsync
@@ -262,6 +263,8 @@ class HopperWgmmaGemmKernel:
         >>> gemm(a_tensor, b_tensor, c_tensor, stream)
     """
 
+    bytes_per_tensormap = 128
+
     def __init__(
         self,
         acc_dtype: Type[cutlass.Numeric],
@@ -296,6 +299,7 @@ class HopperWgmmaGemmKernel:
         self.load_A_cpasync = load_A_cpasync
         if load_A_cpasync:
             assert cluster_shape_mnk[1] == 1, "Cluster shape N must be 1 for cpasync A load"
+        self.tensormap_update_mode = cutlass.utils.TensorMapUpdateMode.GMEM
 
         self.cluster_shape_mnk = cluster_shape_mnk
         self.tile_shape_mnk = tuple(tile_shape_mnk)
@@ -454,6 +458,7 @@ class HopperWgmmaGemmKernel:
         mD: cute.Tensor,
         mC: Optional[cute.Tensor],
         mCuSeqlensM: Optional[cute.Tensor],
+        mTensormaps: Optional[cute.Tensor],
         max_active_clusters: Int32,
         stream: cuda.CUstream,
     ):
@@ -559,6 +564,7 @@ class HopperWgmmaGemmKernel:
                 is_persistent=self.is_persistent,
             )
         else:
+            assert mTensormaps is not None
             problem_shape_ntile_mnl = (
                 None,
                 cute.ceil_div(mD.shape[1], self.tile_shape_mnk[1]),
@@ -614,9 +620,11 @@ class HopperWgmmaGemmKernel:
             tma_tensor_b,
             tma_atom_d,
             tma_tensor_d,
+            mD,
             tma_atom_c,
             tma_tensor_c,
             mCuSeqlensM,
+            mTensormaps,
             tiled_mma,
             self.cluster_layout_mnk,
             self.a_smem_layout_staged,
@@ -644,10 +652,12 @@ class HopperWgmmaGemmKernel:
         tma_atom_b: cute.CopyAtom,
         mB_nkl: cute.Tensor,
         tma_atom_d: cute.CopyAtom,
+        mD_mnl_tma: cute.Tensor,
         mD_mnl: cute.Tensor,
         tma_atom_c: Optional[cute.CopyAtom],
         mC_mnl: Optional[cute.Tensor],
         cu_seqlens_m: Optional[cute.Tensor],
+        tensormaps: Optional[cute.Tensor],
         tiled_mma: cute.TiledMma,
         cluster_layout_mnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -670,8 +680,8 @@ class HopperWgmmaGemmKernel:
         :type mB_nkl: cute.Tensor
         :param tma_atom_d: TMA copy atom for D tensor
         :type tma_atom_d: cute.CopyAtom
-        :param mD_mnl: Output tensor D
-        :type mD_mnl: cute.Tensor
+        :param mD_mnl_tma: Output tensor D
+        :type mD_mnl_tma: cute.Tensor
         :param tiled_mma: Tiled MMA object
         :type tiled_mma: cute.TiledMma
         :param cluster_layout_mnk: CTA layout
@@ -684,6 +694,7 @@ class HopperWgmmaGemmKernel:
         :type epi_smem_layout_staged: cute.ComposedLayout
         """
 
+        varlen = const_expr(cu_seqlens_m is not None)
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         # /////////////////////////////////////////////////////////////////////////////
@@ -770,6 +781,26 @@ class HopperWgmmaGemmKernel:
             )
         else:
             sC = None
+
+        # Get tensormap buffer address
+        if const_expr(varlen):
+            grid_dim = cute.arch.grid_dim()
+            bid = cute.arch.block_idx()
+            tensormap_workspace_idx = (
+                bid[2] * grid_dim[1] * grid_dim[0] + bid[1] * grid_dim[0] + bid[0]
+            )
+            # TODO: this is only for D, not for A/B
+            if const_expr(self.pingpong):
+                tensormap_workspace_idx = tensormap_workspace_idx * 2 + warp_idx // 4
+            tensormap_manager = TensorMapManagerSm90(
+                self.tensormap_update_mode, HopperWgmmaGemmKernel.bytes_per_tensormap
+            )
+            tensormap_d_ptr = tensormap_manager.get_tensormap_ptr(
+                tensormaps[tensormap_workspace_idx, None].iterator
+            )
+            tensormap_d_init_ptr = tensormap_d_ptr
+        else:
+            tensormap_manager, tensormap_d_ptr, tensormap_d_init_ptr = None, None, None
 
         TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
 
@@ -970,6 +1001,17 @@ class HopperWgmmaGemmKernel:
 
         if warp_idx < self.ab_load_warp_id:
             cute.arch.warpgroup_reg_alloc(self.num_regs_mma)
+            is_tma_warp = cutlass.Boolean(
+                (not self.pingpong and warp_idx == 0)
+                or (self.pingpong and (warp_idx == 0 or warp_idx == 4))
+            )
+            if const_expr(varlen):
+                # initialize tensormap for D
+                tensormap_manager.init_tensormap_from_atom(
+                    tma_atom_d,
+                    tensormap_d_init_ptr,
+                    is_manager_warp=is_tma_warp,
+                )
             # //////////////////////////////////////////////////////////////////////////////
             #  Partition global tensor for TiledMMA_A/B/C
             # //////////////////////////////////////////////////////////////////////////////
@@ -1017,8 +1059,38 @@ class HopperWgmmaGemmKernel:
                     ab_read_state.advance_iters(k_tile_cnt)
                     epi_read_state.advance_iters(c_tile_cnt)
             work_tile = tile_scheduler.initial_work_tile_info()
+            if const_expr(varlen):
+                # wait tensormap initialization complete before update
+                tensormap_manager.fence_tensormap_initialization()
+            # batch index of last tile
+            last_batch_idx = cutlass.Int32(-1)
             while work_tile.is_valid_tile:
                 tile_coord_mnkl = work_tile.tile_idx
+                batch_idx = tile_coord_mnkl[3]
+                if const_expr(varlen):
+                    is_group_changed = batch_idx != last_batch_idx
+                    if is_group_changed:
+                        # construct tensor D based on real address, shape and stride information
+                        offset, offset_next = cu_seqlens_m[batch_idx], cu_seqlens_m[batch_idx + 1]
+                        tensor_gmem_ptr = cute.make_ptr(
+                            mD_mnl.element_type,
+                            (mD_mnl.iterator + offset * mD_mnl.stride[0]).toint(),
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        )
+                        tensor_shape = (offset_next - offset, mD_mnl.shape[1])
+                        real_tensor_d = cute.make_tensor(
+                            tensor_gmem_ptr,
+                            cute.make_layout(tensor_shape, stride=mD_mnl.stride),
+                        )
+                        tensormap_manager.update_tensormap(
+                            ((real_tensor_d),),
+                            ((tma_atom_d),),
+                            ((tensormap_d_ptr),),
+                            is_manager_warp=is_tma_warp,
+                            tensormap_smem_ptr=None,
+                        )
+
                 ab_read_state, tiled_mma = self.mma(
                     ab_pipeline,
                     ab_read_state,
@@ -1048,6 +1120,12 @@ class HopperWgmmaGemmKernel:
                 # A in the mainloop is reused in the epilogue if not persistent.
                 if const_expr(not self.is_persistent):
                     epilogue_barrier.arrive_and_wait()
+
+                if const_expr(varlen):
+                    # ensure the update to tensormap has completed before using it
+                    if is_group_changed:
+                        if is_tma_warp:
+                            tensormap_manager.fence_tensormap_update(tensormap_d_ptr)
 
                 # Doesn't work with tile_N % 8 == 0 but tile_n % 16 != since this always
                 # get st.matrix with num_matrices=4
@@ -1083,14 +1161,16 @@ class HopperWgmmaGemmKernel:
                 else:
                     thr_copy_s2r, tSR_sC, tRS_rC, tSR_rC = None, None, None, None
 
-                batch_idx = tile_coord_mnkl[3]
                 if const_expr(cu_seqlens_m is not None):
-                    mD_mn = cute.domain_offset((cu_seqlens_m[batch_idx], 0), mD_mnl)
+                    # mD_mn_tma = cute.domain_offset((cu_seqlens_m[batch_idx], 0), mD_mnl_tma)
+                    # Don't change the coord since we already update the tensormap
+                    # TODO: if we don't use TMA to write D, then we need to update the coord
+                    mD_mn_tma = mD_mnl_tma
                 else:
-                    mD_mn = mD_mnl[None, None, batch_idx]
+                    mD_mn_tma = mD_mnl_tma[None, None, batch_idx]
                 # (bM, bN)
                 gD = cute.local_tile(
-                    mD_mn, cute.select(self.tile_shape_mnk, [0, 1]), tile_coord_mnkl[:2]
+                    mD_mn_tma, cute.select(self.tile_shape_mnk, [0, 1]), tile_coord_mnkl[:2]
                 )
                 tDgD_for_tma_partition = cute.zipped_divide(gD, self.epi_tile)
                 bSG_sD, bSG_gD = cpasync.tma_partition(
@@ -1139,10 +1219,20 @@ class HopperWgmmaGemmKernel:
                     )
                     gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
                     # Copy from shared memory to global memory
-                    if (not self.pingpong and warp_idx == 0) or (
-                        self.pingpong and (warp_idx == 0 or warp_idx == 4)
-                    ):
-                        cute.copy(tma_atom_d, bSG_sD[None, epi_buffer], bSG_gD[None, gmem_coord])
+                    if is_tma_warp:
+                        if const_expr(varlen):
+                            tma_desc_ptr = tensormap_manager.get_tensormap_ptr(
+                                tensormap_d_ptr,
+                                cute.AddressSpace.generic,
+                            )
+                        else:
+                            tma_desc_ptr = None
+                        cute.copy(
+                            tma_atom_d,
+                            bSG_sD[None, epi_buffer],
+                            bSG_gD[None, gmem_coord],
+                            tma_desc_ptr=tma_desc_ptr,
+                        )
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(self.epi_stage - 1, read=True)
                     epilogue_barrier.arrive_and_wait()
@@ -1901,10 +1991,31 @@ def run(
         a, a_torch, d_torch = [rearrange(t, "m x l -> (l m) x") for t in (a, a_torch, d_torch)]
         mA = from_dlpack(a_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
         mD = from_dlpack(d_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        # TODO: generate random cu_seqlens_m
         cu_seqlens_m = torch.arange(0, l + 1, dtype=torch.int32, device="cuda") * m
         mCuSeqlensM = from_dlpack(cu_seqlens_m, assumed_align=64).mark_layout_dynamic(leading_dim=0)
     else:
         cu_seqlens_m, mCuSeqlensM = None, None
+
+    if varlen_m:  # Need to allocate space in gmem to store tensormaps
+        if not persistent:
+            total_m = m * l
+            block_size_m = tile_shape_mnk[0] * cluster_shape_mnk[0]
+            block_size_n = tile_shape_mnk[1] * cluster_shape_mnk[1]
+            total_clusters_m_max = (total_m + l * (block_size_m - 1)) // block_size_m
+            total_clusters_max = total_clusters_m_max * ((n + block_size_n - 1) // block_size_n)
+            total_ctas = total_clusters_max * cluster_shape_mnk[0] * cluster_shape_mnk[1]
+        else:
+            total_ctas = cutlass.utils.HardwareInfo().get_device_multiprocessor_count()
+        if pingpong:
+            total_ctas *= 2
+        # 128 bytes per tensormap
+        tensormaps_torch = torch.empty(total_ctas, 128 // 8, dtype=torch.int64, device="cuda")
+        tensormaps_tensor = from_dlpack(
+            tensormaps_torch, assumed_align=128
+        ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
+    else:
+        tensormaps_tensor = None
 
     gemm = HopperWgmmaGemmKernel(
         acc_dtype,
@@ -1927,11 +2038,13 @@ def run(
     torch_stream = torch.cuda.Stream()
     stream = cuda.CUstream(torch_stream.cuda_stream)
     # compile gemm kernel
-    compiled_gemm = cute.compile(gemm, mA, mB, mD, mC, mCuSeqlensM, max_active_clusters, stream)
+    compiled_gemm = cute.compile(
+        gemm, mA, mB, mD, mC, mCuSeqlensM, tensormaps_tensor, max_active_clusters, stream
+    )
 
     if not skip_ref_check:
         # execution
-        compiled_gemm(mA, mB, mD, mC, mCuSeqlensM, max_active_clusters, stream)
+        compiled_gemm(mA, mB, mD, mC, mCuSeqlensM, tensormaps_tensor, max_active_clusters, stream)
 
         torch.cuda.synchronize()
 
@@ -2019,7 +2132,9 @@ def run(
         print(f"CuBLAS Average time: {timing_cublas:.3f} ms, TFLOPS: {tflops_cublas:.1f}")
 
     time.sleep(0.5)
-    fn = lambda: compiled_gemm(mA, mB, mD, mC, mCuSeqlensM, max_active_clusters, current_stream)
+    fn = lambda: compiled_gemm(
+        mA, mB, mD, mC, mCuSeqlensM, tensormaps_tensor, max_active_clusters, current_stream
+    )
     timing = do_bench(fn, warmup=warmup, rep=repeats)
     tflops = flops / (timing * 1e9)  # Convert to TFlops
     print(f"Cute-DSL Average time: {timing:.3f} ms, TFLOPS: {tflops:.1f}")
