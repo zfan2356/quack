@@ -537,6 +537,8 @@ class VarlenMStaticTileScheduler(StaticTileScheduler):
         self,
         current_work_linear_idx: Int32,
         num_tiles_executed: Int32,
+        current_batch_idx: Int32,
+        num_work_idx_before_cur_batch: Int32,
         params: Params,
         *,
         loc=None,
@@ -544,6 +546,8 @@ class VarlenMStaticTileScheduler(StaticTileScheduler):
     ):
         self._current_work_linear_idx = current_work_linear_idx
         self._num_tiles_executed = num_tiles_executed
+        self._current_batch_idx = current_batch_idx
+        self._num_work_idx_before_cur_batch = num_work_idx_before_cur_batch
         self.params = params
         self._loc = loc
         self._ip = ip
@@ -554,12 +558,13 @@ class VarlenMStaticTileScheduler(StaticTileScheduler):
 
     @staticmethod
     def create(params: Params, *, loc=None, ip=None) -> "VarlenMStaticTileScheduler":
-        assert not params.is_persistent, "VarlenMStaticTileScheduler is not persistent yet"
         _, _, bidz = cute.arch.block_idx()
         current_work_linear_idx = Int32(bidz)
         return VarlenMStaticTileScheduler(
             current_work_linear_idx,
             Int32(0),  # num_tiles_executed
+            Int32(0),  # current_batch_idx
+            Int32(0),  # num_work_idx_before_cur_batch
             params,
             loc=loc,
             ip=ip,
@@ -607,16 +612,19 @@ class VarlenMStaticTileScheduler(StaticTileScheduler):
         lane_idx = cute.arch.lane_idx()
         num_batch = self.params.problem_shape_ncluster_mnl[2]
         block_size = params.tile_shape_mn[0] * params.cluster_shape_mn[0]
-        num_clusters_m = self._get_num_m_blocks(lane_idx, bidb_start=0, block_size=block_size)
+        batch_idx = self._current_batch_idx
+        num_clusters_m = self._get_num_m_blocks(
+            lane_idx, bidb_start=batch_idx, block_size=block_size
+        )
         num_clusters = num_clusters_m * params.problem_shape_ncluster_mnl[1]
         num_clusters_cumulative = utils.warp_prefix_sum(num_clusters, lane_idx)
         # Total number of blocks for the next 31 problems, same for all lanes
         clusters_in_problems = cute.arch.shuffle_sync(
             num_clusters_cumulative, cute.arch.WARP_SIZE - 1
         )
-        problems_end_tile = clusters_in_problems
+        problems_end_tile = self._num_work_idx_before_cur_batch + clusters_in_problems
         # if cute.arch.thread_idx()[0] == 128 + 31: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, problems_end_tile = %d, num_clusters_m=%d, num_clusters_cumulative = %d, problems_end_tile = %d", self._tile_idx, problems_end_tile, num_clusters_m, num_clusters_cumulative, problems_end_tile)
-        cid_m, cid_n, batch_idx = Int32(0), Int32(0), Int32(0)
+        cid_m, cid_n = Int32(0), Int32(0)
         next_tile_idx = self._current_work_linear_idx
         while problems_end_tile <= next_tile_idx:
             batch_idx += cute.arch.WARP_SIZE - 1
@@ -633,6 +641,8 @@ class VarlenMStaticTileScheduler(StaticTileScheduler):
                     num_clusters_cumulative, cute.arch.WARP_SIZE - 1
                 )
                 problems_end_tile += clusters_in_problems
+        # Just a placeholer value in case batch_idx >= num_batch
+        num_work_idx_before_cur_batch = problems_end_tile - clusters_in_problems
         if batch_idx >= num_batch:
             cid_m, cid_n, batch_idx = Int32(0), Int32(0), Int32(num_batch)
         else:
@@ -653,7 +663,8 @@ class VarlenMStaticTileScheduler(StaticTileScheduler):
             )
             num_clusters_m = cute.arch.shuffle_sync(num_clusters_m, batch_idx_in_problems)
             num_clusters = num_clusters_m * params.problem_shape_ncluster_mnl[1]
-            cluster_id_in_problem = next_tile_idx - problems_start_tile - num_clusters_prev_lane
+            num_work_idx_before_cur_batch = problems_start_tile + num_clusters_prev_lane
+            cluster_id_in_problem = next_tile_idx - num_work_idx_before_cur_batch
             # cid_n = cluster_id_in_problem // num_clusters_m
             # cid_m = cluster_id_in_problem - cid_n * num_clusters_m
             # if cute.arch.thread_idx()[0] == 128: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, batch_idx=%d, cid_n=%d, cid_m=%d, is_valid = %d", self._tile_idx, batch_idx, cid_n, cid_m, is_valid)
@@ -695,6 +706,9 @@ class VarlenMStaticTileScheduler(StaticTileScheduler):
             if params.raster_order == RasterOrder.AlongN:
                 cid_m, cid_n = cid_slow, cid_fast
 
+        self._current_batch_idx = batch_idx
+        self._num_work_idx_before_cur_batch = num_work_idx_before_cur_batch
+
         # Get the pid from cluster id
         bidx_in_cluster = cute.arch.block_in_cluster_idx()
         pid_m = cid_m * params.cluster_shape_mn[0] + bidx_in_cluster[0]
@@ -706,31 +720,32 @@ class VarlenMStaticTileScheduler(StaticTileScheduler):
             is_valid = batch_idx < num_batch
         return cutlass.utils.WorkTileInfo(tile_coord_mnkl, is_valid)
 
-    # def initial_work_tile_info(self, *, loc=None, ip=None):
-    #     return self.get_current_work(loc=loc, ip=ip)
+    def __extract_mlir_values__(self):
+        values, self._values_pos = [], []
+        for obj in [
+            self._current_work_linear_idx,
+            self._num_tiles_executed,
+            self._current_batch_idx,
+            self._num_work_idx_before_cur_batch,
+            self.params,
+        ]:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
 
-    # def __extract_mlir_values__(self):
-    #     values, self._values_pos = [], []
-    #     for obj in [
-    #         self._current_work_linear_idx,
-    #         self._num_tiles_executed,
-    #         self.params,
-    #     ]:
-    #         obj_values = cutlass.extract_mlir_values(obj)
-    #         values += obj_values
-    #         self._values_pos.append(len(obj_values))
-    #     return values
-
-    # def __new_from_mlir_values__(self, values):
-    #     obj_list = []
-    #     for obj, n_items in zip(
-    #         [
-    #             self._current_work_linear_idx,
-    #             self._num_tiles_executed,
-    #             self.params,
-    #         ],
-    #         self._values_pos,
-    #     ):
-    #         obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
-    #         values = values[n_items:]
-    #     return self.__class__(*(tuple(obj_list)), loc=self._loc)
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        for obj, n_items in zip(
+            [
+                self._current_work_linear_idx,
+                self._num_tiles_executed,
+                self._current_batch_idx,
+                self._num_work_idx_before_cur_batch,
+                self.params,
+            ],
+            self._values_pos,
+        ):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return self.__class__(*(tuple(obj_list)), loc=self._loc)
