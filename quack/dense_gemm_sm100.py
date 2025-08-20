@@ -89,7 +89,7 @@ Input arguments to this example is same as dense_gemm.py.
       --ab_dtype Float16 --d_dtype Float16 --acc_dtype Float32                  \
       --mma_tiler_mn 256,128 --cluster_shape_mn 2,1                             \
       --mnkl 8192,8192,8192,1                                                   \
-      --use_tma_store --use_2cta_instrs
+      --use_2cta_instrs
 
 To collect performance with NCU profiler:
 
@@ -99,7 +99,7 @@ To collect performance with NCU profiler:
       --ab_dtype Float16 --d_dtype Float16 --acc_dtype Float32                 \
       --mma_tiler_mn 256,128 --cluster_shape_mn 2,1                            \
       --mnkl 8192,8192,8192,1                                                  \
-      --use_tma_store --use_2cta_instrs                                        \
+      --use_2cta_instrs                                        \
       --warmup_iterations 1 --iterations 10 --skip_ref_check
 
 
@@ -130,8 +130,6 @@ class PersistentDenseGemmKernel:
     :type mma_tiler_mn: Tuple[int, int]
     :param cluster_shape_mn: Cluster dimensions (M,N) for parallel processing
     :type cluster_shape_mn: Tuple[int, int]
-    :param use_tma_store: Whether to use Tensor Memory Access (TMA) for storing results
-    :type use_tma_store: bool
 
     :note: In current version, A and B tensor must have the same data type
         - i.e., Float8E4M3FN for A and Float8E5M2 for B is not supported
@@ -176,7 +174,6 @@ class PersistentDenseGemmKernel:
         use_2cta_instrs: bool,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
-        use_tma_store: bool,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -191,9 +188,6 @@ class PersistentDenseGemmKernel:
         2.  Cluster Shape:
             - cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster.
 
-        3. Output C tensor store mode:
-            - use_tma_store: Boolean indicating whether to use Tensor Memory Access (TMA) for storing results.
-
         :param acc_dtype: Data type of the accumulator.
         :type acc_dtype: type[cutlass.Numeric]
         :param mma_tiler_mn: Tuple (M, N) shape of the MMA instruction.
@@ -202,8 +196,6 @@ class PersistentDenseGemmKernel:
         :type use_2cta_instrs: bool
         :param cluster_shape_mn: Tuple (ClusterM, ClusterN) shape of the cluster.
         :type cluster_shape_mn: Tuple[int, int]
-        :param use_tma_store: Use Tensor Memory Access (TMA) or normal store for output C tensor.
-        :type use_tma_store: bool
         """
 
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
@@ -211,7 +203,6 @@ class PersistentDenseGemmKernel:
         self.cluster_shape_mn = cluster_shape_mn
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
-        self.use_tma_store = use_tma_store
 
         self.cta_group = tcgen05.CtaGroup.TWO if use_2cta_instrs else tcgen05.CtaGroup.ONE
 
@@ -283,15 +274,12 @@ class PersistentDenseGemmKernel:
         self.is_b_mcast = self.num_mcast_ctas_b > 1
 
         # Compute epilogue subtile
-        if const_expr(self.use_tma_store):
-            self.epi_tile = sm100_utils.compute_epilogue_tile_shape(
-                self.cta_tile_shape_mnk,
-                self.use_2cta_instrs,
-                self.d_layout,
-                self.d_dtype,
-            )
-        else:
-            self.epi_tile = self.cta_tile_shape_mnk[:2]
+        self.epi_tile = sm100_utils.compute_epilogue_tile_shape(
+            self.cta_tile_shape_mnk,
+            self.use_2cta_instrs,
+            self.d_layout,
+            self.d_dtype,
+        )
 
         # Setup A/B/C stage count in shared memory and ACC stage count in tensor memory
         self.num_acc_stage, self.num_ab_stage, self.num_d_stage = self._compute_stages(
@@ -304,7 +292,6 @@ class PersistentDenseGemmKernel:
             self.d_layout,
             self.smem_capacity,
             self.occupancy,
-            self.use_tma_store,
         )
 
         # Compute A/B/C shared memory layout
@@ -320,15 +307,11 @@ class PersistentDenseGemmKernel:
             self.b_dtype,
             self.num_ab_stage,
         )
-        self.d_smem_layout_staged = (
-            sm100_utils.make_smem_layout_epi(
-                self.d_dtype,
-                self.d_layout,
-                self.epi_tile,
-                self.num_d_stage,
-            )
-            if const_expr(self.use_tma_store)
-            else None
+        self.d_smem_layout_staged = sm100_utils.make_smem_layout_epi(
+            self.d_dtype,
+            self.d_layout,
+            self.epi_tile,
+            self.num_d_stage,
         )
 
         # Compute the number of tensor memory allocation columns
@@ -424,17 +407,14 @@ class PersistentDenseGemmKernel:
         self.num_tma_load_bytes = (a_copy_size + b_copy_size) * atom_thr_size
 
         # Setup TMA store for D
-        tma_atom_d = None
-        tma_tensor_d = None
-        if const_expr(self.use_tma_store):
-            d_cta_v_layout = cute.composition(cute.make_identity_layout(mD.shape), self.epi_tile)
-            epi_smem_layout = cute.slice_(self.d_smem_layout_staged, (None, None, 0))
-            tma_atom_d, tma_tensor_d = cpasync.make_tiled_tma_atom(
-                cpasync.CopyBulkTensorTileS2GOp(),
-                mD,
-                epi_smem_layout,
-                d_cta_v_layout,
-            )
+        d_cta_v_layout = cute.composition(cute.make_identity_layout(mD.shape), self.epi_tile)
+        epi_smem_layout = cute.slice_(self.d_smem_layout_staged, (None, None, 0))
+        tma_atom_d, tma_tensor_d = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileS2GOp(),
+            mD,
+            epi_smem_layout,
+            d_cta_v_layout,
+        )
 
         problem_shape_ntile_mnl = cute.ceil_div(mD.shape[:2], self.cta_tile_shape_mnk[:2]) + (
             mD.shape[2],
@@ -457,9 +437,7 @@ class PersistentDenseGemmKernel:
 
         self.buffer_align_bytes = 1024
 
-        d_smem_size = (
-            cute.cosize(self.d_smem_layout_staged.outer) if const_expr(self.use_tma_store) else 0
-        )
+        d_smem_size = cute.cosize(self.d_smem_layout_staged.outer)
 
         # Define shared storage for kernel
         @cute.struct
@@ -496,7 +474,7 @@ class PersistentDenseGemmKernel:
             tma_atom_b,
             tma_tensor_b,
             tma_atom_d,
-            tma_tensor_d if const_expr(self.use_tma_store) else mD,
+            tma_tensor_d,
             self.cluster_layout_vmnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -545,8 +523,7 @@ class PersistentDenseGemmKernel:
         if warp_idx == self.tma_warp_id:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
-            if const_expr(self.use_tma_store):
-                cpasync.prefetch_descriptor(tma_atom_d)
+            cpasync.prefetch_descriptor(tma_atom_d)
 
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
 
@@ -610,11 +587,8 @@ class PersistentDenseGemmKernel:
         # Setup smem tensor A/B/D
         #
         # (EPI_TILE_M, EPI_TILE_N, STAGE)
-        sD = (
-            storage.sD.get_tensor(d_smem_layout_staged.outer, swizzle=d_smem_layout_staged.inner)
-            if const_expr(self.use_tma_store)
-            else None
-        )
+        sD = storage.sD.get_tensor(d_smem_layout_staged.outer, swizzle=d_smem_layout_staged.inner)
+
         # (MMA, MMA_M, MMA_K, STAGE)
         sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
         # (MMA, MMA_N, MMA_K, STAGE)
@@ -825,32 +799,15 @@ class PersistentDenseGemmKernel:
                 epi_tidx, tCtAcc_base, tCgC, epi_tile, use_2cta_instrs
             )
 
-            tTR_rD = None
-            tiled_copy_r2s = None
-            simt_atom = None
-            tRS_rC = None
-            tRS_sC = None
-            bSG_sD = None
-            bSG_gC_partitioned = None
-            tTR_gD_partitioned = None
-            if const_expr(self.use_tma_store):
-                tTR_rD = cute.make_fragment(tTR_rAcc.shape, self.d_dtype)
-                tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
-                    tiled_copy_t2r, tTR_rD, epi_tidx, sD
-                )
-                (
-                    tma_atom_d,
-                    bSG_sD,
-                    bSG_gC_partitioned,
-                ) = self.epilog_gmem_copy_and_partition(epi_tidx, tma_atom_d, tCgC, epi_tile, sD)
-            else:
-                (
-                    simt_atom,
-                    tTR_rD,
-                    tTR_gD_partitioned,
-                ) = self.epilog_gmem_copy_and_partition(
-                    epi_tidx, tiled_copy_t2r, tCgC, epi_tile, sD
-                )
+            tTR_rD = cute.make_fragment(tTR_rAcc.shape, self.d_dtype)
+            tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
+                tiled_copy_t2r, tTR_rD, epi_tidx, sD
+            )
+            (
+                tma_atom_d,
+                bSG_sD,
+                bSG_gC_partitioned,
+            ) = self.epilog_gmem_copy_and_partition(epi_tidx, tma_atom_d, tCgC, epi_tile, sD)
 
             # Persistent tile scheduling loop
             tile_scheduler = TileSchedulerCls()
@@ -858,17 +815,15 @@ class PersistentDenseGemmKernel:
             acc_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_acc_stage
             )
-            d_pipeline = None
-            if const_expr(self.use_tma_store):
-                # Threads/warps participating in tma store pipeline
-                d_producer_group = pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread,
-                    32 * len(self.epilog_warp_id),
-                    32 * len(self.epilog_warp_id),
-                )
-                d_pipeline = pipeline.PipelineTmaStore.create(
-                    num_stages=self.num_d_stage, producer_group=d_producer_group
-                )
+            # Threads/warps participating in tma store pipeline
+            d_producer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                32 * len(self.epilog_warp_id),
+                32 * len(self.epilog_warp_id),
+            )
+            d_pipeline = pipeline.PipelineTmaStore.create(
+                num_stages=self.num_d_stage, producer_group=d_producer_group
+            )
 
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
@@ -881,12 +836,8 @@ class PersistentDenseGemmKernel:
                 # Slice to per mma tile index
                 bSG_gD = None
                 tTR_gD = None
-                if const_expr(self.use_tma_store):
-                    # ((ATOM_V, REST_V), EPI_M, EPI_N)
-                    bSG_gD = bSG_gC_partitioned[None, None, None, *mma_tile_coord_mnl]
-                else:
-                    # (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
-                    tTR_gD = tTR_gD_partitioned[None, None, None, None, None, *mma_tile_coord_mnl]
+                # ((ATOM_V, REST_V), EPI_M, EPI_N)
+                bSG_gD = bSG_gC_partitioned[None, None, None, *mma_tile_coord_mnl]
 
                 # Set tensor memory buffer for current tile
                 # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
@@ -896,10 +847,7 @@ class PersistentDenseGemmKernel:
                 acc_pipeline.consumer_wait(acc_consumer_state)
 
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
-                if const_expr(self.use_tma_store):
-                    bSG_gD = cute.group_modes(bSG_gD, 1, cute.rank(bSG_gD))
-                else:
-                    tTR_gD = cute.group_modes(tTR_gD, 3, cute.rank(tTR_gD))
+                bSG_gD = cute.group_modes(bSG_gD, 1, cute.rank(bSG_gD))
 
                 # Store accumulator to global memory in subtiles
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
@@ -909,33 +857,25 @@ class PersistentDenseGemmKernel:
                     tTR_tAcc_mn = tTR_tAcc[None, None, None, subtile_idx]
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
-                    if const_expr(self.use_tma_store):
-                        # Convert to D type
-                        acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
-                        acc_vec = epilogue_op(acc_vec.to(self.d_dtype))
-                        tRS_rC.store(acc_vec)
-                        # Store D to shared memory
-                        c_buffer = (num_prev_subtiles + subtile_idx) % self.num_d_stage
-                        cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, c_buffer)])
+                    # Convert to D type
+                    acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
+                    acc_vec = epilogue_op(acc_vec.to(self.d_dtype))
+                    tRS_rC.store(acc_vec)
+                    # Store D to shared memory
+                    c_buffer = (num_prev_subtiles + subtile_idx) % self.num_d_stage
+                    cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, c_buffer)])
+                    # Fence and barrier to make sure shared memory store is visible to TMA store
+                    cute.arch.fence_proxy(
+                        cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+                    )
+                    epilogue_barrier.arrive_and_wait()
+                    # TMA store D to global memory
+                    if warp_idx == self.epilog_warp_id[0]:
+                        cute.copy(tma_atom_d, bSG_sD[None, c_buffer], bSG_gD[None, subtile_idx])
                         # Fence and barrier to make sure shared memory store is visible to TMA store
-                        cute.arch.fence_proxy(
-                            cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-                        )
-                        epilogue_barrier.arrive_and_wait()
-                        # TMA store D to global memory
-                        if warp_idx == self.epilog_warp_id[0]:
-                            cute.copy(tma_atom_d, bSG_sD[None, c_buffer], bSG_gD[None, subtile_idx])
-                            # Fence and barrier to make sure shared memory store is visible to TMA store
-                            d_pipeline.producer_commit()
-                            d_pipeline.producer_acquire()
-                        epilogue_barrier.arrive_and_wait()
-                    else:
-                        # Convert to D type
-                        acc_vec = tTR_rAcc.load()
-                        acc_vec = epilogue_op(acc_vec.to(self.d_dtype))
-                        tTR_rD.store(acc_vec)
-                        # Store D to global memory
-                        cute.copy(simt_atom, tTR_rD, tTR_gD[None, None, None, subtile_idx])
+                        d_pipeline.producer_commit()
+                        d_pipeline.producer_acquire()
+                    epilogue_barrier.arrive_and_wait()
 
                 # Async arrive accumulator buffer empty
                 with cute.arch.elect_one():
@@ -959,8 +899,7 @@ class PersistentDenseGemmKernel:
                 )
 
             # Wait for D store complete
-            if const_expr(self.use_tma_store):
-                d_pipeline.producer_tail()
+            d_pipeline.producer_tail()
 
     @cute.jit
     def load_AB(
@@ -1190,31 +1129,19 @@ class PersistentDenseGemmKernel:
         """
         # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, RestM, RestN, RestL)
         gC_epi = cute.flat_divide(gC_mnl[((None, None), 0, 0, None, None, None)], epi_tile)
-        if const_expr(self.use_tma_store):
-            tma_atom_d = atom
-            sC_for_tma_partition = cute.group_modes(sD, 0, 2)
-            gC_for_tma_partition = cute.group_modes(gC_epi, 0, 2)
-            # ((ATOM_V, REST_V), EPI_M, EPI_N)
-            # ((ATOM_V, REST_V), EPI_M, EPI_N, RestM, RestN, RestL)
-            bSG_sD, bSG_gD = cpasync.tma_partition(
-                tma_atom_d,
-                0,
-                cute.make_layout(1),
-                sC_for_tma_partition,
-                gC_for_tma_partition,
-            )
-            return tma_atom_d, bSG_sD, bSG_gD
-        else:
-            tiled_copy_t2r = atom
-            # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN, RestL)
-            thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
-            tTR_gD = thr_copy_t2r.partition_D(gC_epi)
-            # (T2R, T2R_M, T2R_N)
-            tTR_rD = cute.make_fragment(
-                tTR_gD[(None, None, None, 0, 0, 0, 0, 0)].shape, self.d_dtype
-            )
-            simt_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.d_dtype)
-            return simt_atom, tTR_rD, tTR_gD
+        tma_atom_d = atom
+        sC_for_tma_partition = cute.group_modes(sD, 0, 2)
+        gC_for_tma_partition = cute.group_modes(gC_epi, 0, 2)
+        # ((ATOM_V, REST_V), EPI_M, EPI_N)
+        # ((ATOM_V, REST_V), EPI_M, EPI_N, RestM, RestN, RestL)
+        bSG_sD, bSG_gD = cpasync.tma_partition(
+            tma_atom_d,
+            0,
+            cute.make_layout(1),
+            sC_for_tma_partition,
+            gC_for_tma_partition,
+        )
+        return tma_atom_d, bSG_sD, bSG_gD
 
     @staticmethod
     def _compute_stages(
@@ -1227,7 +1154,6 @@ class PersistentDenseGemmKernel:
         d_layout: utils.LayoutEnum,
         smem_capacity: int,
         occupancy: int,
-        use_tma_store: bool,
     ) -> Tuple[int, int, int]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 
@@ -1249,8 +1175,6 @@ class PersistentDenseGemmKernel:
         :type smem_capacity: int
         :param occupancy: Target number of CTAs per SM (occupancy).
         :type occupancy: int
-        :param use_tma_store: Whether TMA store is enabled.
-        :type use_tma_store: bool
 
         :return: A tuple containing the computed number of stages for:
                  (ACC stages, A/B operand stages, C stages)
@@ -1260,7 +1184,7 @@ class PersistentDenseGemmKernel:
         num_acc_stage = 2
 
         # Default D stages
-        num_d_stage = 2 if use_tma_store else 0
+        num_d_stage = 2
 
         # Calculate smem layout and size for one stage of A, B, and C
         a_smem_layout_staged_one = sm100_utils.make_smem_layout_a(
@@ -1275,23 +1199,14 @@ class PersistentDenseGemmKernel:
             b_dtype,
             1,  # a tmp 1 stage is provided
         )
-        d_smem_layout_staged_one = (
-            sm100_utils.make_smem_layout_epi(
-                d_dtype,
-                d_layout,
-                epi_tile,
-                1,
-            )
-            if use_tma_store
-            else None
-        )
+        d_smem_layout_staged_one = sm100_utils.make_smem_layout_epi(d_dtype, d_layout, epi_tile, 1)
+
         ab_bytes_per_stage = cute.size_in_bytes(
             a_dtype, a_smem_layout_staged_one
         ) + cute.size_in_bytes(b_dtype, b_smem_layout_staged_one)
         mbar_helpers_bytes = 1024
-        d_bytes_per_stage = (
-            cute.size_in_bytes(d_dtype, d_smem_layout_staged_one) if use_tma_store else 0
-        )
+        d_bytes_per_stage = cute.size_in_bytes(d_dtype, d_smem_layout_staged_one)
+
         d_bytes = d_bytes_per_stage * num_d_stage
 
         # Calculate A/B stages:
@@ -1305,12 +1220,11 @@ class PersistentDenseGemmKernel:
         # Refine epilogue stages:
         # Calculate remaining smem after allocating for A/B stages and reserved bytes
         # Add remaining unused smem to epilogue
-        if use_tma_store:
-            num_d_stage += (
-                smem_capacity
-                - occupancy * ab_bytes_per_stage * num_ab_stage
-                - occupancy * (mbar_helpers_bytes + d_bytes)
-            ) // (occupancy * d_bytes_per_stage)
+        num_d_stage += (
+            smem_capacity
+            - occupancy * ab_bytes_per_stage * num_ab_stage
+            - occupancy * (mbar_helpers_bytes + d_bytes)
+        ) // (occupancy * d_bytes_per_stage)
         return num_acc_stage, num_ab_stage, num_d_stage
 
     @staticmethod
@@ -1541,43 +1455,6 @@ class PersistentDenseGemmKernel:
         return is_valid
 
     @staticmethod
-    def is_valid_epilog_store_option(
-        use_2cta_instrs: bool,
-        use_tma_store: bool,
-        m: int,
-        n: int,
-        mma_tiler_mn: Tuple[int, int],
-    ) -> bool:
-        """
-        Check if the epilogue store option is valid
-
-        :param use_2cta_instrs: Whether to use 2 CTA groups
-        :type use_2cta_instrs: bool
-        :param use_tma_store: Whether to use TMA store
-        :type use_tma_store: bool
-        :param m: The number of rows in the A tensor
-        :type m: int
-        :param n: The number of columns in the B tensor
-        :type n: int
-        :param mma_tiler_mn: The (M, N) shape of the MMA instruction tiler
-        :type mma_tiler_mn: Tuple[int, int]
-
-        :return: True if the epilogue store option is valid, False otherwise
-        :rtype: bool
-        """
-
-        is_valid = True
-        # None TMA store version does not have predication, can not support OOB tiles
-        cta_tile_shape_mn = (
-            mma_tiler_mn[0] // (2 if use_2cta_instrs else 1),
-            mma_tiler_mn[1],
-        )
-        if not use_tma_store:
-            if not (m % cta_tile_shape_mn[0] == 0 and n % cta_tile_shape_mn[1] == 0):
-                is_valid = False
-        return is_valid
-
-    @staticmethod
     def can_implement(
         ab_dtype: Type[cutlass.Numeric],
         acc_dtype: Type[cutlass.Numeric],
@@ -1585,7 +1462,6 @@ class PersistentDenseGemmKernel:
         use_2cta_instrs: bool,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
-        use_tma_store: bool,
         m: int,
         n: int,
         k: int,
@@ -1609,8 +1485,6 @@ class PersistentDenseGemmKernel:
         :type mma_tiler_mn: Tuple[int, int]
         :param cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster
         :type cluster_shape_mn: Tuple[int, int]
-        :param use_tma_store: Whether to use TMA store
-        :type use_tma_store: bool
         :param m: The number of rows in the A tensor
         :type m: int
         :param n: The number of columns in the B tensor
@@ -1643,11 +1517,6 @@ class PersistentDenseGemmKernel:
             m, n, k, l, ab_dtype, d_dtype, a_major, b_major, c_major
         ):
             can_implement = False
-        # Skip invalid epilogue store option
-        if not PersistentDenseGemmKernel.is_valid_epilog_store_option(
-            use_2cta_instrs, use_tma_store, m, n, mma_tiler_mn
-        ):
-            can_implement = False
         return can_implement
 
 
@@ -1662,7 +1531,6 @@ def run(
     mma_tiler_mn: Tuple[int, int] = (256, 256),
     cluster_shape_mn: Tuple[int, int] = (2, 1),
     use_2cta_instrs: bool = True,
-    use_tma_store: bool = True,
     tolerance: float = 1e-01,
     warmup_iterations: int = 0,
     iterations: int = 1,
@@ -1694,9 +1562,6 @@ def run(
     :param use_2cta_instrs: Whether to use 2CTA instructions. If not specified in the decorator parameters, the autotuner
         will use the default value of True. Otherwise, the autotuner will use the value specified in the decorator parameters.
     :type use_2cta_instrs: bool, optional
-    :param use_tma_store: Whether to use TMA store. If not specified in the decorator parameters, the autotuner will use
-        the default value of True. Otherwise, the autotuner will use the value specified in the decorator parameters.
-    :type use_tma_store: bool, optional
     :param tolerance: Tolerance value for reference validation comparison, defaults to 1e-01
     :type tolerance: float, optional
     :param warmup_iterations: Number of warmup iterations before benchmarking, defaults to 0
@@ -1718,7 +1583,6 @@ def run(
     print(f"Matrix majors - A: {a_major}, B: {b_major}, C: {c_major}")
     print(f"Mma Tiler (M, N): {mma_tiler_mn}, Cluster Shape (M, N): {cluster_shape_mn}")
     print(f"2CTA MMA instructions: {'True' if use_2cta_instrs else 'False'}")
-    print(f"Use TMA Store: {'True' if use_tma_store else 'False'}")
     print(f"Tolerance: {tolerance}")
     print(f"Warmup iterations: {warmup_iterations}")
     print(f"Iterations: {iterations}")
@@ -1736,7 +1600,6 @@ def run(
         use_2cta_instrs,
         mma_tiler_mn,
         cluster_shape_mn,
-        use_tma_store,
         m,
         n,
         k,
@@ -1746,7 +1609,7 @@ def run(
         c_major,
     ):
         raise TypeError(
-            f"Unsupported testcase {ab_dtype}, {acc_dtype}, {d_dtype}, {use_2cta_instrs}, {mma_tiler_mn}, {cluster_shape_mn}, {use_tma_store}, {m}, {n}, {k}, {l}, {a_major}, {b_major}, {c_major}"
+            f"Unsupported testcase {ab_dtype}, {acc_dtype}, {d_dtype}, {use_2cta_instrs}, {mma_tiler_mn}, {cluster_shape_mn}, {m}, {n}, {k}, {l}, {a_major}, {b_major}, {c_major}"
         )
 
     if not torch.cuda.is_available():
@@ -1822,7 +1685,6 @@ def run(
         use_2cta_instrs,
         mma_tiler_mn,
         cluster_shape_mn,
-        use_tma_store,
     )
 
     # Compute max active clusters on current device
@@ -1974,7 +1836,6 @@ if __name__ == "__main__":
     parser.add_argument("--a_major", choices=["k", "m"], type=str, default="k")
     parser.add_argument("--b_major", choices=["k", "n"], type=str, default="k")
     parser.add_argument("--c_major", choices=["n", "m"], type=str, default="n")
-    parser.add_argument("--use_tma_store", action="store_true", help="Use tma store or not")
     parser.add_argument("--tolerance", type=float, default=3e-02, help="Tolerance for validation")
     parser.add_argument("--warmup_iterations", type=int, default=5, help="Warmup iterations")
     parser.add_argument(
@@ -2013,7 +1874,6 @@ if __name__ == "__main__":
         args.mma_tiler_mn,
         args.cluster_shape_mn,
         args.use_2cta_instrs,
-        args.use_tma_store,
         args.tolerance,
         args.warmup_iterations,
         args.iterations,
