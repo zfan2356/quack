@@ -430,11 +430,6 @@ class PersistentDenseGemmKernel:
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid = TileScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
 
-        # # Compute grid size
-        # self.tile_sched_params, grid = self._compute_grid(
-        #     mD, self.cta_tile_shape_mnk, self.cluster_shape_mn, max_active_clusters
-        # )
-
         self.buffer_align_bytes = 1024
 
         d_smem_size = cute.cosize(self.d_smem_layout_staged.outer)
@@ -583,65 +578,16 @@ class PersistentDenseGemmKernel:
             cta_layout_vmnk=cluster_layout_vmnk,
         )
 
-        #
         # Setup smem tensor A/B/D
-        #
-        # (EPI_TILE_M, EPI_TILE_N, STAGE)
-        sD = storage.sD.get_tensor(d_smem_layout_staged.outer, swizzle=d_smem_layout_staged.inner)
-
         # (MMA, MMA_M, MMA_K, STAGE)
         sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
         # (MMA, MMA_N, MMA_K, STAGE)
         sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
+        # (EPI_TILE_M, EPI_TILE_N, STAGE)
+        sD = storage.sD.get_tensor(d_smem_layout_staged.outer, swizzle=d_smem_layout_staged.inner)
 
-        #
-        # Compute multicast mask for A/B buffer full
-        #
-        a_mcast_mask = None
-        b_mcast_mask = None
-        if const_expr(self.is_a_mcast or self.is_b_mcast or use_2cta_instrs):
-            a_mcast_mask = cpasync.create_tma_multicast_mask(
-                cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
-            )
-            b_mcast_mask = cpasync.create_tma_multicast_mask(
-                cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1
-            )
-
-        #
-        # Local_tile partition global tensors
-        #
-        # (bM, bK, RestM, RestK, RestL)
-        gA_mkl = cute.local_tile(
-            mA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
-        )
-        # (bN, bK, RestN, RestK, RestL)
-        gB_nkl = cute.local_tile(
-            mB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
-        )
-        # (bM, bN, RestM, RestN, RestL)
-        gC_mnl = cute.local_tile(
-            mD_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
-        )
-        k_tile_cnt = cute.ceil_div(cute.size(mA_mkl.shape[1]), self.mma_tiler[2])
-
-        #
-        # Partition global tensor for TiledMMA_A/B/D
-        #
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
-        # (MMA, MMA_M, MMA_K, RestM, RestK, RestL)
-        tCgA = thr_mma.partition_A(gA_mkl)
-        # (MMA, MMA_N, MMA_K, RestN, RestK, RestL)
-        tCgB = thr_mma.partition_B(gB_nkl)
-        # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
-        tCgC = thr_mma.partition_C(gC_mnl)
 
-        #
-        # Partition shared/tensor memory tensor for TiledMMA_A/B/D
-        #
-        # (MMA, MMA_M, MMA_K, STAGE)
-        tCrA = tiled_mma.make_fragment_A(sA)
-        # (MMA, MMA_N, MMA_K, STAGE)
-        tCrB = tiled_mma.make_fragment_B(sB)
         # (MMA, MMA_M, MMA_N)
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
         # (MMA, MMA_M, MMA_N, STAGE)
@@ -653,34 +599,22 @@ class PersistentDenseGemmKernel:
         )
 
         TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
+        k_tile_cnt = cute.ceil_div(cute.size(mA_mkl.shape[1]), self.mma_tiler[2])
 
         #
         # Specialized TMA load warp
         #
         if warp_idx == self.tma_warp_id:
-            # Partition global/shared tensor for TMA load A/B
-            # TMA load A partition_S/D
-            a_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape)
-            # ((atom_v, rest_v), STAGE)
-            # ((atom_v, rest_v), RestM, RestK, RestL)
-            tAsA, tAgA = cpasync.tma_partition(
-                tma_atom_a,
-                block_in_cluster_coord_vmnk[2],
-                a_cta_layout,
-                cute.group_modes(sA, 0, 3),
-                cute.group_modes(tCgA, 0, 3),
-            )
-            # TMA load B partition_S/D
-            b_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape)
-            # ((atom_v, rest_v), STAGE)
-            # ((atom_v, rest_v), RestM, RestK, RestL)
-            tBsB, tBgB = cpasync.tma_partition(
-                tma_atom_b,
-                block_in_cluster_coord_vmnk[1],
-                b_cta_layout,
-                cute.group_modes(sB, 0, 3),
-                cute.group_modes(tCgB, 0, 3),
-            )
+            # Compute multicast mask for A/B buffer full
+            a_mcast_mask = None
+            b_mcast_mask = None
+            if const_expr(self.is_a_mcast or self.is_b_mcast or use_2cta_instrs):
+                a_mcast_mask = cpasync.create_tma_multicast_mask(
+                    cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
+                )
+                b_mcast_mask = cpasync.create_tma_multicast_mask(
+                    cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1
+                )
 
             # Persistent tile scheduling loop
             tile_scheduler = TileSchedulerCls()
@@ -696,20 +630,60 @@ class PersistentDenseGemmKernel:
                     tile_coord_mnkl[1],
                     tile_coord_mnkl[3],
                 )
-                # Slice to per mma tile index
+                # Local_tile partition global tensors
+                # (bM, bK, RestK)
+                gA_mkl = cute.local_tile(
+                    mA_mkl,
+                    cute.slice_(self.mma_tiler, (None, 0, None)),
+                    (mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2]),
+                )
+                # (bN, bK, RestK)
+                gB_nkl = cute.local_tile(
+                    mB_nkl,
+                    cute.slice_(self.mma_tiler, (0, None, None)),
+                    (mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2]),
+                )
+                # Partition global tensor for TiledMMA_A/B/D
+                # (MMA, MMA_M, MMA_K, RestK)
+                tCgA = thr_mma.partition_A(gA_mkl)
+                # (MMA, MMA_N, MMA_K, RestK)
+                tCgB = thr_mma.partition_B(gB_nkl)
+                # Partition global/shared tensor for TMA load A/B
+                # TMA load A partition_S/D
+                a_cta_layout = cute.make_layout(
+                    cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
+                )
+                # ((atom_v, rest_v), STAGE)
                 # ((atom_v, rest_v), RestK)
-                tAgA_slice = tAgA[None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2]]
+                tAsA, tAgA = cpasync.tma_partition(
+                    tma_atom_a,
+                    block_in_cluster_coord_vmnk[2],
+                    a_cta_layout,
+                    cute.group_modes(sA, 0, 3),
+                    cute.group_modes(tCgA, 0, 3),
+                )
+                # TMA load B partition_S/D
+                b_cta_layout = cute.make_layout(
+                    cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
+                )
+                # ((atom_v, rest_v), STAGE)
                 # ((atom_v, rest_v), RestK)
-                tBgB_slice = tBgB[None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2]]
+                tBsB, tBgB = cpasync.tma_partition(
+                    tma_atom_b,
+                    block_in_cluster_coord_vmnk[1],
+                    b_cta_layout,
+                    cute.group_modes(sB, 0, 3),
+                    cute.group_modes(tCgB, 0, 3),
+                )
                 ab_producer_state = self.load_AB(
                     ab_pipeline,
                     ab_producer_state,
                     tma_atom_a,
-                    tAgA_slice,
+                    tAgA,
                     tAsA,
                     a_mcast_mask,
                     tma_atom_b,
-                    tBgB_slice,
+                    tBgB,
                     tBsB,
                     b_mcast_mask,
                 )
@@ -728,6 +702,11 @@ class PersistentDenseGemmKernel:
             tmem_ptr = cute.arch.retrieve_tmem_ptr(
                 self.acc_dtype, alignment=16, ptr_to_buffer_holding_addr=tmem_holding_buf
             )
+            # Partition shared/tensor memory tensor for TiledMMA_A/B/D
+            # (MMA, MMA_M, MMA_K, STAGE)
+            tCrA = tiled_mma.make_fragment_A(sA)
+            # (MMA, MMA_N, MMA_K, STAGE)
+            tCrB = tiled_mma.make_fragment_B(sB)
             # (MMA, MMA_M, MMA_N, STAGE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
 
@@ -743,11 +722,6 @@ class PersistentDenseGemmKernel:
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
                 tile_coord_mnkl = work_tile.tile_idx
-                mma_tile_coord_mnl = (
-                    tile_coord_mnkl[0] // cute.size(tiled_mma.thr_id.shape),
-                    tile_coord_mnkl[1],
-                    tile_coord_mnkl[3],
-                )
                 # Set tensor memory buffer for current tile
                 # (MMA, MMA_M, MMA_N)
                 tCtAcc = tCtAcc_base[None, None, None, acc_producer_state.index]
@@ -796,18 +770,13 @@ class PersistentDenseGemmKernel:
             # Partition for epilogue
             epi_tidx = tidx
             tiled_copy_t2r, tTR_tAcc_base, tTR_rAcc = self.epilog_tmem_copy_and_partition(
-                epi_tidx, tCtAcc_base, tCgC, epi_tile, use_2cta_instrs
+                epi_tidx, tCtAcc_base, epi_tile, use_2cta_instrs
             )
 
             tTR_rD = cute.make_fragment(tTR_rAcc.shape, self.d_dtype)
             tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
                 tiled_copy_t2r, tTR_rD, epi_tidx, sD
             )
-            (
-                tma_atom_d,
-                bSG_sD,
-                bSG_gC_partitioned,
-            ) = self.epilog_gmem_copy_and_partition(epi_tidx, tma_atom_d, tCgC, epi_tile, sD)
 
             # Persistent tile scheduling loop
             tile_scheduler = TileSchedulerCls()
@@ -833,11 +802,18 @@ class PersistentDenseGemmKernel:
                     tile_coord_mnkl[1],
                     tile_coord_mnkl[3],
                 )
-                # Slice to per mma tile index
-                bSG_gD = None
-                tTR_gD = None
-                # ((ATOM_V, REST_V), EPI_M, EPI_N)
-                bSG_gD = bSG_gC_partitioned[None, None, None, *mma_tile_coord_mnl]
+                # Local_tile partition global tensors
+                # (bM, bN)
+                gD_mnl = cute.local_tile(
+                    mD_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), mma_tile_coord_mnl
+                )
+                # Partition global tensor for TiledMMA_A/B/D
+                # (MMA, MMA_M, MMA_N)
+                tDgD = thr_mma.partition_C(gD_mnl)
+                # bSG_gD has shape ((ATOM_V, REST_V), EPI_M, EPI_N)
+                bSG_sD, bSG_gD = self.epilog_gmem_copy_and_partition(
+                    epi_tidx, tma_atom_d, tDgD, epi_tile, sD
+                )
 
                 # Set tensor memory buffer for current tile
                 # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
@@ -862,8 +838,8 @@ class PersistentDenseGemmKernel:
                     acc_vec = epilogue_op(acc_vec.to(self.d_dtype))
                     tRS_rC.store(acc_vec)
                     # Store D to shared memory
-                    c_buffer = (num_prev_subtiles + subtile_idx) % self.num_d_stage
-                    cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, c_buffer)])
+                    d_buffer = (num_prev_subtiles + subtile_idx) % self.num_d_stage
+                    cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, d_buffer)])
                     # Fence and barrier to make sure shared memory store is visible to TMA store
                     cute.arch.fence_proxy(
                         cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
@@ -871,7 +847,7 @@ class PersistentDenseGemmKernel:
                     epilogue_barrier.arrive_and_wait()
                     # TMA store D to global memory
                     if warp_idx == self.epilog_warp_id[0]:
-                        cute.copy(tma_atom_d, bSG_sD[None, c_buffer], bSG_gD[None, subtile_idx])
+                        cute.copy(tma_atom_d, bSG_sD[None, d_buffer], bSG_gD[None, subtile_idx])
                         # Fence and barrier to make sure shared memory store is visible to TMA store
                         d_pipeline.producer_commit()
                         d_pipeline.producer_acquire()
@@ -1001,7 +977,6 @@ class PersistentDenseGemmKernel:
         self,
         tidx: Int32,
         tAcc: cute.Tensor,
-        gC_mnl: cute.Tensor,
         epi_tile: cute.Tile,
         use_2cta_instrs: Union[cutlass.Boolean, bool],
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
@@ -1012,8 +987,6 @@ class PersistentDenseGemmKernel:
         :type tidx: Int32
         :param tAcc: The accumulator tensor to be copied and partitioned
         :type tAcc: cute.Tensor
-        :param gC_mnl: The global tensor C
-        :type gC_mnl: cute.Tensor
         :param epi_tile: The epilogue tiler
         :type epi_tile: cute.Tile
         :param use_2cta_instrs: Whether use_2cta_instrs is enabled
@@ -1035,10 +1008,7 @@ class PersistentDenseGemmKernel:
             use_2cta_instrs,
         )
         # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, STAGE)
-        tAcc_epi = cute.flat_divide(
-            tAcc[((None, None), 0, 0, None)],
-            epi_tile,
-        )
+        tAcc_epi = cute.flat_divide(tAcc[((None, None), 0, 0, None)], epi_tile)
         # (EPI_TILE_M, EPI_TILE_N)
         tiled_copy_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tAcc_epi[(None, None, 0, 0, 0)])
 
@@ -1046,14 +1016,13 @@ class PersistentDenseGemmKernel:
         # (T2R, T2R_M, T2R_N, EPI_M, EPI_M, STAGE)
         tTR_tAcc = thr_copy_t2r.partition_S(tAcc_epi)
 
-        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, RestM, RestN, RestL)
-        gC_mnl_epi = cute.flat_divide(gC_mnl[((None, None), 0, 0, None, None, None)], epi_tile)
-        # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN, RestL)
-        tTR_gD = thr_copy_t2r.partition_D(gC_mnl_epi)
+        cAcc = cute.make_identity_tensor((self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1]))
+        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N)
+        cAcc_epi = cute.flat_divide(cAcc, epi_tile)
+        # (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
+        tTR_cAcc = thr_copy_t2r.partition_D(cAcc_epi)
         # (T2R, T2R_M, T2R_N)
-        tTR_rAcc = cute.make_fragment(
-            tTR_gD[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
-        )
+        tTR_rAcc = cute.make_fragment(tTR_cAcc[None, None, None, 0, 0].shape, self.acc_dtype)
         return tiled_copy_t2r, tTR_tAcc, tTR_rAcc
 
     def epilog_smem_copy_and_partition(
@@ -1097,10 +1066,10 @@ class PersistentDenseGemmKernel:
         self,
         tidx: Int32,
         atom: Union[cute.CopyAtom, cute.TiledCopy],
-        gC_mnl: cute.Tensor,
+        gD_mnl: cute.Tensor,
         epi_tile: cute.Tile,
         sD: cute.Tensor,
-    ) -> Tuple[cute.CopyAtom, cute.Tensor, cute.Tensor]:
+    ) -> Tuple[cute.Tensor, cute.Tensor]:
         """Make tiledCopy for global memory store, then use it to:
         - partition register array (source) and global memory (destination) for none TMA store version;
         - partition shared memory (source) and global memory (destination) for TMA store version.
@@ -1109,8 +1078,8 @@ class PersistentDenseGemmKernel:
         :type tidx: Int32
         :param atom: The copy_atom_c to be used for TMA store version, or tiled_copy_t2r for none TMA store version
         :type atom: cute.CopyAtom or cute.TiledCopy
-        :param gC_mnl: The global tensor C
-        :type gC_mnl: cute.Tensor
+        :param gD_mnl: The global tensor C
+        :type gD_mnl: cute.Tensor
         :param epi_tile: The epilogue tiler
         :type epi_tile: cute.Tile
         :param sD: The shared memory tensor to be copied and partitioned
@@ -1127,21 +1096,19 @@ class PersistentDenseGemmKernel:
                 - tTR_gD: The partitioned global tensor C
         :rtype: Tuple[cute.CopyAtom, cute.Tensor, cute.Tensor]
         """
-        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, RestM, RestN, RestL)
-        gC_epi = cute.flat_divide(gC_mnl[((None, None), 0, 0, None, None, None)], epi_tile)
-        tma_atom_d = atom
+        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N)
+        gC_epi = cute.flat_divide(gD_mnl[((None, None), 0, 0)], epi_tile)
         sC_for_tma_partition = cute.group_modes(sD, 0, 2)
         gC_for_tma_partition = cute.group_modes(gC_epi, 0, 2)
         # ((ATOM_V, REST_V), EPI_M, EPI_N)
-        # ((ATOM_V, REST_V), EPI_M, EPI_N, RestM, RestN, RestL)
         bSG_sD, bSG_gD = cpasync.tma_partition(
-            tma_atom_d,
+            atom,
             0,
             cute.make_layout(1),
             sC_for_tma_partition,
             gC_for_tma_partition,
         )
-        return tma_atom_d, bSG_sD, bSG_gD
+        return bSG_sD, bSG_gD
 
     @staticmethod
     def _compute_stages(
@@ -1228,41 +1195,6 @@ class PersistentDenseGemmKernel:
         return num_acc_stage, num_ab_stage, num_d_stage
 
     @staticmethod
-    def _compute_grid(
-        c: cute.Tensor,
-        cta_tile_shape_mnk: Tuple[int, int, int],
-        cluster_shape_mn: Tuple[int, int],
-        max_active_clusters: cutlass.Constexpr,
-    ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
-        """Use persistent tile scheduler to compute the grid size for the output tensor C.
-
-        :param c: The output tensor C
-        :type c: cute.Tensor
-        :param cta_tile_shape_mnk: The shape (M, N, K) of the CTA tile.
-        :type cta_tile_shape_mnk: tuple[int, int, int]
-        :param cluster_shape_mn: Shape of each cluster in M, N dimensions.
-        :type cluster_shape_mn: tuple[int, int]
-        :param max_active_clusters: Maximum number of active clusters.
-        :type max_active_clusters: cutlass.Constexpr
-
-        :return: A tuple containing:
-            - tile_sched_params: Parameters for the persistent tile scheduler.
-            - grid: Grid shape for kernel launch.
-        :rtype: Tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]
-        """
-        c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
-        gc = cute.zipped_divide(c, tiler=c_shape)
-        num_ctas_mnl = gc[(0, (None, None, None))].shape
-        cluster_shape_mnl = (*cluster_shape_mn, 1)
-
-        tile_sched_params = utils.PersistentTileSchedulerParams(num_ctas_mnl, cluster_shape_mnl)
-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
-            tile_sched_params, max_active_clusters
-        )
-
-        return tile_sched_params, grid
-
-    @staticmethod
     def _compute_num_tmem_alloc_cols(
         tiled_mma: cute.TiledMma,
         mma_tiler: Tuple[int, int, int],
@@ -1284,7 +1216,6 @@ class PersistentDenseGemmKernel:
         acc_shape = tiled_mma.partition_shape_C(mma_tiler[:2])
         tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, num_acc_stage))
         num_tmem_alloc_cols = utils.get_num_tmem_alloc_cols(tCtAcc_fake)
-
         return num_tmem_alloc_cols
 
     @staticmethod
