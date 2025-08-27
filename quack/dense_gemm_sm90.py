@@ -360,28 +360,33 @@ class HopperWgmmaGemmKernel:
         self.num_threads_per_warp_group = 128
         self.threads_per_cta = (self.mma_warp_groups + 1) * self.num_threads_per_warp_group
         self.smem_capacity = cutlass.utils.get_smem_capacity_in_bytes("sm_90")
-        self.num_mma_threads = (
-            self.mma_warp_groups if not self.pingpong else 1
-        ) * self.num_threads_per_warp_group
         self.num_epi_threads = (
             self.mma_warp_groups if not self.pingpong else 1
         ) * self.num_threads_per_warp_group
-        self.num_ab_load_warps = 1 if not self.load_A_cpasync else 2
+        self.num_ab_load_warps = 1 if not self.load_A_cpasync else 3
         self.num_ab_load_threads = cute.arch.WARP_SIZE * self.num_ab_load_warps
         self.num_epi_load_threads = cute.arch.WARP_SIZE * 1
         self.ab_load_warp_id = self.mma_warp_groups * 4
         self.epi_load_warp_id = self.ab_load_warp_id + self.num_ab_load_warps
 
-        regs_per_thread = math.prod(self.tile_shape_mnk[:2]) // self.num_mma_threads
+        regs_per_thread = math.prod(self.tile_shape_mnk[:2]) // (
+            math.prod(self.atom_layout_mnk) * self.num_threads_per_warp_group
+        )
         if self.fp8_slow_accum:
             regs_per_thread *= 2
-        if self.mma_warp_groups == 3:
-            self.num_regs_load, self.num_regs_mma = 32, 160
+        if not self.load_A_cpasync:
+            if self.mma_warp_groups == 3:
+                self.num_regs_load, self.num_regs_mma = 32, 160
+            else:
+                heavy_register_pressure = regs_per_thread >= 208
+                self.num_regs_load, self.num_regs_mma = (
+                    (40, 232) if not heavy_register_pressure else (24, 240)
+                )
         else:
-            heavy_register_pressure = regs_per_thread >= 208
-            self.num_regs_load, self.num_regs_mma = (
-                (40, 232) if not heavy_register_pressure else (24, 240)
-            )
+            if self.mma_warp_groups == 3:
+                self.num_regs_load, self.num_regs_mma = 56, 152
+            else:
+                self.num_regs_load, self.num_regs_mma = (56, 224)
 
         self.ab_stage = None
         self.epi_stage = None
@@ -741,7 +746,7 @@ class HopperWgmmaGemmKernel:
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, producer_cnt)
         # Each warp will contribute to the arrive count with the number of mcast size
         mcast_size = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
-        consumer_arrive_cnt = mcast_size * (self.num_mma_threads // cute.arch.WARP_SIZE)
+        consumer_arrive_cnt = mcast_size * (tiled_mma.size // cute.arch.WARP_SIZE)
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
@@ -907,6 +912,7 @@ class HopperWgmmaGemmKernel:
                             cute.group_modes(sA, 0, 2),
                             cute.group_modes(gA_k, 0, 2),
                         )
+                        copy_A = partial(cute.copy, tma_atom_a, mcast_mask=a_mcast_mask)
                     else:
                         tiled_copy_A = self._make_gmem_tiled_copy_A(
                             mA_mkl.element_type, self.a_layout, self.num_ab_load_threads
@@ -924,6 +930,7 @@ class HopperWgmmaGemmKernel:
                         tAsA = thr_copy_A.partition_D(sA)
                         assert tAsA.shape[2] == 1
                         tAsA = cute.group_modes(cute.slice_(tAsA, (None, None, 0, None)), 0, 2)
+                        copy_A = partial(cute.copy, tiled_copy_A)
                     # TMA load B partition_S/D
                     b_cta_layout = cute.make_layout(
                         cute.slice_(cluster_layout_mnk, (None, 0, 0)).shape
@@ -938,30 +945,32 @@ class HopperWgmmaGemmKernel:
                         cute.group_modes(sB, 0, 2),
                         cute.group_modes(gB_k, 0, 2),
                     )
+                    copy_B = partial(cute.copy, tma_atom_b, mcast_mask=b_mcast_mask)
                     if const_expr(not self.load_A_cpasync):
                         ab_producer_state = self.load_AB(
                             ab_pipeline,
                             ab_producer_state,
-                            tma_atom_a,
+                            copy_A,
                             tAgA_k,
                             tAsA,
-                            a_mcast_mask,
-                            tma_atom_b,
+                            copy_B,
                             tBgB_k,
                             tBsB,
-                            b_mcast_mask,
                         )
                     else:
                         ab_producer_state = self.load_AB_cpasync_A(
                             ab_pipeline,
                             ab_producer_state,
-                            tiled_copy_A,
+                            thr_copy_A,
                             tAgA_k,
                             tAsA,
-                            tma_atom_b,
+                            copy_B,
                             tBgB_k,
                             tBsB,
-                            b_mcast_mask,
+                            limit_A=(
+                                mA_mk.shape[0] - tile_coord_mnkl[0] * self.tile_shape_mnk[0],
+                                mA_mk.shape[1],
+                            ),
                         )
                     if const_expr(epi_load_barrier is not None):
                         # In the first work tile, the epi load warp will wait for the signal
@@ -1293,14 +1302,12 @@ class HopperWgmmaGemmKernel:
         self,
         ab_pipeline: cutlass.pipeline.PipelineAsync,
         ab_producer_state: cutlass.pipeline.PipelineState,
-        tma_atom_a: cute.CopyAtom,
+        copy_A: Callable,
         tAgA: cute.Tensor,
         tAsA: cute.Tensor,
-        a_mcast_mask: cutlass.Int16,
-        tma_atom_b: cute.CopyAtom,
+        copy_B: Callable,
         tBgB: cute.Tensor,
         tBsB: cute.Tensor,
-        b_mcast_mask: cutlass.Int16,
     ) -> cutlass.pipeline.PipelineState:
         k_tile_cnt = cute.size(tAgA, mode=[1])
         # Peek (try_wait) AB buffer empty for k_block = prefetch_k_tile_cnt
@@ -1314,19 +1321,16 @@ class HopperWgmmaGemmKernel:
             # Wait for A/B buffers to be empty before loading into them
             # Also sets the transaction barrier for the A/B buffers
             ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
-            cute.copy(
-                tma_atom_a,
+            tma_bar_ptr = ab_pipeline.producer_get_barrier(ab_producer_state)
+            copy_A(
                 tAgA[None, k_tile],
                 tAsA[None, ab_producer_state.index],
-                tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
-                mcast_mask=a_mcast_mask,
+                tma_bar_ptr=tma_bar_ptr,
             )
-            cute.copy(
-                tma_atom_b,
+            copy_B(
                 tBgB[None, k_tile],
                 tBsB[None, ab_producer_state.index],
-                tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
-                mcast_mask=b_mcast_mask,
+                tma_bar_ptr=tma_bar_ptr,
             )
             # Mainloop pipeline's producer commit is a NOP
             ab_pipeline.producer_commit(ab_producer_state)
@@ -1341,14 +1345,23 @@ class HopperWgmmaGemmKernel:
         self,
         ab_pipeline: cutlass.pipeline.PipelineAsync,
         ab_producer_state: cutlass.pipeline.PipelineState,
-        tiled_copy_A: cute.TiledCopy,
+        thr_copy_A: cute.core.ThrCopy,
         tAgA: cute.Tensor,
         tAsA: cute.Tensor,
-        tma_atom_b: cute.CopyAtom,
+        copy_B: Callable,
         tBgB: cute.Tensor,
         tBsB: cute.Tensor,
-        b_mcast_mask: cutlass.Int16,
+        limit_A: Tuple[Int32, Int32],
     ) -> cutlass.pipeline.PipelineState:
+        limit_m, limit_k = limit_A
+        limit_m = min(limit_m, self.tile_shape_mnk[0])  # To avoid writing beyond smem limit
+        cA = cute.make_identity_tensor(cute.select(self.tile_shape_mnk, [0, 2]))
+        tAcA = thr_copy_A.partition_S(cA)
+        t0AcA = thr_copy_A.get_slice(0).partition_S(cA)
+        # Instead of comparing tAcA to limit_m, we instead compare t0AcA to limit_m - tAcA[0][0]
+        # since we know that tAcA[m][0] = t0AcA[m][0] + tAcA[0][0].
+        # This is so that when we do the comparison, t0AcA is known at compile time.
+        limit_m = limit_m - tAcA[0][0]
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         k_tile_cnt = cute.size(tAgA, mode=[1])
         # Peek (try_wait) AB buffer empty for k_block = prefetch_k_tile_cnt
@@ -1356,36 +1369,58 @@ class HopperWgmmaGemmKernel:
         if 0 < k_tile_cnt:
             peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
         # /////////////////////////////////////////////////////////////////////////
-        # TMA load
+        # TMA load on B and cp.async on A
         # /////////////////////////////////////////////////////////////////////////
-        for k_tile in cutlass.range(k_tile_cnt, unroll=1):
+        copy_A = partial(cute.copy, thr_copy_A)
+        for k_tile in cutlass.range(k_tile_cnt - 1, unroll=1):
             # Wait for A/B buffers to be empty before loading into them
             # Also sets the transaction barrier for the A/B buffers
             ab_pipeline.producer_acquire(
                 ab_producer_state,
                 peek_ab_empty_status,
-                is_tma_warp=warp_idx == self.ab_load_warp_id,
+                # A bit faster to rotate the warp that does TMA
+                is_tma_warp=warp_idx == self.ab_load_warp_id + (k_tile % self.num_ab_load_warps),
             )
-            # TODO: need bound checking
-            cute.copy(
-                tiled_copy_A,
-                tAgA[None, k_tile],
-                tAsA[None, ab_producer_state.index],
-            )
-            if warp_idx == self.ab_load_warp_id:
-                cute.copy(
-                    tma_atom_b,
+            # A bit faster to load B first while we calculate the predicate for A
+            if warp_idx == self.ab_load_warp_id + (k_tile % self.num_ab_load_warps):
+                copy_B(
                     tBgB[None, k_tile],
                     tBsB[None, ab_producer_state.index],
                     tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
-                    mcast_mask=b_mcast_mask,
                 )
+            for m in cutlass.range_constexpr(tAcA.shape[1]):
+                if t0AcA[0, m, 0][0] < limit_m:
+                    copy_A(tAgA[(None, m), k_tile], tAsA[(None, m), ab_producer_state.index])
             # This tells mbarrier to track the completion of cp.async
             ab_pipeline.producer_commit(ab_producer_state)
             ab_producer_state.advance()
             peek_ab_empty_status = cutlass.Boolean(True)
             if k_tile + 1 < k_tile_cnt:
                 peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
+        # bound checking in the K dimension on the last k_tile
+        if 0 < k_tile_cnt:
+            k_tile = k_tile_cnt - 1
+            ab_pipeline.producer_acquire(
+                ab_producer_state,
+                peek_ab_empty_status,
+                is_tma_warp=warp_idx == self.ab_load_warp_id,
+            )
+            if warp_idx == self.ab_load_warp_id:
+                copy_B(
+                    tBgB[None, k_tile],
+                    tBsB[None, ab_producer_state.index],
+                    tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                )
+            assert tAcA.shape[2] == 1  # there's only 1 load along the K dimension
+            tApA = cute.make_fragment(1, cutlass.Boolean)
+            tApA[0] = tAcA[0, 0, 0][1] < limit_k
+            for m in cutlass.range_constexpr(tAcA.shape[1]):
+                if t0AcA[0, m, 0][0] < limit_m:
+                    copy_A(
+                        tAgA[(None, m), k_tile], tAsA[(None, m), ab_producer_state.index], pred=tApA
+                    )
+            ab_pipeline.producer_commit(ab_producer_state)
+            ab_producer_state.advance()
         return ab_producer_state
 
     @cute.jit
