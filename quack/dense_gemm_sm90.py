@@ -364,7 +364,7 @@ class HopperWgmmaGemmKernel:
         self.num_epi_threads = (
             self.mma_warp_groups if not self.pingpong else 1
         ) * self.num_threads_per_warp_group
-        self.num_ab_load_warps = 1 if not self.gather_A else 3
+        self.num_ab_load_warps = 1 if not self.gather_A else 4
         self.num_ab_load_threads = cute.arch.WARP_SIZE * self.num_ab_load_warps
         self.num_epi_load_threads = cute.arch.WARP_SIZE * 1
         self.ab_load_warp_id = self.mma_warp_groups * 4
@@ -908,8 +908,12 @@ class HopperWgmmaGemmKernel:
                         )
                     else:
                         mA_mk = mA_mkl
+                        if const_expr(cu_seqlens_m is not None):
+                            mAIdx_mk = cute.domain_offset((cu_seqlens_m[batch_idx],), mAIdx)
+                        else:
+                            mAIdx_mk = mAIdx[None, batch_idx]
                         gAIdx = cute.local_tile(
-                            mAIdx[None, batch_idx], (self.tile_shape_mnk[0],), (tile_coord_mnkl[0],)
+                            mAIdx_mk, (self.tile_shape_mnk[0],), (tile_coord_mnkl[0],)
                         )
                     # (bN, bK, RestK)
                     gB_k = cute.local_tile(
@@ -975,6 +979,11 @@ class HopperWgmmaGemmKernel:
                             tBsB,
                         )
                     else:
+                        limit_m = (
+                            mAIdx.shape[0]
+                            if const_expr(cu_seqlens_m is None)
+                            else cu_seqlens_m[batch_idx + 1] - cu_seqlens_m[batch_idx]
+                        )
                         ab_producer_state = self.load_AB_gather_A(
                             ab_pipeline,
                             ab_producer_state,
@@ -986,7 +995,7 @@ class HopperWgmmaGemmKernel:
                             tBgB_k,
                             tBsB,
                             limit_A=(
-                                mAIdx.shape[0] - tile_coord_mnkl[0] * self.tile_shape_mnk[0],
+                                limit_m - tile_coord_mnkl[0] * self.tile_shape_mnk[0],
                                 mA_mk.shape[1],
                             ),
                         )
@@ -2079,8 +2088,8 @@ def run(
 
     a, mA, a_torch = create_and_permute_tensor(l, m, k, a_major == "m", a_dtype)
     if gather_A:
-        assert not varlen_m, "gather_A and varlen_m cannot be both True for now"
         assert a_major == "k"
+        assert c_dtype is None, "Gather A doesn't support loading C for now"
         a_idx = torch.randperm(l * m, dtype=torch.int32, device="cuda")
         from einops import rearrange
 
@@ -2102,12 +2111,17 @@ def run(
         assert d_major == "n"
         from einops import rearrange
 
-        a, a_torch, d_torch = [rearrange(t, "m x l -> (l m) x") for t in (a, a_torch, d_torch)]
+        a, d_torch = [rearrange(t, "m x l -> (l m) x") for t in (a, d_torch)]
+        if not gather_A:
+            (a_torch,) = [rearrange(t, "m x l -> (l m) x") for t in (a_torch,)]
         mA = from_dlpack(a_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
         mD = from_dlpack(d_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
         # TODO: generate random cu_seqlens_m
         cu_seqlens_m = torch.arange(0, l + 1, dtype=torch.int32, device="cuda") * m
         mCuSeqlensM = from_dlpack(cu_seqlens_m, assumed_align=64).mark_layout_dynamic(leading_dim=0)
+        if gather_A:
+            a_idx_reshaped = rearrange(a_idx_reshaped, "m l -> (l m)")
+            mAIdx = from_dlpack(a_idx_reshaped, assumed_align=4).mark_layout_dynamic(leading_dim=0)
     else:
         cu_seqlens_m, mCuSeqlensM = None, None
 
@@ -2266,6 +2280,9 @@ def run(
     fn = lambda: compiled_gemm(
         mA, mB, mD, mC, mAIdx, mCuSeqlensM, tensormaps_tensor, max_active_clusters, current_stream
     )
+    timing = do_bench(fn, warmup=warmup, rep=repeats)
+    # Idk why but for some cases the 1st run is much slower
+    time.sleep(0.5)
     timing = do_bench(fn, warmup=warmup, rep=repeats)
     tflops = flops / (timing * 1e9)  # Convert to TFlops
     print(f"Cute-DSL Average time: {timing:.3f} ms, TFLOPS: {tflops:.1f}")
