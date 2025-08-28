@@ -1012,58 +1012,58 @@ class HopperWgmmaGemmKernel:
                     # End of persistent scheduler loop
                 ab_pipeline.producer_tail(ab_producer_state)
 
-            if const_expr(mC_mnl is not None):
-                if warp_idx == self.epi_load_warp_id:
-                    epi_producer_state = make_pipeline_state(
-                        pipeline.PipelineUserType.Producer, self.epi_c_stage
-                    )
-                    do_epi_load_barrier_wait = cutlass.Boolean(True)
-                    tile_scheduler = TileSchedulerCls()
-                    work_tile = tile_scheduler.initial_work_tile_info()
-                    while work_tile.is_valid_tile:
-                        tile_coord_mnkl = work_tile.tile_idx
-                        batch_idx = tile_coord_mnkl[3]
-                        if const_expr(cu_seqlens_m is not None):
-                            mC_mn = cute.domain_offset((cu_seqlens_m[batch_idx], 0), mC_mnl)
-                        else:
-                            mC_mn = mC_mnl[None, None, batch_idx]
-                        # (bM, bN)
-                        gC = cute.local_tile(
-                            mC_mn, cute.select(self.tile_shape_mnk, [0, 1]), tile_coord_mnkl[:2]
-                        )
-                        tCgC_for_tma_partition = cute.zipped_divide(gC, self.epi_tile)
-                        bGS_sC, bGS_gC = cpasync.tma_partition(
-                            tma_atom_c,
-                            0,
-                            cute.make_layout(1),
-                            cute.group_modes(sC, 0, 2),
-                            tCgC_for_tma_partition,
-                        )
-                        if do_epi_load_barrier_wait:
-                            epi_load_barrier.arrive_and_wait()
-                            do_epi_load_barrier_wait = cutlass.Boolean(False)
-                        epi_tile_num = const_expr(cute.size(tCgC_for_tma_partition, mode=[1]))
-                        epi_tile_shape = tCgC_for_tma_partition.shape[1]
-                        for epi_idx in cutlass.range(epi_tile_num, unroll=1):
-                            epi_pipeline.producer_acquire(epi_producer_state)
-                            # Get the global memory coordinate for the current epi tile
-                            epi_tile_layout = cute.make_layout(
-                                epi_tile_shape, stride=(epi_tile_shape[1], 1)
-                            )
-                            gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
-                            cute.copy(
-                                tma_atom_c,
-                                bGS_gC[None, gmem_coord],
-                                bGS_sC[None, epi_producer_state.index],
-                                tma_bar_ptr=epi_pipeline.producer_get_barrier(epi_producer_state),
-                            )
-                            # Epi pipeline's producer commit is a NOP
-                            epi_pipeline.producer_commit(epi_producer_state)
-                            epi_producer_state.advance()
-                        tile_scheduler.advance_to_next_work()
-                        work_tile = tile_scheduler.get_current_work()
-                        # End of persistent scheduler loop
-                    epi_pipeline.producer_tail(epi_producer_state)
+            # if const_expr(mC_mnl is not None):
+            #     if warp_idx == self.epi_load_warp_id:
+            #         epi_producer_state = make_pipeline_state(
+            #             pipeline.PipelineUserType.Producer, self.epi_c_stage
+            #         )
+            #         do_epi_load_barrier_wait = cutlass.Boolean(True)
+            #         tile_scheduler = TileSchedulerCls()
+            #         work_tile = tile_scheduler.initial_work_tile_info()
+            #         while work_tile.is_valid_tile:
+            #             tile_coord_mnkl = work_tile.tile_idx
+            #             batch_idx = tile_coord_mnkl[3]
+            #             if const_expr(cu_seqlens_m is not None):
+            #                 mC_mn = cute.domain_offset((cu_seqlens_m[batch_idx], 0), mC_mnl)
+            #             else:
+            #                 mC_mn = mC_mnl[None, None, batch_idx]
+            #             # (bM, bN)
+            #             gC = cute.local_tile(
+            #                 mC_mn, cute.select(self.tile_shape_mnk, [0, 1]), tile_coord_mnkl[:2]
+            #             )
+            #             tCgC_for_tma_partition = cute.zipped_divide(gC, self.epi_tile)
+            #             bGS_sC, bGS_gC = cpasync.tma_partition(
+            #                 tma_atom_c,
+            #                 0,
+            #                 cute.make_layout(1),
+            #                 cute.group_modes(sC, 0, 2),
+            #                 tCgC_for_tma_partition,
+            #             )
+            #             if do_epi_load_barrier_wait:
+            #                 epi_load_barrier.arrive_and_wait()
+            #                 do_epi_load_barrier_wait = cutlass.Boolean(False)
+            #             epi_tile_num = const_expr(cute.size(tCgC_for_tma_partition, mode=[1]))
+            #             epi_tile_shape = tCgC_for_tma_partition.shape[1]
+            #             for epi_idx in cutlass.range(epi_tile_num, unroll=1):
+            #                 epi_pipeline.producer_acquire(epi_producer_state)
+            #                 # Get the global memory coordinate for the current epi tile
+            #                 epi_tile_layout = cute.make_layout(
+            #                     epi_tile_shape, stride=(epi_tile_shape[1], 1)
+            #                 )
+            #                 gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
+            #                 cute.copy(
+            #                     tma_atom_c,
+            #                     bGS_gC[None, gmem_coord],
+            #                     bGS_sC[None, epi_producer_state.index],
+            #                     tma_bar_ptr=epi_pipeline.producer_get_barrier(epi_producer_state),
+            #                 )
+            #                 # Epi pipeline's producer commit is a NOP
+            #                 epi_pipeline.producer_commit(epi_producer_state)
+            #                 epi_producer_state.advance()
+            #             tile_scheduler.advance_to_next_work()
+            #             work_tile = tile_scheduler.get_current_work()
+            #             # End of persistent scheduler loop
+            #         epi_pipeline.producer_tail(epi_producer_state)
 
         if warp_idx < self.ab_load_warp_id:
             cute.arch.warpgroup_reg_alloc(self.num_regs_mma)
@@ -1115,6 +1115,9 @@ class HopperWgmmaGemmKernel:
             ab_read_state = make_pipeline_state(pipeline.PipelineUserType.Consumer, self.ab_stage)
             epi_read_state = make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.epi_c_stage
+            )
+            epi_producer_state = make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.epi_c_stage
             )
             tile_scheduler = TileSchedulerCls()
             if const_expr(self.pingpong):
@@ -1236,9 +1239,46 @@ class HopperWgmmaGemmKernel:
                     tDgD_for_tma_partition,
                 )
 
+                if const_expr(mC_mnl is not None):
+                    if const_expr(cu_seqlens_m is not None):
+                        mC_mn = cute.domain_offset((cu_seqlens_m[batch_idx], 0), mC_mnl)
+                    else:
+                        mC_mn = mC_mnl[None, None, batch_idx]
+                    # (bM, bN)
+                    gC = cute.local_tile(
+                        mC_mn, cute.select(self.tile_shape_mnk, [0, 1]), tile_coord_mnkl[:2]
+                    )
+                    tCgC_for_tma_partition = cute.zipped_divide(gC, self.epi_tile)
+                    bGS_sC, bGS_gC = cpasync.tma_partition(
+                        tma_atom_c,
+                        0,
+                        cute.make_layout(1),
+                        cute.group_modes(sC, 0, 2),
+                        tCgC_for_tma_partition,
+                    )
+
                 epi_tile_num = const_expr(cute.size(tDgD_for_tma_partition, mode=[1]))
                 epi_tile_shape = tDgD_for_tma_partition.shape[1]
                 num_prev_subtiles = tile_scheduler.num_tiles_executed * epi_tile_num
+                epi_tile_layout = cute.make_layout(epi_tile_shape, stride=(epi_tile_shape[1], 1))
+
+                if const_expr(mC_mnl is not None):
+                    # TODO: for pingpong we need to advance the epi_producer_state?
+                    for epi_idx in cutlass.range(min(epi_tile_num, self.epi_c_stage), unroll=1):
+                        if is_tma_warp:
+                            epi_pipeline.producer_acquire(epi_producer_state)
+                            # Get the global memory coordinate for the current epi tile
+                            gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
+                            cute.copy(
+                                tma_atom_c,
+                                bGS_gC[None, gmem_coord],
+                                bGS_sC[None, epi_producer_state.index],
+                                tma_bar_ptr=epi_pipeline.producer_get_barrier(epi_producer_state),
+                            )
+                            # Epi pipeline's producer commit is a NOP
+                            epi_pipeline.producer_commit(epi_producer_state)
+                        epi_producer_state.advance()
+
                 for epi_idx in cutlass.range_constexpr(epi_tile_num):
                     # Copy from acc to D registers
                     for epi_v in cutlass.range_constexpr(cute.size(tRS_rD)):
@@ -1256,6 +1296,24 @@ class HopperWgmmaGemmKernel:
                         with cute.arch.elect_one():
                             epi_pipeline.consumer_release(epi_read_state)
                         epi_read_state.advance()
+                        if const_expr(epi_idx + self.epi_c_stage < epi_tile_num):
+                            if is_tma_warp:
+                                epi_pipeline.producer_acquire(epi_producer_state)
+                                # Get the global memory coordinate for the current epi tile
+                                gmem_coord = epi_tile_layout.get_hier_coord(
+                                    epi_idx + self.epi_c_stage
+                                )
+                                cute.copy(
+                                    tma_atom_c,
+                                    bGS_gC[None, gmem_coord],
+                                    bGS_sC[None, epi_producer_state.index],
+                                    tma_bar_ptr=epi_pipeline.producer_get_barrier(
+                                        epi_producer_state
+                                    ),
+                                )
+                                # Epi pipeline's producer commit is a NOP
+                                epi_pipeline.producer_commit(epi_producer_state)
+                            epi_producer_state.advance()
                         tRS_rD.store(tRS_rD.load() + tRS_rC.load().to(self.acc_dtype))
                     # Type conversion
                     tRS_rD_out = cute.make_fragment_like(tRS_rD, self.d_dtype)
@@ -1269,9 +1327,6 @@ class HopperWgmmaGemmKernel:
                     )
                     epilogue_barrier.arrive_and_wait()
                     # Get the global memory coordinate for the current epi tile
-                    epi_tile_layout = cute.make_layout(
-                        epi_tile_shape, stride=(epi_tile_shape[1], 1)
-                    )
                     gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
                     # Copy from shared memory to global memory
                     if is_tma_warp:
@@ -2089,7 +2144,6 @@ def run(
     a, mA, a_torch = create_and_permute_tensor(l, m, k, a_major == "m", a_dtype)
     if gather_A:
         assert a_major == "k"
-        assert c_dtype is None, "Gather A doesn't support loading C for now"
         a_idx = torch.randperm(l * m, dtype=torch.int32, device="cuda")
         from einops import rearrange
 
