@@ -2114,6 +2114,9 @@ def run(
         a, d_torch = [rearrange(t, "m x l -> (l m) x") for t in (a, d_torch)]
         if not gather_A:
             (a_torch,) = [rearrange(t, "m x l -> (l m) x") for t in (a_torch,)]
+        if c_dtype is not None:
+            c, c_torch = [rearrange(t, "m x l -> (l m) x") for t in (c, c_torch)]
+            mC = from_dlpack(c_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
         mA = from_dlpack(a_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
         mD = from_dlpack(d_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
         # TODO: generate random cu_seqlens_m
