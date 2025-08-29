@@ -1127,6 +1127,7 @@ class HopperWgmmaGemmKernel:
                     # Advance 2nd Math WG pipeline states to the end of 1st Math WG
                     ab_read_state.advance_iters(k_tile_cnt)
                     epi_read_state.advance_iters(c_tile_cnt)
+                    epi_producer_state.advance_iters(c_tile_cnt)
             work_tile = tile_scheduler.initial_work_tile_info()
             if const_expr(varlen):
                 # wait tensormap initialization complete before update
@@ -1263,7 +1264,6 @@ class HopperWgmmaGemmKernel:
                 epi_tile_layout = cute.make_layout(epi_tile_shape, stride=(epi_tile_shape[1], 1))
 
                 if const_expr(mC_mnl is not None):
-                    # TODO: for pingpong we need to advance the epi_producer_state?
                     for epi_idx in cutlass.range(min(epi_tile_num, self.epi_c_stage), unroll=1):
                         if is_tma_warp:
                             epi_pipeline.producer_acquire(epi_producer_state)
@@ -1350,6 +1350,7 @@ class HopperWgmmaGemmKernel:
                 if const_expr(self.pingpong):
                     # Update starting load/store pipeline states for the next tile
                     epi_read_state.advance_iters(c_tile_cnt)
+                    epi_producer_state.advance_iters(c_tile_cnt)
                     # With pingpong, 2 WGs write two different output tiles to the same smem,
                     # so we have to make sure the smem content is done reading before signalling
                     # the next WG's epilogue.
