@@ -2351,7 +2351,12 @@ def run(
         else:
             ref_d = ref.to(cutlass_torch.dtype(d_dtype))
 
+        out = d_torch.cpu().squeeze()
+        out_ref = ref_d.squeeze()
+        # breakpoint()
         torch.testing.assert_close(d_torch.cpu(), ref_d, atol=tolerance, rtol=1e-03)
+
+    # return
 
     from triton.testing import do_bench
 
