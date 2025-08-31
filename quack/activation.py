@@ -23,13 +23,18 @@ def tanh(a: float | Float32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
-def silu(a: Float32, *, loc=None, ip=None) -> Float32:
+def silu(y: Float32, *, loc=None, ip=None) -> Float32:
     """
-    silu(a) = a * sigmoid(a) = a * (1 + tanh(a / 2)) / 2 = (0.5 * a) * tanh(0.5 * a) + (0.5 * a)
-    This compiles down to 3 SASS instructions: FMUL to get 0.5 * a, MUFU.TANH, and FFMA.
+    silu(y) = y * sigmoid(y) = y * (1 + tanh(y / 2)) / 2 = (0.5 * y) * tanh(0.5 * y) + (0.5 * y)
+    This compiles down to 3 SASS instructions: FMUL to get 0.5 * y, MUFU.TANH, and FFMA.
     """
-    a_half = 0.5 * a
-    return a_half * tanh(a_half) + a_half
+    y_half = 0.5 * y
+    return y_half * tanh(y_half) + y_half
+
+
+@dsl_user_op
+def swiglu(x: Float32, y: Float32, *, loc=None, ip=None) -> Float32:
+    return x * silu(y)
 
 
 @dsl_user_op
@@ -62,4 +67,40 @@ def dswiglu(
     dy = d_silu_y_dout * x  # FMUL
     swiglu_out = x * silu_y  # FMUL
     # Overall it's 1 MUFU.TANH, 5 FMUL, 3 FFMA
+    return dx, dy, swiglu_out
+
+
+@dsl_user_op
+def swiglu_oai(x: Float32, y: Float32, alpha: float = 1.072, *, loc=None, ip=None) -> Float32:
+    """The swiglu variant used in gpt-oss, which has a scaling factor on y and bias of 1 to x.
+    https://github.com/openai/gpt-oss/blob/7be9334950053a888e24887a57dac797a17d6e00/gpt_oss/torch/model.py#L249
+    (x + 1) * y * sigmoid(alpha * y)
+    Compile down to FMUL, FMUL, TANH, FFMA, FFMA
+    """
+    # Compute sigmoid(alpha * y) using tanh: sigmoid(z) = 0.5 * (1 + tanh(z/2))
+    y_half = 0.5 * y
+    silu_y = y_half * tanh(alpha * y_half) + y_half
+    return x * silu_y + silu_y
+
+
+@dsl_user_op
+def dswiglu_oai(
+    x: Float32, y: Float32, dout: Float32, alpha: float = 1.072, *, loc=None, ip=None
+) -> Tuple[Float32, Float32, Float32]:
+    """
+    Swiglu OAI backward pass: computes gradients w.r.t. x and y
+    Given: silu_oai_out = (x + 1) * y * sigmoid(alpha * y), and dout = grad w.r.t. silu_oai_out
+    Returns: (dx, dy, silu_oai_out)
+    It's the same as dswiglu, dx formula stays the same, for dy we just replace x by x + 1
+    """
+    # Compute sigmoid(alpha * y) using tanh: sigmoid(z) = 0.5 * (1 + tanh(z/2))
+    alpha_y_half = (0.5 * alpha) * y  # FMUL
+    sigmoid_alpha_y = 0.5 + 0.5 * tanh(alpha_y_half)  # MUFU.TANH, then FFMA
+    silu_y = y * sigmoid_alpha_y  # FMUL
+    silu_y_dout = silu_y * dout  # FMUL
+    d_silu_y_dout = (sigmoid_alpha_y - silu_y * sigmoid_alpha_y) * dout + silu_y_dout  # FFMA, FFMA
+    dx = silu_y_dout
+    dy = d_silu_y_dout * x + d_silu_y_dout  # FFMA, instead of multiply by x + 1
+    swiglu_out = x * silu_y + silu_y  # FFMA, instead of multiply by x + 1
+    # Overall it's 1 MUFU.TANH, 3 FMUL, 5 FFMA
     return dx, dy, swiglu_out
