@@ -28,7 +28,7 @@
 
 import argparse
 import enum
-from typing import Tuple, Type, Callable, Optional
+from typing import Tuple, Type, Callable, Optional, Union
 from functools import partial
 import math
 
@@ -661,7 +661,6 @@ class HopperWgmmaGemmKernel:
             tma_tensor_b,
             tma_atom_d,
             tma_tensor_d,
-            mD,
             tma_atom_c,
             tma_tensor_c,
             mAIdx,
@@ -694,7 +693,6 @@ class HopperWgmmaGemmKernel:
         tma_atom_b: cute.CopyAtom,
         mB_nkl: cute.Tensor,
         tma_atom_d: cute.CopyAtom,
-        mD_mnl_tma: cute.Tensor,
         mD_mnl: cute.Tensor,
         tma_atom_c: Optional[cute.CopyAtom],
         mC_mnl: Optional[cute.Tensor],
@@ -723,8 +721,8 @@ class HopperWgmmaGemmKernel:
         :type mB_nkl: cute.Tensor
         :param tma_atom_d: TMA copy atom for D tensor
         :type tma_atom_d: cute.CopyAtom
-        :param mD_mnl_tma: Output tensor D
-        :type mD_mnl_tma: cute.Tensor
+        :param mD_mnl: Output tensor D
+        :type mD_mnl: cute.Tensor
         :param tiled_mma: Tiled MMA object
         :type tiled_mma: cute.TiledMma
         :param cluster_layout_mnk: CTA layout
@@ -738,6 +736,8 @@ class HopperWgmmaGemmKernel:
         """
 
         varlen = const_expr(cu_seqlens_m is not None)
+        has_C = const_expr(mC_mnl is not None)
+
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         # /////////////////////////////////////////////////////////////////////////////
@@ -784,7 +784,7 @@ class HopperWgmmaGemmKernel:
             cta_layout_vmnk=cta_layout_vmnk,
         )
 
-        if const_expr(mC_mnl is not None):
+        if const_expr(has_C):
             # Threads/warps participating in this pipeline
             epi_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
             # Each warp will contribute 1 to the arrive count
@@ -841,7 +841,7 @@ class HopperWgmmaGemmKernel:
             sD = storage.sD.get_tensor(
                 epi_smem_layout_staged.outer, swizzle=epi_smem_layout_staged.inner
             )
-        if const_expr(mC_mnl is not None):
+        if const_expr(has_C):
             sC = storage.sC.get_tensor(
                 epi_c_smem_layout_staged.outer, swizzle=epi_c_smem_layout_staged.inner
             )
@@ -893,7 +893,7 @@ class HopperWgmmaGemmKernel:
 
         if warp_idx >= self.ab_load_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_load)
-            if const_expr(mC_mnl is not None):
+            if const_expr(has_C):
                 epi_load_barrier = pipeline.NamedBarrier(
                     barrier_id=int(NamedBarrierGemm.EpilogueLoad),
                     num_threads=self.num_ab_load_threads + self.num_epi_load_threads,
@@ -1166,100 +1166,45 @@ class HopperWgmmaGemmKernel:
                     barrier_id=int(NamedBarrierGemm.Epilogue), num_threads=self.num_epi_threads
                 )
 
-                # Wait for all warp groups in the thread block to finish, because smem for tensor
-                # A in the mainloop is reused in the epilogue if not persistent.
-                if const_expr(not self.is_persistent):
-                    epilogue_barrier.arrive_and_wait()
-
                 if const_expr(varlen):
                     # ensure the update to tensormap has completed before using it
                     if is_group_changed:
                         if is_tma_warp:
                             tensormap_manager.fence_tensormap_update(tensormap_d_ptr)
-
-                if const_expr(varlen):
                     tma_desc_ptr = tensormap_manager.get_tensormap_ptr(
                         tensormap_d_ptr,
                         cute.AddressSpace.generic,
                     )
                 else:
                     tma_desc_ptr = None
+
+                bSG_sD, bSG_gD = self.epilog_gmem_copy_and_partition(
+                    tma_atom_d, mD_mnl, self.epi_tile, sD, tile_coord_mnkl, cu_seqlens_m,
+                )
                 copy_D = partial(cute.copy, tma_atom_d, tma_desc_ptr=tma_desc_ptr)
-                copy_C = partial(cute.copy, tma_atom_c) if const_expr(mC_mnl is not None) else None
-
-                # Doesn't work with tile_N % 8 == 0 but tile_n % 16 != since this always
-                # get st.matrix with num_matrices=4
-                copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
-                    self.d_layout, elem_ty_d=self.d_dtype, elem_ty_acc=self.acc_dtype
-                )
-                copy_atom_C = cute.make_copy_atom(
-                    warp.StMatrix8x8x16bOp(
-                        self.d_layout.is_m_major_c(),
-                        num_matrices=4 if self.epi_tile[1] % 16 == 0 else 2,
-                    ),
-                    cutlass.Float16,  # this is just to get the right source layout
-                )
-                tiled_copy_C_atom = cute.make_tiled_copy_C_atom(copy_atom_C, tiled_mma)
-                tiled_copy_r2s = cute.make_tiled_copy_S(copy_atom_r2s, tiled_copy_C_atom)
-                # (R2S, R2S_M, R2S_N, PIPE_D)
-                thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
-                tRS_sD = thr_copy_r2s.partition_D(sD)
-                # (R2S, R2S_M, R2S_N)
-                tRS_rAcc = tiled_copy_r2s.retile(acc)
-
-                # Allocate D registers.
-                tRS_rD_layout = cute.make_layout(thr_copy_r2s.partition_S(sD).shape[:3])
-                tRS_rD = cute.make_fragment(tRS_rD_layout, self.acc_dtype)
-
-                if const_expr(mC_mnl is not None):
-                    copy_atom_s2r = utils.sm90_get_smem_load_op(self.c_layout, self.c_dtype)
-                    tiled_copy_s2r = cute.make_tiled_copy_S(copy_atom_s2r, tiled_copy_C_atom)
-                    thr_copy_s2r = tiled_copy_s2r.get_slice(tidx)
-                    tSR_sC = thr_copy_s2r.partition_S(sC)
-                    tRS_rC = cute.make_fragment(tRS_rD_layout, self.c_dtype)
-                    tSR_rC = thr_copy_s2r.retile(tRS_rC)
-                else:
-                    tiled_copy_s2r, tSR_sC, tRS_rC, tSR_rC = None, None, None, None
-
-                if const_expr(cu_seqlens_m is not None):
-                    mD_mn_tma = cute.domain_offset((cu_seqlens_m[batch_idx], 0), mD_mnl_tma)
-                else:
-                    mD_mn_tma = mD_mnl_tma[None, None, batch_idx]
-                # (bM, bN)
-                gD = cute.local_tile(
-                    mD_mn_tma, cute.select(self.tile_shape_mnk, [0, 1]), tile_coord_mnkl[:2]
-                )
-                tDgD_for_tma_partition = cute.zipped_divide(gD, self.epi_tile)
-                bSG_sD, bSG_gD = cpasync.tma_partition(
-                    tma_atom_d,
-                    0,
-                    cute.make_layout(1),
-                    cute.group_modes(sD, 0, 2),
-                    tDgD_for_tma_partition,
-                )
-
-                if const_expr(mC_mnl is not None):
-                    if const_expr(cu_seqlens_m is not None):
-                        mC_mn = cute.domain_offset((cu_seqlens_m[batch_idx], 0), mC_mnl)
-                    else:
-                        mC_mn = mC_mnl[None, None, batch_idx]
-                    # (bM, bN)
-                    gC = cute.local_tile(
-                        mC_mn, cute.select(self.tile_shape_mnk, [0, 1]), tile_coord_mnkl[:2]
+                if const_expr(has_C):
+                    bGS_sC, bGS_gC = self.epilog_gmem_copy_and_partition(
+                        tma_atom_c, mC_mnl, self.epi_tile, sC, tile_coord_mnkl, cu_seqlens_m,
                     )
-                    tCgC_for_tma_partition = cute.zipped_divide(gC, self.epi_tile)
-                    bGS_sC, bGS_gC = cpasync.tma_partition(
-                        tma_atom_c,
-                        0,
-                        cute.make_layout(1),
-                        cute.group_modes(sC, 0, 2),
-                        tCgC_for_tma_partition,
-                    )
-
-                if const_expr(mC_mnl is not None):
+                    copy_C = partial(cute.copy, tma_atom_c)
                     epi_load_g2s = partial(self.epi_load_g2s, epi_pipeline, copy_C, bGS_gC, bGS_sC)
                 else:
                     epi_load_g2s = None
+
+                tiled_copy_r2s, tRS_rAcc, tRS_rD, tRS_sD = self.epilog_smem_store_and_partition(
+                    tiled_mma, self.d_layout, self.d_dtype, acc, sD, tidx
+                )
+                if const_expr(mC_mnl is not None):
+                    tiled_copy_s2r, tRS_rC, tSR_rC, tSR_sC = self.epilog_smem_load_and_partition(
+                        tiled_mma, self.c_layout, self.c_dtype, sC, tRS_rD.layout, tidx
+                    )
+                else:
+                    tiled_copy_s2r, tSR_sC, tRS_rC, tSR_rC = None, None, None, None
+
+                # Wait for all warp groups in the thread block to finish, because smem for tensor
+                # A in the mainloop is reused in the epilogue if not persistent.
+                if const_expr(not self.is_persistent):
+                    epilogue_barrier.arrive_and_wait()
 
                 epi_read_state, epi_producer_state = self.epilogue(
                     epi_pipeline,
@@ -1664,6 +1609,88 @@ class HopperWgmmaGemmKernel:
             barrier_id=int(barrier) + warp_group_idx,
             number_of_threads=2 * self.num_threads_per_warp_group,
         )
+
+    def epilog_smem_copy_atom(self, tiled_mma: cute.TiledMma) -> cute.TiledCopy:
+        copy_atom_C = cute.make_copy_atom(
+            warp.StMatrix8x8x16bOp(
+                self.d_layout.is_m_major_c(),
+                num_matrices=4 if self.epi_tile[1] % 16 == 0 else 2,
+            ),
+            cutlass.Float16,  # this is just to get the right source layout
+        )
+        tiled_copy_C_atom = cute.make_tiled_copy_C_atom(copy_atom_C, tiled_mma)
+        return tiled_copy_C_atom
+
+    def epilog_smem_store_and_partition(
+        self,
+        tiled_mma: cute.TiledMma,
+        d_layout: cutlass.utils.LayoutEnum,
+        dtype: Type[cutlass.Numeric],
+        acc: cute.Tensor,
+        sD: cute.Tensor,
+        tidx: Int32,
+    ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
+        tiled_copy_C_atom = self.epilog_smem_copy_atom(tiled_mma)
+        # Doesn't work with tile_N % 8 == 0 but tile_n % 16 != since this always
+        # get st.matrix with num_matrices=4
+        copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
+            d_layout, elem_ty_d=dtype, elem_ty_acc=self.acc_dtype
+        )
+        tiled_copy_r2s = cute.make_tiled_copy_S(copy_atom_r2s, tiled_copy_C_atom)
+        # (R2S, R2S_M, R2S_N, PIPE_D)
+        thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
+        tRS_sD = thr_copy_r2s.partition_D(sD)
+        # (R2S, R2S_M, R2S_N)
+        tRS_rAcc = tiled_copy_r2s.retile(acc)
+        tRS_rD_layout = cute.make_layout(thr_copy_r2s.partition_S(sD).shape[:3])
+        tRS_rD = cute.make_fragment(tRS_rD_layout, self.acc_dtype)
+        return tiled_copy_r2s, tRS_rAcc, tRS_rD, tRS_sD
+
+    def epilog_smem_load_and_partition(
+        self,
+        tiled_mma: cute.TiledMma,
+        c_layout: cutlass.utils.LayoutEnum,
+        dtype: Type[cutlass.Numeric],
+        sC: cute.Tensor,
+        tRS_rD_layout: cutlass.Layout,
+        tidx: Int32,
+    ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
+        tiled_copy_C_atom = self.epilog_smem_copy_atom(tiled_mma)
+        copy_atom_s2r = utils.sm90_get_smem_load_op(c_layout, dtype)
+        tiled_copy_s2r = cute.make_tiled_copy_S(copy_atom_s2r, tiled_copy_C_atom)
+        thr_copy_s2r = tiled_copy_s2r.get_slice(tidx)
+        tSR_sC = thr_copy_s2r.partition_S(sC)
+        tRS_rC = cute.make_fragment(tRS_rD_layout, dtype)
+        tSR_rC = thr_copy_s2r.retile(tRS_rC)
+        return tiled_copy_s2r, tRS_rC, tSR_rC, tSR_sC
+
+    def epilog_gmem_copy_and_partition(
+        self,
+        atom: Union[cute.CopyAtom, cute.TiledCopy],
+        mD_mnl: cute.Tensor,
+        epi_tile: cute.Tile,
+        sD: cute.Tensor,
+        tile_coord_mnkl: cute.Coord,
+        cu_seqlens_m: Optional[cute.Tensor] = None,
+    ) -> Tuple[cute.Tensor, cute.Tensor]:
+        batch_idx = tile_coord_mnkl[3]
+        if const_expr(cu_seqlens_m is not None):
+            mD_mn = cute.domain_offset((cu_seqlens_m[batch_idx], 0), mD_mnl)
+        else:
+            mD_mn = mD_mnl[None, None, batch_idx]
+        # (bM, bN)
+        gD = cute.local_tile(
+            mD_mn, cute.select(self.tile_shape_mnk, [0, 1]), tile_coord_mnkl[:2]
+        )
+        tDgD_for_tma_partition = cute.zipped_divide(gD, epi_tile)
+        bSG_sD, bSG_gD = cpasync.tma_partition(
+            atom,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sD, 0, 2),
+            tDgD_for_tma_partition,
+        )
+        return bSG_sD, bSG_gD
 
     @staticmethod
     def _compute_stages(
