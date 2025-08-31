@@ -49,7 +49,7 @@ from quack.tile_scheduler import (
     TileSchedulerArguments,
     ParamsBase,
     RasterOrderOption,
-    TriangularStaticTileScheduler
+    TriangularTileScheduler,
 )
 from quack.reduction_base import torch2cute_dtype_map
 
@@ -58,6 +58,7 @@ from quack.pipeline import make_pipeline_state
 import quack.utils as utils
 
 from functools import lru_cache
+
 
 # /////////////////////////////////////////////////////////////////////////////
 #  Helpers to parse args
@@ -78,12 +79,8 @@ def parse_arguments() -> argparse.Namespace:
         default=(4096, 4096, 4096, 1),
         help="mnkl dimensions (comma-separated)",
     )
-    parser.add_argument(
-        "--alpha", type=float, default=1.0, help="Scalar multiplier for A @ B"
-    )
-    parser.add_argument(
-        "--beta", type=float, default=1.0, help="Scalar multiplier for C"
-    )
+    parser.add_argument("--alpha", type=float, default=1.0, help="Scalar multiplier for A @ B")
+    parser.add_argument("--beta", type=float, default=1.0, help="Scalar multiplier for C")
     parser.add_argument(
         "--alpha_dtype",
         type=cutlass.dtype,
@@ -105,7 +102,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--cluster_shape_mn",
         type=parse_comma_separated_ints,
-        choices=[(2,1)],
+        choices=[(2, 1)],
         default=(2, 1),
         help="Cluster shape (comma-separated)",
     )
@@ -424,7 +421,9 @@ class HopperSymmetricGemmKernel:
         :param stream: CUDA stream for asynchronous execution
         :type stream: cuda.CUstream
         """
-        mDt = cute.make_tensor(mD.iterator, cute.make_layout(mD.shape, stride=cute.select(mD.stride, mode=[1, 0, 2])))
+        mDt = cute.make_tensor(
+            mD.iterator, cute.make_layout(mD.shape, stride=cute.select(mD.stride, mode=[1, 0, 2]))
+        )
 
         # setup static attributes before smem/grid/tma computation
         self.a_dtype = mA.element_type
@@ -489,10 +488,7 @@ class HopperSymmetricGemmKernel:
         )
 
         tma_atom_dt, tma_tensor_dt = self._make_tma_epi_atoms_and_tensors(
-            mDt,
-            self.epi_t_smem_layout_staged,
-            self.epi_tile,
-            store_or_load="store"
+            mDt, self.epi_t_smem_layout_staged, self.epi_tile, store_or_load="store"
         )
 
         if const_expr(mC is not None):
@@ -505,7 +501,7 @@ class HopperSymmetricGemmKernel:
         problem_shape_ntile_mnl = cute.ceil_div(mD.shape[:2], self.tile_shape_mnk[:2]) + (
             mD.shape[2],
         )
-        TileScheduler = TriangularStaticTileScheduler
+        TileScheduler = TriangularTileScheduler
         tile_sched_args = TileSchedulerArguments(
             problem_shape_ntile_mnl=problem_shape_ntile_mnl,
             raster_order=RasterOrderOption.Heuristic,
@@ -545,7 +541,7 @@ class HopperSymmetricGemmKernel:
                 cute.struct.MemRange[self.b_dtype, cute.cosize(self.b_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
-        
+
         self.shared_storage = SharedStorage
 
         # Launch the kernel synchronously
@@ -712,7 +708,9 @@ class HopperSymmetricGemmKernel:
             )
         if cutlass.const_expr(not self.is_persistent):
             sD_size_bytes = cute.size_in_bytes(self.d_dtype, epi_smem_layout_staged.outer)
-            sDt_ptr = cute.recast_ptr(sA.iterator + sD_size_bytes, epi_t_smem_layout_staged.inner, dtype=self.d_dtype)
+            sDt_ptr = cute.recast_ptr(
+                sA.iterator + sD_size_bytes, epi_t_smem_layout_staged.inner, dtype=self.d_dtype
+            )
             sDt = cute.make_tensor(sDt_ptr, epi_t_smem_layout_staged.outer)
         else:
             sDt = storage.sDt.get_tensor(
@@ -830,7 +828,7 @@ class HopperSymmetricGemmKernel:
                         if do_epi_load_barrier_arrive:
                             epi_load_barrier.arrive()
                             do_epi_load_barrier_arrive = cutlass.Boolean(False)
-                    tile_scheduler.prefetch_next_work()
+                    tile_scheduler.fetch_next_work()
                     tile_scheduler.advance_to_next_work()
                     work_tile = tile_scheduler.get_current_work()
                     # End of persistent scheduler loop
@@ -1036,7 +1034,11 @@ class HopperSymmetricGemmKernel:
                     warp.StMatrix8x8x16bOp(self.d_layout.is_m_major_c(), 4),
                     self.d_dtype,
                 )
-                dt_layout = cutlass.utils.LayoutEnum.COL_MAJOR if self.d_layout == cutlass.utils.LayoutEnum.ROW_MAJOR else cutlass.utils.LayoutEnum.ROW_MAJOR
+                dt_layout = (
+                    cutlass.utils.LayoutEnum.COL_MAJOR
+                    if self.d_layout == cutlass.utils.LayoutEnum.ROW_MAJOR
+                    else cutlass.utils.LayoutEnum.ROW_MAJOR
+                )
                 copy_atom_r2s_t = sm90_utils.sm90_get_smem_store_op(
                     dt_layout,
                     elem_ty_d=self.d_dtype,
@@ -1057,7 +1059,7 @@ class HopperSymmetricGemmKernel:
                     copy_atom_r2s_t,
                     tiled_copy_Dt_atom,
                 )
-                
+
                 # (R2S, R2S_M, R2S_N, PIPE_D)
                 thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
                 tRS_sD = thr_copy_r2s.partition_D(sD)
@@ -1121,7 +1123,9 @@ class HopperSymmetricGemmKernel:
                         with cute.arch.elect_one():
                             epi_pipeline.consumer_release(epi_read_state)
                         epi_read_state.advance()
-                        result_vec = alpha.to(self.acc_dtype) * tRS_rD.load() + beta.to(self.acc_dtype) * tRS_rC.load().to(self.acc_dtype)
+                        result_vec = alpha.to(self.acc_dtype) * tRS_rD.load() + beta.to(
+                            self.acc_dtype
+                        ) * tRS_rC.load().to(self.acc_dtype)
                         tRS_rD.store(result_vec)
                     else:
                         result_vec = alpha.to(self.acc_dtype) * tRS_rD.load()
@@ -1133,8 +1137,10 @@ class HopperSymmetricGemmKernel:
                     epi_buffer = (num_prev_subtiles + epi_idx) % cute.size(tRS_sD, mode=[3])
                     cute.copy(tiled_copy_r2s, tRS_rD_out, tRS_sD[(None, None, None, epi_buffer)])
                     tRS_rDt_out = tiled_copy_r2s_t.retile(tRS_rD_out)
-                    cute.copy( tiled_copy_r2s_t, tRS_rDt_out, tRS_sDt[(None, None, None, epi_buffer)])
-                    
+                    cute.copy(
+                        tiled_copy_r2s_t, tRS_rDt_out, tRS_sDt[(None, None, None, epi_buffer)]
+                    )
+
                     # Fence and barrier to make sure shared memory store is visible to TMA store
                     cute.arch.fence_proxy(
                         cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
@@ -1150,7 +1156,9 @@ class HopperSymmetricGemmKernel:
                         self.pingpong and (warp_idx == 0 or warp_idx == 4)
                     ):
                         cute.copy(tma_atom_d, bSG_sD[None, epi_buffer], bSG_gD[None, gmem_coord])
-                        cute.copy(tma_atom_dt, bSG_sDt[(None, epi_buffer)], bSG_gDt[(None, gmem_coord)])
+                        cute.copy(
+                            tma_atom_dt, bSG_sDt[(None, epi_buffer)], bSG_gDt[(None, gmem_coord)]
+                        )
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(self.epi_stage - 1, read=True)
                     epilogue_barrier.arrive_and_wait()
@@ -1226,7 +1234,7 @@ class HopperSymmetricGemmKernel:
             epi_bytes = 0
         else:
             d_bytes_per_stage = 2 * cute.size(epi_tile) * d_dtype.width // 8  # added * 2 here
-            epi_bytes = d_bytes_per_stage * epi_stage 
+            epi_bytes = d_bytes_per_stage * epi_stage
         epi_c_stage = 0 if c_dtype is None else 2
         if c_dtype is not None:
             epi_bytes += cute.size(epi_tile) * c_dtype.width // 8 * epi_c_stage
@@ -1387,7 +1395,11 @@ class HopperSymmetricGemmKernel:
             order=(1, 0, 2) if d_layout.is_m_major_c() else (0, 1, 2),
         )
 
-        dt_layout = cutlass.utils.LayoutEnum.COL_MAJOR if d_layout == cutlass.utils.LayoutEnum.ROW_MAJOR else cutlass.utils.LayoutEnum.ROW_MAJOR
+        dt_layout = (
+            cutlass.utils.LayoutEnum.COL_MAJOR
+            if d_layout == cutlass.utils.LayoutEnum.ROW_MAJOR
+            else cutlass.utils.LayoutEnum.ROW_MAJOR
+        )
         dt_major_mode_size = epi_tile[1] if dt_layout.is_n_major_c() else epi_tile[0]
         dt_smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
             sm90_utils.get_smem_layout_atom(
@@ -1703,7 +1715,7 @@ def run(
         )
 
         return f32_torch_tensor, cute_tensor, torch_tensor
-    
+
     # Create symmetric C matrix
     def create_and_permute_tensor_C(l, mode0, mode1, is_mode0_major, dtype, is_dynamic_layout=True):
         # is_mode0_major: (l, mode1, mode0) -> (mode0, mode1, l)
@@ -1733,7 +1745,7 @@ def run(
         # Create symmetric matrix
         assert mode0 == mode1, f"For symmetric C, mode0 ({mode0}) must equal mode1 ({mode1})"
         torch_tensor_cpu = base_tensor + base_tensor.transpose(0, 1)
-        
+
         # Create dtype torch tensor (gpu)
         torch_tensor = torch_tensor_cpu.cuda()
 
@@ -1789,13 +1801,15 @@ def run(
 
     torch_stream = torch.cuda.Stream()
     stream = cuda.CUstream(torch_stream.cuda_stream)
-    
+
     # Create alpha and beta as scalars with specified dtypes
     alpha_scalar = alpha_dtype(alpha)
     beta_scalar = beta_dtype(beta)
-    
+
     # compile gemm kernel
-    compiled_gemm = cute.compile(gemm, mA, mB, mD, mC, alpha_scalar, beta_scalar, max_active_clusters, stream)
+    compiled_gemm = cute.compile(
+        gemm, mA, mB, mD, mC, alpha_scalar, beta_scalar, max_active_clusters, stream
+    )
 
     if not skip_ref_check:
         # execution
@@ -1863,16 +1877,22 @@ def run(
         )
     else:
         if c_torch is None:
-            fn_cublas = lambda: alpha * torch.matmul(a_torch.permute(2, 0, 1), b_torch.permute(2, 0, 1).mT)
+            fn_cublas = lambda: alpha * torch.matmul(
+                a_torch.permute(2, 0, 1), b_torch.permute(2, 0, 1).mT
+            )
         else:
             c_torch_convert = c_torch.to(a_torch.dtype)  # In case C is in FP32
-            fn_cublas = lambda: alpha * torch.matmul(a_torch.permute(2, 0, 1), b_torch.permute(2, 0, 1).mT) + beta * c_torch_convert.permute(2, 0, 1)
+            fn_cublas = lambda: alpha * torch.matmul(
+                a_torch.permute(2, 0, 1), b_torch.permute(2, 0, 1).mT
+            ) + beta * c_torch_convert.permute(2, 0, 1)
     timing_cublas = do_bench(fn_cublas, warmup=warmup, rep=repeats)
     tflops_cublas = flops / (timing_cublas * 1e9)  # Convert to TFlops
     print(f"CuBLAS Average time: {timing_cublas:.3f} ms, TFLOPS: {tflops_cublas:.1f}")
 
     time.sleep(0.5)
-    fn = lambda: compiled_gemm(mA, mB, mD, mC, alpha_scalar, beta_scalar, max_active_clusters, current_stream)
+    fn = lambda: compiled_gemm(
+        mA, mB, mD, mC, alpha_scalar, beta_scalar, max_active_clusters, current_stream
+    )
     timing = do_bench(fn, warmup=warmup, rep=repeats)
     tflops = flops / (timing * 1e9)  # Convert to TFlops
     print(f"Cute-DSL Average time: {timing:.3f} ms, TFLOPS: {tflops:.1f}")
@@ -1882,12 +1902,14 @@ def run(
     tflops_cublas = flops / (timing_cublas * 1e9)  # Convert to TFlops
     print(f"CuBLAS Average time: {timing_cublas:.3f} ms, TFLOPS: {tflops_cublas:.1f}")
 
+
 @lru_cache(maxsize=32)
 def get_max_active_clusters_cached(cluster_shape_mn_tuple):
     cluster_shape_mn = tuple(cluster_shape_mn_tuple)
     return cutlass.utils.HardwareInfo().get_max_active_clusters(
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )
+
 
 def _symmetric_dense_gemm(
     a: torch.Tensor,
@@ -1917,12 +1939,14 @@ def _symmetric_dense_gemm(
         elif x.stride()[1] == 1:
             leading_dim = 1
         else:
-            raise ValueError(f"Input tesnor should have stride 1 along either dim 0 or 1. Strides: {x.stride()}")
+            raise ValueError(
+                f"Input tesnor should have stride 1 along either dim 0 or 1. Strides: {x.stride()}"
+            )
         t = t.mark_layout_dynamic(leading_dim=leading_dim)
         return cutlass_torch.convert_cute_tensor(x_fp32, t, cutlass_dtype, is_dynamic_layout=True)
-    
+
     mA = make_cute_tensor(a)
-    mB = make_cute_tensor(b) 
+    mB = make_cute_tensor(b)
 
     if c is not None:
         mC = make_cute_tensor(c)
@@ -1930,12 +1954,7 @@ def _symmetric_dense_gemm(
         mC = None
 
     # Kernel requires output tensor with stride 1 along dim 0 or 1 as opposed to dim 2
-    d = torch.empty_strided(
-        (M, M, L), 
-        (M, 1, M*M), 
-        dtype=a.dtype, 
-        device=a.device
-    )
+    d = torch.empty_strided((M, M, L), (M, 1, M * M), dtype=a.dtype, device=a.device)
     mD = make_cute_tensor(d)
 
     tile_shape_mnk = (128, 256, 64)
@@ -1944,13 +1963,18 @@ def _symmetric_dense_gemm(
     cluster_shape_mnk = (*cluster_shape_mn, 1)
 
     compile_key = (
-        cutlass_dtype,          
-        tile_shape_mnk,        
-        cluster_shape_mnk,       
-        c is not None,          
-        persistent,           
+        cutlass_dtype,
+        tile_shape_mnk,
+        cluster_shape_mnk,
+        c is not None,
+        persistent,
         (M, K, L),
-        (a.stride(1) == 1, b.stride(1) == 1, c.stride(1) == 1 if c is not None else None, d.stride(1) == 1)
+        (
+            a.stride(1) == 1,
+            b.stride(1) == 1,
+            c.stride(1) == 1 if c is not None else None,
+            d.stride(1) == 1,
+        ),
     )
 
     if persistent:
@@ -1959,7 +1983,7 @@ def _symmetric_dense_gemm(
         max_active = 0
 
     alpha_s = cutlass.Float32(alpha)
-    beta_s  = cutlass.Float32(beta)
+    beta_s = cutlass.Float32(beta)
 
     cache = _symmetric_dense_gemm.compile_cache
     if compile_key not in cache:
@@ -1973,15 +1997,29 @@ def _symmetric_dense_gemm(
             fp8_fast_accum=False,
         )
         cache[compile_key] = cute.compile(
-            gemm, mA, mB, mD, mC, alpha_s, beta_s, max_active,
-            cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+            gemm,
+            mA,
+            mB,
+            mD,
+            mC,
+            alpha_s,
+            beta_s,
+            max_active,
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         )
     cache[compile_key](
-        mA, mB, mD, mC, alpha_s, beta_s, max_active,
-        cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        mA,
+        mB,
+        mD,
+        mC,
+        alpha_s,
+        beta_s,
+        max_active,
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
     )
 
     return d
+
 
 _symmetric_dense_gemm.compile_cache = {}
 
@@ -1994,7 +2032,7 @@ def symmetric_dense_gemm(
     beta: float = 1.0,
 ) -> torch.Tensor:
     """High-performance batched symmetric dense GEMM.
-    
+
     Computes D = alpha * A @ B + beta * C using the symmetric dense GEMM kernel, with the assumption that
     A @ B is symmetric and C is symmetric.
 

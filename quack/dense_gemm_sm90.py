@@ -40,16 +40,16 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.torch as cutlass_torch
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import Int32, const_expr
 
 from quack.tile_scheduler import (
     TileSchedulerArguments,
-    StaticTileScheduler,
+    TileScheduler,
     VarlenMTileSchedulerArguments,
-    VarlenMStaticTileScheduler,
+    VarlenMTileScheduler,
     ParamsBase,
     RasterOrderOption,
 )
@@ -193,6 +193,9 @@ def parse_arguments() -> argparse.Namespace:
         help="Number of iterations to run the kernel",
     )
     parser.add_argument("--persistent", action="store_true", help="Persistent kernel")
+    parser.add_argument(
+        "--dynamic_persistent", action="store_true", help="Dynamic persistent kernel"
+    )
     parser.add_argument("--pingpong", action="store_true", help="Pingpong kernel")
     parser.add_argument("--varlen_m", action="store_true", help="Variable length M dimension")
     parser.add_argument("--gather_A", action="store_true", help="Gather A")
@@ -435,6 +438,7 @@ class HopperWgmmaGemmKernel:
             # epi_smem will reuse smem ab if not persistent.
             overlap_sD_sA=not self.is_persistent,
         )
+        self.sched_stage = 2 if self.pingpong else 1
 
         (
             self.a_smem_layout_staged,
@@ -467,6 +471,7 @@ class HopperWgmmaGemmKernel:
         mAIdx: Optional[cute.Tensor],
         mCuSeqlensM: Optional[cute.Tensor],
         mTensormaps: Optional[cute.Tensor],
+        tile_count_semaphore: Optional[cute.Pointer],
         max_active_clusters: Int32,
         stream: cuda.CUstream,
     ):
@@ -574,12 +579,13 @@ class HopperWgmmaGemmKernel:
             problem_shape_ntile_mnl = cute.ceil_div(mD.shape[:2], self.tile_shape_mnk[:2]) + (
                 mD.shape[2],
             )
-            TileScheduler = StaticTileScheduler
+            TileSchedulerCls = TileScheduler
             tile_sched_args = TileSchedulerArguments(
                 problem_shape_ntile_mnl=problem_shape_ntile_mnl,
                 raster_order=RasterOrderOption.Heuristic,
                 group_size=8,
                 cluster_shape_mnk=self.cluster_shape_mnk,
+                tile_count_semaphore=tile_count_semaphore,
                 is_persistent=self.is_persistent,
             )
         else:
@@ -589,7 +595,7 @@ class HopperWgmmaGemmKernel:
                 cute.ceil_div(mD.shape[1], self.tile_shape_mnk[1]),
                 mCuSeqlensM.shape[0] - 1,
             )
-            TileScheduler = VarlenMStaticTileScheduler
+            TileSchedulerCls = VarlenMTileScheduler
             tile_sched_args = VarlenMTileSchedulerArguments(
                 problem_shape_ntile_mnl=problem_shape_ntile_mnl,
                 total_m=mD.shape[0],
@@ -598,10 +604,11 @@ class HopperWgmmaGemmKernel:
                 group_size=8,
                 tile_shape_mnk=self.tile_shape_mnk,
                 cluster_shape_mnk=self.cluster_shape_mnk,
+                tile_count_semaphore=tile_count_semaphore,
                 is_persistent=self.is_persistent,
             )
-        tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
-        grid = TileScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
+        tile_sched_params = TileSchedulerCls.to_underlying_arguments(tile_sched_args)
+        grid = TileSchedulerCls.get_grid_shape(tile_sched_params, max_active_clusters)
 
         epi_smem_size = cute.cosize(self.epi_smem_layout_staged) if self.is_persistent else 0
         epi_c_smem_size = cute.cosize(self.epi_c_smem_layout_staged) if mC is not None else 0
@@ -623,6 +630,8 @@ class HopperWgmmaGemmKernel:
             ]
             ab_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             epi_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.epi_c_stage * 2]
+            sched_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.sched_stage * 2]
+            tile_count: cute.struct.MemRange[cutlass.Int32, self.sched_stage]
             sD: cute.struct.Align[
                 cute.struct.MemRange[self.d_dtype, epi_smem_size],
                 self.buffer_align_bytes,
@@ -665,7 +674,7 @@ class HopperWgmmaGemmKernel:
             self.epi_smem_layout_staged,
             self.epi_c_smem_layout_staged,
             tile_sched_params,
-            TileScheduler,
+            TileSchedulerCls,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -699,7 +708,7 @@ class HopperWgmmaGemmKernel:
         epi_smem_layout_staged: cute.ComposedLayout,
         epi_c_smem_layout_staged: cute.ComposedLayout,
         tile_sched_params: ParamsBase,
-        TileScheduler: cutlass.Constexpr[Callable],
+        TileSchedulerCls: cutlass.Constexpr[Callable],
     ):
         """
         GPU device kernel performing the batched GEMM computation.
@@ -795,6 +804,31 @@ class HopperWgmmaGemmKernel:
         else:
             epi_pipeline = None
 
+        if const_expr(tile_sched_params.tile_count_semaphore is not None):
+            # Dynamic persistent scheduler
+            # Threads/warps participating in this pipeline
+            sched_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+            cluster_size = cute.size(cluster_layout_mnk)
+            # Each warp that are not the scheduler warp will contribute 1 to the arrive count
+            consumer_arrive_cnt = (
+                (self.mma_warp_groups if not self.pingpong else 1) * 4 + self.num_ab_load_warps
+            ) * cluster_size - 1
+            sched_pipeline_consumer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, consumer_arrive_cnt
+            )
+            sched_pipeline = pipeline.PipelineAsync.create(
+                barrier_storage=storage.sched_pipeline_array_ptr.data_ptr(),
+                num_stages=self.sched_stage,
+                producer_group=sched_pipeline_producer_group,
+                consumer_group=sched_pipeline_consumer_group,
+                # If there's cluster, the consumers must arrive at the mbar of CTA 0 in the cluster.
+                consumer_mask=None if const_expr(cute.size(cluster_layout_mnk) == 1) else 0,
+            )
+            tile_count = storage.tile_count.get_tensor((self.sched_stage,))
+        else:
+            sched_pipeline = None
+            tile_count = None
+
         # ///////////////////////////////////////////////////////////////////////////////
         #  Generate smem tensor A/B
         # ///////////////////////////////////////////////////////////////////////////////
@@ -850,7 +884,9 @@ class HopperWgmmaGemmKernel:
             tensormap_d_smem_ptr = None
             tensormap_manager, tensormap_d_ptr, tensormap_d_init_ptr = None, None, None
 
-        TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
+        TileSchedulerCls = partial(
+            TileSchedulerCls.create, tile_sched_params, tile_count, sched_pipeline
+        )
 
         k_tile_cnt = cute.ceil_div(cute.size(mA_mkl.shape[1]), self.tile_shape_mnk[2])
         c_tile_cnt = cute.size(cute.ceil_div(self.tile_shape_mnk[:2], self.epi_tile))
@@ -883,7 +919,10 @@ class HopperWgmmaGemmKernel:
                 b_mcast_mask = b_mcast_mask if self.is_b_mcast else 0
 
                 # Persistent tile scheduling loop
-                tile_scheduler = TileSchedulerCls()
+                is_scheduler_warp = self.num_ab_load_warps == 1 or warp_idx == self.ab_load_warp_id
+                if const_expr(cute.size(cluster_layout_mnk) > 1):
+                    is_scheduler_warp = is_scheduler_warp and cute.arch.block_idx_in_cluster() == 0
+                tile_scheduler = TileSchedulerCls(is_scheduler_warp=is_scheduler_warp)
                 work_tile = tile_scheduler.initial_work_tile_info()
                 ab_producer_state = make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.ab_stage
@@ -1006,11 +1045,16 @@ class HopperWgmmaGemmKernel:
                         if do_epi_load_barrier_arrive:
                             epi_load_barrier.arrive()
                             do_epi_load_barrier_arrive = cutlass.Boolean(False)
-                    tile_scheduler.prefetch_next_work()
-                    tile_scheduler.advance_to_next_work()
+                    tile_scheduler.fetch_next_work(is_scheduler_warp=is_scheduler_warp)
+                    tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
                     work_tile = tile_scheduler.get_current_work()
                     # End of persistent scheduler loop
+                if const_expr(self.pingpong):
+                    # Need to write the tile_idx to smem for the next WG in the pingpong mode
+                    tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
                 ab_pipeline.producer_tail(ab_producer_state)
+                if is_scheduler_warp:
+                    tile_scheduler.producer_tail()
 
             # if const_expr(mC_mnl is not None):
             #     if warp_idx == self.epi_load_warp_id:
@@ -1222,9 +1266,6 @@ class HopperWgmmaGemmKernel:
 
                 if const_expr(cu_seqlens_m is not None):
                     mD_mn_tma = cute.domain_offset((cu_seqlens_m[batch_idx], 0), mD_mnl_tma)
-                    # Don't change the coord since we already update the tensormap
-                    # TODO: if we don't use TMA to write D, then we need to update the coord
-                    # mD_mn_tma = mD_mnl_tma
                 else:
                     mD_mn_tma = mD_mnl_tma[None, None, batch_idx]
                 # (bM, bN)
@@ -1352,7 +1393,7 @@ class HopperWgmmaGemmKernel:
                     epi_read_state.advance_iters(c_tile_cnt)
                     epi_producer_state.advance_iters(c_tile_cnt)
                     # With pingpong, 2 WGs write two different output tiles to the same smem,
-                    # so we have to make sure the smem content is done reading before signalling
+                    # so we have to make sure the smem content is done reading before signaling
                     # the next WG's epilogue.
                     if warp_idx == 0 or warp_idx == 4:
                         cute.arch.cp_async_bulk_wait_group(0, read=True)
@@ -2020,6 +2061,7 @@ def run(
     iterations: int,
     skip_ref_check: bool,
     persistent: bool,
+    dynamic_persistent: bool,
     pingpong: bool,
     varlen_m: bool,
     gather_A: bool,
@@ -2054,6 +2096,9 @@ def run(
     :param skip_ref_check: Whether to skip reference result validation, defaults to False
     :type skip_ref_check: bool, optional
     """
+
+    if dynamic_persistent:
+        persistent = True
 
     print("Running Hopper Dense GEMM with:")
     print(f"mnkl: {mnkl}")
@@ -2219,8 +2264,14 @@ def run(
         max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(
             cluster_shape_mn[0] * cluster_shape_mn[1]
         )
+        if dynamic_persistent:
+            tile_count_semaphore = torch.zeros(1, dtype=torch.int32, device="cuda")
+        else:
+            tile_count_semaphore = None
+        # max_active_clusters = 1
     else:
         max_active_clusters = 0
+        tile_count_semaphore = None
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     # compile gemm kernel
@@ -2233,6 +2284,9 @@ def run(
         mAIdx,
         mCuSeqlensM,
         tensormaps_tensor,
+        make_ptr(Int32, tile_count_semaphore.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
+        if tile_count_semaphore is not None
+        else None,
         max_active_clusters,
         current_stream,
     )
@@ -2247,9 +2301,12 @@ def run(
             mAIdx,
             mCuSeqlensM,
             tensormaps_tensor,
+            tile_count_semaphore,
             max_active_clusters,
             current_stream,
         )
+        if tile_count_semaphore is not None and varlen_m:
+            tile_count_semaphore.zero_()
 
         torch.cuda.synchronize()
 
@@ -2299,6 +2356,12 @@ def run(
     from triton.testing import do_bench
 
     flops = 2 * m * n * k * l
+    # Calculate memory bandwidth
+    bytes_A = m * k * l * (a_dtype.width // 8)  # A tensor: (m, k, l)
+    bytes_B = n * k * l * (b_dtype.width // 8)  # B tensor: (n, k, l)
+    bytes_D = m * n * l * (d_dtype.width // 8)  # D tensor: (m, n, l)
+    bytes_C = m * n * l * (c_dtype.width // 8) if c_dtype is not None else 0  # C tensor: (m, n, l)
+    total_bytes = bytes_A + bytes_B + bytes_D + bytes_C  # Read A, B, C; Write D
 
     repeats = iterations
     warmup = warmup_iterations
@@ -2335,15 +2398,31 @@ def run(
         print(f"CuBLAS Average time: {timing_cublas:.3f} ms, TFLOPS: {tflops_cublas:.1f}")
 
     time.sleep(0.5)
-    fn = lambda: compiled_gemm(
-        mA, mB, mD, mC, mAIdx, mCuSeqlensM, tensormaps_tensor, max_active_clusters, current_stream
-    )
+
+    def fn():
+        compiled_gemm(
+            mA,
+            mB,
+            mD,
+            mC,
+            mAIdx,
+            mCuSeqlensM,
+            tensormaps_tensor,
+            tile_count_semaphore,
+            max_active_clusters,
+            current_stream,
+        )
+        if tile_count_semaphore is not None and varlen_m:
+            tile_count_semaphore.zero_()
+
     timing = do_bench(fn, warmup=warmup, rep=repeats)
     # Idk why but for some cases the 1st run is much slower
     time.sleep(0.5)
     timing = do_bench(fn, warmup=warmup, rep=repeats)
     tflops = flops / (timing * 1e9)  # Convert to TFlops
-    print(f"Cute-DSL Average time: {timing:.3f} ms, TFLOPS: {tflops:.1f}")
+    gbps = total_bytes / (timing * 1e6)  # Convert to GB/s (1e9 for ms->s, 1e9 for B->GB)
+    print(f"Cute-DSL Average time: {timing:.3f} ms, TFLOPS: {tflops:.1f}, GB/s: {gbps:.0f}")
+    fn()
 
     if not varlen_m:
         time.sleep(0.5)
@@ -2381,6 +2460,7 @@ if __name__ == "__main__":
         args.iterations,
         args.skip_ref_check,
         args.persistent,
+        args.dynamic_persistent,
         args.pingpong,
         args.varlen_m,
         args.gather_A,

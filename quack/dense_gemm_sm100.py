@@ -40,12 +40,12 @@ import cutlass.torch as cutlass_torch
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass import Int32, const_expr
 
 from quack.tile_scheduler import (
     TileSchedulerArguments,
-    StaticTileScheduler,
+    TileScheduler,
     ParamsBase,
     RasterOrderOption,
 )
@@ -411,6 +411,7 @@ class PersistentDenseGemmKernel:
         mB: cute.Tensor,
         mD: cute.Tensor,
         mC: Optional[cute.Tensor],
+        tile_count_semaphore: Optional[cute.Pointer],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         mSFA: Optional[cute.Tensor] = None,
@@ -590,16 +591,17 @@ class PersistentDenseGemmKernel:
         problem_shape_ntile_mnl = cute.ceil_div(mD.shape[:2], self.cta_tile_shape_mnk[:2]) + (
             mD.shape[2],
         )
-        TileScheduler = StaticTileScheduler
+        TileSchedulerCls = TileScheduler
         tile_sched_args = TileSchedulerArguments(
             problem_shape_ntile_mnl=problem_shape_ntile_mnl,
             raster_order=RasterOrderOption.Heuristic,
             group_size=8,
             cluster_shape_mnk=(*self.cluster_shape_mn, 1),
+            tile_count_semaphore=tile_count_semaphore,
             is_persistent=True,
         )
-        tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
-        grid = TileScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
+        tile_sched_params = TileSchedulerCls.to_underlying_arguments(tile_sched_args)
+        grid = TileSchedulerCls.get_grid_shape(tile_sched_params, max_active_clusters)
 
         self.buffer_align_bytes = 1024
 
@@ -622,6 +624,8 @@ class PersistentDenseGemmKernel:
             acc_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
             tmem_dealloc_mbar_ptr: cutlass.Int64
             tmem_holding_buf: Int32
+            sched_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+            tile_count: cute.struct.MemRange[cutlass.Int32, 1]
             # (EPI_TILE_M, EPI_TILE_N, STAGE)
             sD: cute.struct.Align[
                 cute.struct.MemRange[self.d_dtype, cute.cosize(self.d_smem_layout_staged.outer)],
@@ -682,7 +686,7 @@ class PersistentDenseGemmKernel:
             self.epi_c_smem_layout_staged,
             self.epi_tile,
             tile_sched_params,
-            TileScheduler,
+            TileSchedulerCls,
             epilogue_op,
         ).launch(
             grid=grid,
@@ -721,7 +725,7 @@ class PersistentDenseGemmKernel:
         epi_c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
         epi_tile: cute.Tile,
         tile_sched_params: ParamsBase,
-        TileScheduler: cutlass.Constexpr[Callable],
+        TileSchedulerCls: cutlass.Constexpr[Callable],
         epilogue_op: cutlass.Constexpr[Callable],
     ):
         """
@@ -824,6 +828,31 @@ class PersistentDenseGemmKernel:
             cta_layout_vmnk=cluster_layout_vmnk,
         )
 
+        # if const_expr(tile_sched_params.tile_count_semaphore is not None):
+        #     # Dynamic persistent scheduler
+        #     # Threads/warps participating in this pipeline
+        #     sched_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        #     cluster_size = cute.size(cluster_layout_vmnk)
+        #     # Each warp that are not the scheduler warp will contribute 1 to the arrive count
+        #     consumer_arrive_cnt = (
+        #         (self.mma_warp_groups if not self.pingpong else 1) * 4 + self.num_ab_load_warps
+        #     ) * cluster_size - 1
+        #     sched_pipeline_consumer_group = pipeline.CooperativeGroup(
+        #         pipeline.Agent.Thread, consumer_arrive_cnt
+        #     )
+        #     sched_pipeline = pipeline.PipelineAsync.create(
+        #         barrier_storage=storage.sched_pipeline_array_ptr.data_ptr(),
+        #         num_stages=self.sched_stage,
+        #         producer_group=sched_pipeline_producer_group,
+        #         consumer_group=sched_pipeline_consumer_group,
+        #         # If there's cluster, the consumers must arrive at the mbar of CTA 0 in the cluster.
+        #         consumer_mask=None if const_expr(cute.size(cluster_layout_mnk) == 1) else 0,
+        #     )
+        #     tile_count = storage.tile_count.get_tensor((self.sched_stage,))
+        # else:
+        #     sched_pipeline = None
+        #     tile_count = None
+
         # Setup smem tensor A/B/D
         # (MMA, MMA_M, MMA_K, STAGE)
         sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
@@ -860,7 +889,7 @@ class PersistentDenseGemmKernel:
             barrier_id=self.tmem_ptr_sync_bar_id, num_threads=tmem_ptr_read_threads
         )
 
-        TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
+        TileSchedulerCls = partial(TileSchedulerCls.create, tile_sched_params)
         k_tile_cnt = cute.ceil_div(cute.size(mA_mkl.shape[1]), self.mma_tiler[2])
 
         if const_expr(mC_mnl is not None):
@@ -2162,7 +2191,7 @@ def run(
     warmup_iterations: int = 0,
     iterations: int = 1,
     skip_ref_check: bool = False,
-    use_cold_l2: bool = False,
+    dynamic_persistent: bool = False,
     **kwargs,
 ):
     """Execute a persistent batched dense GEMM operation on Blackwell architecture with performance benchmarking.
@@ -2197,8 +2226,6 @@ def run(
     :type iterations: int, optional
     :param skip_ref_check: Whether to skip reference result validation, defaults to False
     :type skip_ref_check: bool, optional
-    :param use_cold_l2: Whether to use circular buffer strategy to ensure cold L2 cache, defaults to False
-    :type use_cold_l2: bool, optional
     :raises RuntimeError: If CUDA GPU is not available
     :raises ValueError: If the configuration is invalid or unsupported by the kernel
     :return: Execution time of the GEMM kernel
@@ -2207,14 +2234,15 @@ def run(
     print("Running Blackwell Persistent Dense GEMM test with:")
     print(f"mnkl: {mnkl}")
     print(f"AB dtype: {ab_dtype}, C dtype: {d_dtype}, Acc dtype: {acc_dtype}")
-    print(f"Matrix majors - A: {a_major}, B: {b_major}, C: {c_major}")
+    print(f"Matrix majors - A: {a_major}, B: {b_major}, C: {d_major}")
     print(f"Mma Tiler (M, N): {mma_tiler_mn}, Cluster Shape (M, N): {cluster_shape_mn}")
     print(f"2CTA MMA instructions: {'True' if use_2cta_instrs else 'False'}")
     print(f"Tolerance: {tolerance}")
     print(f"Warmup iterations: {warmup_iterations}")
     print(f"Iterations: {iterations}")
     print(f"Skip reference checking: {skip_ref_check}")
-    print(f"Use cold L2: {'True' if use_cold_l2 else 'False'}")
+
+    assert not dynamic_persistent, "Dynamic persistent mode is not supported yet."
 
     # Unpack parameters
     m, n, k, l = mnkl
@@ -2323,16 +2351,31 @@ def run(
     max_active_clusters = hardware_info.get_max_active_clusters(
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )
+    if dynamic_persistent:
+        tile_count_semaphore = torch.zeros(1, dtype=torch.int32, device="cuda")
+    else:
+        tile_count_semaphore = None
 
     # Get current CUDA stream from PyTorch
     torch_stream = torch.cuda.current_stream()
     # Get the raw stream pointer as a CUstream
     current_stream = cuda.CUstream(torch_stream.cuda_stream)
     # Compile gemm kernel
-    compiled_gemm = cute.compile(gemm, mA, mB, mD, mC, max_active_clusters, current_stream)
+    compiled_gemm = cute.compile(
+        gemm,
+        mA,
+        mB,
+        mD,
+        mC,
+        make_ptr(Int32, tile_count_semaphore.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
+        if tile_count_semaphore is not None
+        else None,
+        max_active_clusters,
+        current_stream,
+    )
 
     if not skip_ref_check:
-        compiled_gemm(mA, mB, mD, mC, current_stream)
+        compiled_gemm(mA, mB, mD, mC, tile_count_semaphore, current_stream)
         if ab_dtype in {
             cutlass.Int8,
             cutlass.Uint8,
@@ -2420,7 +2463,7 @@ def run(
     print(f"CuBLAS Average time: {timing_cublas:.3f} ms, TFLOPS: {tflops_cublas:.1f}")
 
     time.sleep(0.5)
-    fn = lambda: compiled_gemm(mA, mB, mD, mC, current_stream)
+    fn = lambda: compiled_gemm(mA, mB, mD, mC, tile_count_semaphore, current_stream)
     timing = do_bench(fn, warmup=warmup, rep=repeats)
     tflops = flops / (timing * 1e9)  # Convert to TFlops
     print(f"Cute-DSL Average time: {timing:.3f} ms, TFLOPS: {tflops:.1f}")
@@ -2483,10 +2526,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--skip_ref_check", action="store_true", help="Skip reference checking")
     parser.add_argument(
-        "--use_cold_l2",
-        action="store_true",
-        default=False,
-        help="Use circular buffer tensor sets to ensure L2 cold cache",
+        "--dynamic_persistent", action="store_true", help="Dynamic persistent kernel"
     )
 
     args = parser.parse_args()
@@ -2517,6 +2557,6 @@ if __name__ == "__main__":
         args.warmup_iterations,
         args.iterations,
         args.skip_ref_check,
-        args.use_cold_l2,
+        args.dynamic_persistent,
     )
     print("PASS")

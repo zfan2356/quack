@@ -100,13 +100,14 @@ def store_shared_remote(
     ).ir_value()
     if cutlass.const_expr(isinstance(val, float)):
         val = Float32(val)
-    assert isinstance(val, (Float32, cutlass.Int64)), "val must be Float32 or Int64"
-    suffix = "f32" if cutlass.const_expr(isinstance(val, Float32)) else "s64"
+    assert isinstance(val, (Float32, Int32, cutlass.Int64)), "val must be Float32, Int32, or Int64"
+    suffix = {Float32: "f32", Int32: "s32", cutlass.Int64: "s64"}[type(val)]
+    constraint = {Float32: "f", Int32: "r", cutlass.Int64: "l"}[type(val)]
     llvm.inline_asm(
         None,
         [remote_smem_ptr_i32, val.ir_value(loc=loc, ip=ip), remote_mbar_ptr_i32],
         f"st.async.shared::cluster.mbarrier::complete_tx::bytes.{suffix} [$0], $1, [$2];",
-        f"r,{'f' if cutlass.const_expr(isinstance(val, Float32)) else 'l'},r",
+        f"r,{constraint},r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -198,9 +199,9 @@ def row_reduce(
         hook_fn()
     if cutlass.const_expr(reduction_buffer is not None):
         warps_per_row, cluster_n = reduction_buffer.shape[1]
-        assert (
-            cluster_n == 1 or mbar_ptr is not None
-        ), "mbar_ptr must be provided for cluster reduction"
+        assert cluster_n == 1 or mbar_ptr is not None, (
+            "mbar_ptr must be provided for cluster reduction"
+        )
         if cutlass.const_expr(warps_per_row > 1 or cluster_n > 1):
             val = block_or_cluster_reduce(
                 val, warp_op, reduction_buffer, mbar_ptr, phase=phase, init_val=init_val
@@ -237,13 +238,13 @@ def online_softmax_reduce(
         hook_fn()
     if cutlass.const_expr(reduction_buffer is not None):
         rows_per_block, (warps_per_row, cluster_n) = reduction_buffer.shape
-        assert (
-            cluster_n == 1 or mbar_ptr is not None
-        ), "mbar_ptr must be provided for cluster reduction"
+        assert cluster_n == 1 or mbar_ptr is not None, (
+            "mbar_ptr must be provided for cluster reduction"
+        )
         if cutlass.const_expr(warps_per_row > 1 or cluster_n > 1):
-            assert (
-                reduction_buffer.element_type == cutlass.Int64
-            ), "reduction_buffer must be of type cute.Int64"
+            assert reduction_buffer.element_type == cutlass.Int64, (
+                "reduction_buffer must be of type cute.Int64"
+            )
             lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
             row_idx, col_idx = warp_idx // warps_per_row, warp_idx % warps_per_row
             if cutlass.const_expr(mbar_ptr is None):
@@ -537,9 +538,9 @@ def i64_to_f32x2(c: cutlass.Int64, *, loc=None, ip=None) -> Tuple[Float32, Float
 def domain_offset_i64(coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
     flat_coord_i64 = tuple(cutlass.Int64(c) for c in cute.flatten(coord))
     flat_stride = cute.flatten_to_tuple(tensor.stride)
-    assert len(flat_coord_i64) == len(
-        flat_stride
-    ), "Coordinate and stride must have the same length"
+    assert len(flat_coord_i64) == len(flat_stride), (
+        "Coordinate and stride must have the same length"
+    )
     offset = sum(c * s for c, s in zip(flat_coord_i64, flat_stride))
     assert isinstance(tensor.iterator, cute.Pointer)
     # HACK: we assume that applying the offset does not change the pointer alignment
@@ -647,3 +648,19 @@ def sm90_get_smem_load_op(
         )
     else:
         return cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), elem_ty_c, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def atomic_add_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
+    return nvvm.atomicrmw(
+        res=T.i32(), op=nvvm.AtomicOpKind.ADD, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
+    )
+
+
+@dsl_user_op
+def atomic_inc_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
+    return nvvm.atomicrmw(
+        res=T.i32(), op=nvvm.AtomicOpKind.INC, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
+    )
+
+
