@@ -3,14 +3,16 @@
 import math
 from typing import Optional, Type
 
+import torch
+
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.cute.runtime import from_dlpack
 
 import quack.utils as utils
-import torch
-from cutlass.cute.runtime import from_dlpack
+from quack.reduce import row_reduce, online_softmax_reduce
 from quack.reduction_base import ReductionBase, torch2cute_dtype_map
 
 
@@ -161,7 +163,7 @@ class CrossEntropy(ReductionBase):
 
         threads_per_row = tv_layout.shape[0][0]
         if cutlass.const_expr(not self.online_softmax):
-            max_x = utils.row_reduce(
+            max_x = row_reduce(
                 x,
                 cute.ReductionOp.MAX,
                 threads_per_row,
@@ -181,7 +183,7 @@ class CrossEntropy(ReductionBase):
             # exp_x = utils.exp2f((x - max_x) * log2_e)
             # This would use ffma instead of fadd then fmul
             exp_x = utils.exp2f(x * log2_e - (max_x * log2_e))
-            denom = utils.row_reduce(
+            denom = row_reduce(
                 exp_x,
                 cute.ReductionOp.ADD,
                 threads_per_row,
@@ -190,7 +192,7 @@ class CrossEntropy(ReductionBase):
                 init_val=0.0,
             )
         else:
-            max_x, denom, _ = utils.online_softmax_reduce(
+            max_x, denom, _ = online_softmax_reduce(
                 x,
                 threads_per_row,
                 reduction_buffer[None, None, 0],
@@ -483,9 +485,9 @@ def _cross_entropy_backward(
     assert x.shape[0] == target.shape[0], "Batch dimensions must match"
     assert x.shape[0] == dloss.shape[0], "Batch dimensions must match"
     assert x.shape[0] == lse.shape[0], "Batch dimensions must match"
-    assert (
-        x.is_cuda and target.is_cuda and dloss.is_cuda and lse.is_cuda
-    ), "Tensors must be on CUDA device"
+    assert x.is_cuda and target.is_cuda and dloss.is_cuda and lse.is_cuda, (
+        "Tensors must be on CUDA device"
+    )
     assert x.dtype in [
         torch.float16,
         torch.bfloat16,

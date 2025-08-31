@@ -9,6 +9,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 import quack.utils as utils
+from quack.reduce import row_reduce, online_softmax_reduce
 from quack.reduction_base import ReductionBase, torch2cute_dtype_map
 
 
@@ -147,7 +148,7 @@ class Softmax(ReductionBase):
         x = tXrX.load().to(cute.Float32)
         threads_per_row = tv_layout.shape[0][0]
         if cutlass.const_expr(not self.online_softmax):
-            max_x = utils.row_reduce(
+            max_x = row_reduce(
                 x,
                 cute.ReductionOp.MAX,
                 threads_per_row,
@@ -158,7 +159,7 @@ class Softmax(ReductionBase):
             )
             log2_e = math.log2(math.e)
             exp_x = cute.math.exp2((x - max_x) * log2_e, fastmath=True)
-            denom = utils.row_reduce(
+            denom = row_reduce(
                 exp_x,
                 cute.ReductionOp.ADD,
                 threads_per_row,
@@ -167,7 +168,7 @@ class Softmax(ReductionBase):
                 init_val=0.0,
             )
         else:
-            max_x, denom, exp_x = utils.online_softmax_reduce(
+            max_x, denom, exp_x = online_softmax_reduce(
                 x,
                 threads_per_row,
                 reduction_buffer[None, None, 0],
@@ -372,7 +373,7 @@ class SoftmaxBackward(ReductionBase):
 
         # Compute dot product: dot = Σⱼ dy_j × y_j
         threads_per_row = tv_layout.shape[0][0]
-        dot = utils.row_reduce(
+        dot = row_reduce(
             dy * y,
             cute.ReductionOp.ADD,
             threads_per_row,

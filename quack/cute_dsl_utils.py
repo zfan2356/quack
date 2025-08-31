@@ -35,6 +35,3 @@ def cute_compile_patched(*args, **kwargs):
             sass = extract(cubin_path, None)
             cubin_path.with_suffix(".annotated.sass").write_text(sass)
     return output
-
-
-cute.compile = cute_compile_patched

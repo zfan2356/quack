@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from quack.rmsnorm import rmsnorm, rmsnorm_ref, rstd_ref, _rmsnorm_fwd
+from quack.rmsnorm import rmsnorm, rmsnorm_ref, _rmsnorm_fwd
 
 @pytest.mark.parametrize("eps", [1e-5, 1e-6])
 # @pytest.mark.parametrize("eps", [1e-5])
@@ -52,11 +52,9 @@ def test_rmsnorm_forward_backward(M, N, input_dtype, weight_dtype, eps):
     weight_ref = weight.detach().clone().requires_grad_()
     out = rmsnorm(x, weight, eps=eps)
     out_ref = rmsnorm_ref(x_ref, weight_ref, eps=eps)
-    # rstd_ref_val = rstd_ref(x_ref, eps=eps)
     assert out.shape == x.shape
     assert out.dtype == input_dtype
     torch.testing.assert_close(out, out_ref, atol=atol, rtol=1e-3)
-    # torch.testing.assert_close(rstd, rstd_ref_val, atol=atol, rtol=1e-3)
     # Backward pass
     if N > 128 * 1024 and input_dtype == torch.float32:
         # Skip backward pass for due to not enough smem
