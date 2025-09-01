@@ -1022,6 +1022,7 @@ class GemmSm90:
                 bSG_sD, bSG_gD = self.epilog_gmem_copy_and_partition(
                     tma_atom_d,
                     mD_mnl,
+                    self.tile_shape_mnk[:2],
                     self.epi_tile,
                     sD,
                     tile_coord_mnkl,
@@ -1032,6 +1033,7 @@ class GemmSm90:
                     bGS_sC, bGS_gC = self.epilog_gmem_copy_and_partition(
                         tma_atom_c,
                         mC_mnl,
+                        self.tile_shape_mnk[:2],
                         self.epi_tile,
                         sC,
                         tile_coord_mnkl,
@@ -1045,7 +1047,7 @@ class GemmSm90:
                 tiled_copy_r2s, tRS_rAcc, tRS_rD, tRS_sD = self.epilog_smem_store_and_partition(
                     tiled_mma, self.d_layout, self.d_dtype, acc, sD, tidx
                 )
-                if const_expr(mC_mnl is not None):
+                if const_expr(has_C):
                     tiled_copy_s2r, tRS_rC, tSR_rC, tSR_sC = self.epilog_smem_load_and_partition(
                         tiled_mma, self.c_layout, self.c_dtype, sC, tRS_rD.layout, tidx
                     )
@@ -1065,6 +1067,7 @@ class GemmSm90:
                     epi_pipeline,
                     epi_read_state,
                     epi_producer_state,
+                    tiled_mma,
                     tRS_rAcc,
                     tRS_rD,
                     tRS_rC,
@@ -1354,6 +1357,7 @@ class GemmSm90:
         epi_pipeline: cutlass.pipeline.PipelineAsync,
         epi_read_state: cutlass.pipeline.PipelineState,
         epi_producer_state: cutlass.pipeline.PipelineState,
+        tiled_mma: cute.TiledMma,
         tRS_rAcc: cute.Tensor,
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor],
@@ -1379,7 +1383,7 @@ class GemmSm90:
         epi_tile_num = cute.size(bSG_gD.shape[1])
         num_prev_subtiles = tile_scheduler.num_tiles_executed * epi_tile_num
 
-        if const_expr(has_C):
+        if const_expr(epi_load_g2s is not None):
             for epi_idx in cutlass.range(min(epi_tile_num, self.epi_c_stage), unroll=1):
                 epi_producer_state = epi_load_g2s(epi_producer_state, epi_idx, is_tma_warp)
 
@@ -1398,7 +1402,7 @@ class GemmSm90:
                 with cute.arch.elect_one():
                     epi_pipeline.consumer_release(epi_read_state)
                 epi_read_state.advance()
-            if const_expr(has_C and epi_idx + self.epi_c_stage < epi_tile_num):
+            if const_expr(epi_load_g2s is not None and epi_idx + self.epi_c_stage < epi_tile_num):
                 epi_producer_state = epi_load_g2s(
                     epi_producer_state, epi_idx + self.epi_c_stage, is_tma_warp
                 )
@@ -1566,6 +1570,7 @@ class GemmSm90:
         self,
         atom: Union[cute.CopyAtom, cute.TiledCopy],
         mD_mnl: cute.Tensor,
+        tile_shape_mn: cute.Tile,
         epi_tile: cute.Tile,
         sD: cute.Tensor,
         tile_coord_mnkl: cute.Coord,
@@ -1577,7 +1582,7 @@ class GemmSm90:
         else:
             mD_mn = mD_mnl[None, None, batch_idx]
         # (bM, bN)
-        gD = cute.local_tile(mD_mn, cute.select(self.tile_shape_mnk, [0, 1]), tile_coord_mnkl[:2])
+        gD = cute.local_tile(mD_mn, tile_shape_mn, tile_coord_mnkl[:2])
         tDgD_for_tma_partition = cute.zipped_divide(gD, epi_tile)
         bSG_sD, bSG_gD = cpasync.tma_partition(
             atom,
