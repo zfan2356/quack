@@ -1620,7 +1620,7 @@ class GemmSm90:
         :rtype: Tuple[int, int]
         """
 
-        epi_stage = 2
+        epi_stage = 4 if epi_tile[1] <= 16 else 2
         if overlap_sD_sA:
             epi_bytes = 0
         else:
@@ -1629,7 +1629,7 @@ class GemmSm90:
                 epilogue_args, tile_shape_mnk, epi_tile
             )
             epi_bytes = epi_bytes_per_stage * epi_stage
-        epi_c_stage = 0 if c_dtype is None else 2
+        epi_c_stage = 0 if c_dtype is None else (4 if epi_tile[1] <= 16 else 2)
         if c_dtype is not None:
             epi_bytes += cute.size(epi_tile) * c_dtype.width // 8 * epi_c_stage
 
