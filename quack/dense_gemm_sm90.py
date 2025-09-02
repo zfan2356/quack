@@ -2220,7 +2220,7 @@ def run(
         mA = from_dlpack(a_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
         mD = from_dlpack(d_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
         # TODO: generate random cu_seqlens_m
-        cu_seqlens_m = torch.arange(0, l + 1, dtype=torch.int32, device="cuda") * m
+        cu_seqlens_m = torch.arange(0, l + 1, dtype=torch.int32, device="cpu") * m
         mCuSeqlensM = from_dlpack(cu_seqlens_m, assumed_align=64).mark_layout_dynamic(leading_dim=0)
         if gather_A:
             a_idx_reshaped = rearrange(a_idx_reshaped, "m l -> (l m)")
