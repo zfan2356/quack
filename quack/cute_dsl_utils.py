@@ -4,6 +4,7 @@ import os
 import pathlib
 from functools import partial
 from dataclasses import dataclass, fields
+from typing import List
 
 try:
     from triton.tools.disasm import extract
@@ -50,6 +51,7 @@ class ParamsBase:
         return self.__class__(**non_constexpr_fields, **constexpr_fields)
 
 
+
 @dataclass
 class ArgumentsBase(JitArgument):
     def __c_pointers__(self):
@@ -93,6 +95,34 @@ class ArgumentsBase(JitArgument):
             values = values[n_items:]
         return self.__class__(**non_constexpr_fields, **constexpr_fields)
 
+@dataclass
+class IntList(ArgumentsBase):
+    ints: List[cutlass.Int32]
+    
+    # def __extract_mlir_values__(self):
+    #     all_fields = [i for i in self.ints]
+    #     values, self._values_pos = [], []
+    #     for obj in all_fields:
+    #         obj_values = cutlass.extract_mlir_values(obj)
+    #         values += obj_values
+    #         self._values_pos.append(len(obj_values))
+    #     return values
+
+    # def __new_from_mlir_values__(self, values):
+    #     all_fields = {i: i for i in self.ints}
+    #     for (name, field), n_items in zip(all_fields.items(), self._values_pos):
+    #         all_fields[name] = cutlass.new_from_mlir_values(field, values[:n_items])
+    #         values = values[n_items:]
+    #     return self.__class__(**all_fields)
+    
+    # def __c_pointers__(self):
+    #     all_fields = [i for i in self.ints]
+    #     c_ptrs = []
+    #     for obj in all_fields:
+    #         if hasattr(obj, "__c_pointers__"):
+    #             c_ptrs.extend(obj.__c_pointers__())
+    #     return c_ptrs
+    
 
 def load_cubin_module_data_patched(cubin_data, filepath):
     path = pathlib.Path(filepath)

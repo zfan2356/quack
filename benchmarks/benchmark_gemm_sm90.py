@@ -107,13 +107,14 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--c_dtype",
         type=cutlass.dtype,
-        default=None,
+        default=cutlass.BFloat16,
     )
     parser.add_argument(
         "--acc_dtype",
         type=cutlass.dtype,
         default=cutlass.Float32,
     )
+    parser.add_argument("--use_cpu_mseq", action="store_true", help="Use CPU mseq")
     parser.add_argument("--a_major", choices=["k", "m"], type=str, default="k")
     parser.add_argument("--b_major", choices=["k", "n"], type=str, default="k")
     parser.add_argument("--d_major", choices=["n", "m"], type=str, default="n")
@@ -171,6 +172,7 @@ def run(
     varlen_m: bool,
     gather_A: bool,
     fp8_fast_accum: bool,
+    use_cpu_mseq: bool,
     **kwargs,
 ):
     """
@@ -325,7 +327,10 @@ def run(
         mA = from_dlpack(a_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
         mD = from_dlpack(d_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
         # TODO: generate random cu_seqlens_m
-        cu_seqlens_m = torch.arange(0, l + 1, dtype=torch.int32, device="cuda") * m
+        if not use_cpu_mseq:
+            cu_seqlens_m = torch.arange(0, l + 1, dtype=torch.int32, device="cuda") * m
+        else:
+            cu_seqlens_m = list(range(0, l + 1)) * m
         mCuSeqlensM = from_dlpack(cu_seqlens_m, assumed_align=64).mark_layout_dynamic(leading_dim=0)
         if gather_A:
             a_idx_reshaped = rearrange(a_idx_reshaped, "m l -> (l m)")
@@ -386,6 +391,7 @@ def run(
         mB,
         mD,
         mC,
+        None,
         mAIdx,
         mCuSeqlensM,
         tensormaps_tensor,
@@ -403,6 +409,7 @@ def run(
             mB,
             mD,
             mC,
+            None,
             mAIdx,
             mCuSeqlensM,
             tensormaps_tensor,
@@ -515,6 +522,7 @@ def run(
             mB,
             mD,
             mC,
+            None,
             mAIdx,
             mCuSeqlensM,
             tensormaps_tensor,
@@ -575,5 +583,6 @@ if __name__ == "__main__":
         args.varlen_m,
         args.gather_A,
         args.fp8_fast_accum,
+        args.use_cpu_mseq,
     )
     print("PASS")

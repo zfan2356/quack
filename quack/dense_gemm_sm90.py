@@ -323,7 +323,7 @@ class GemmSm90:
         mC: Optional[cute.Tensor],
         epilogue_args: EpilogueArguments,
         mAIdx: Optional[cute.Tensor],
-        mCuSeqlensM: Optional[cute.Tensor],
+        mCuSeqlensM: Optional[cute.Tensor | Tuple[Int32, ...]],
         mTensormaps: Optional[cute.Tensor],
         tile_count_semaphore: Optional[cute.Pointer],
         max_active_clusters: Int32,
