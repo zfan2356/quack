@@ -1,7 +1,9 @@
 # Copyright (c) 2025, Tri Dao.
 
+import math
 from typing import Tuple
 
+import cutlass.cute as cute
 from cutlass import Float32
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
@@ -20,6 +22,27 @@ def tanh(a: float | Float32, *, loc=None, ip=None) -> Float32:
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     )
+
+
+@dsl_user_op
+def relu(x: Float32, *, loc=None, ip=None) -> Float32:
+    return cute.arch.fmax(x, Float32(0.0))
+
+
+@dsl_user_op
+def relu_sq(x: Float32, *, loc=None, ip=None) -> Float32:
+    return cute.arch.fmax(x, Float32(0.0)) * x
+
+
+@dsl_user_op
+def gelu_tanh_approx(x: Float32, *, loc=None, ip=None) -> Float32:
+    """
+    gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+            = 0.5 * x * (1 + tanh(x * (0.797885 + 0.0356774 * x * x)))
+    """
+    sqrt_2_over_pi = math.sqrt(2 / math.pi)  # ~0.797885
+    sqrt_2_over_pi_coeff = 0.044715 * sqrt_2_over_pi  # ~0.0356774
+    return 0.5 * (x * (1 + tanh(x * (sqrt_2_over_pi + sqrt_2_over_pi_coeff * (x * x)))))
 
 
 @dsl_user_op

@@ -1,5 +1,5 @@
 # Copyright (c) 2025, Tri Dao
-from typing import Optional
+from typing import Optional, List
 
 import torch
 import torch.nn.functional as F
@@ -9,6 +9,7 @@ from quack.gemm_config import GemmConfig, get_all_configs
 
 from quack.autotuner import autotune, AutotuneConfig
 from quack.dense_gemm_sm90 import gemm_sm90
+from quack.gemm_act_sm90 import gemm_act_sm90
 
 
 def gemm_swiglu_out_ref(
@@ -25,7 +26,7 @@ def gemm_swiglu_out_ref(
     return out, preact
 
 
-@autotune(configs=[AutotuneConfig(config=c) for c in get_all_configs("add")], key=["out_dtype"])
+@autotune(configs=[AutotuneConfig(config=c) for c in get_all_configs()], key=["out_dtype"])
 def gemm_tuned(
     A: Tensor,  # (M, K)
     B: Tensor,  # (K, N)
@@ -52,6 +53,44 @@ def gemm_tuned(
         config.pingpong,
     )
     return D
+
+
+@autotune(
+    configs=[AutotuneConfig(config=c) for c in get_all_configs()],
+    key=["activation", "out_dtype", "postact_dtype"],
+)
+def gemm_act_tuned(
+    A: Tensor,  # (M, K)
+    B: Tensor,  # (K, N)
+    C: Optional[Tensor] = None,  # (M, N)
+    activation: Optional[str] = None,  # None, "relu", "relu_sq", "gelu_tanh_approx"
+    out_dtype: Optional[torch.dtype] = None,
+    postact_dtype: Optional[torch.dtype] = None,
+    config: Optional[GemmConfig] = None,
+) -> (Tensor, Optional[Tensor]):
+    if config is None:
+        config = GemmConfig(tile_m=128, tile_n=192, cluster_m=2, cluster_n=1, pingpong=True)
+    A, B = A.unsqueeze(0), B.mT.unsqueeze(0)  # (1, M, K), (1, N, K)
+    if C is not None:
+        C = C.unsqueeze(0)  # (1, M, N)
+    out_dtype = A.dtype if out_dtype is None else out_dtype
+    postact_dtype = A.dtype if postact_dtype is None else postact_dtype
+    D = torch.empty((1, A.shape[1], B.shape[1]), dtype=out_dtype, device=A.device)
+    PostAct = torch.empty((1, A.shape[1], B.shape[1]), dtype=postact_dtype, device=A.device)
+    gemm_act_sm90(
+        A if not config.swap_ab else B,
+        B if not config.swap_ab else A,
+        D if not config.swap_ab else D.mT,
+        (C if not config.swap_ab else C.mT) if C is not None else None,
+        PostAct if not config.swap_ab else PostAct.mT,
+        activation,
+        config.tile_m,
+        config.tile_n,
+        config.cluster_m,
+        config.cluster_n,
+        config.pingpong,
+    )
+    return D, PostAct
 
 
 @torch.library.custom_op("quack::gemm", mutates_args=(), device_types="cuda")
@@ -86,6 +125,38 @@ def gemm_t_add(A: Tensor, B: Tensor, C: Tensor) -> Tensor:
 @torch.library.register_fake("quack::gemm_add_t")
 def gemm_t_add_ref(A: Tensor, B: Tensor, C: Tensor) -> Tensor:
     return gemm_add_ref(A, B.T, C)
+
+
+# TODO: how to specify schema when returning multiple tensors? Do we have to write a str schema?
+# @torch.library.custom_op("quack::gemm_act", mutates_args=(), device_types="cuda")
+def gemm_act(
+    A: Tensor,
+    B: Tensor,
+    C: Optional[Tensor] = None,
+    activation: Optional[str] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    postact_dtype: Optional[torch.dtype] = None,
+) -> List[Tensor]:
+    return gemm_act_tuned(A, B, C, activation, out_dtype, postact_dtype)
+
+
+# @torch.library.register_fake("quack::gemm_act")
+def gemm_act_ref(
+    A: Tensor,
+    B: Tensor,
+    C: Optional[Tensor] = None,
+    activation: Optional[str] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    postact_dtype: Optional[torch.dtype] = None,
+) -> (Tensor, Tensor):
+    out_dtype = A.dtype if out_dtype is None else out_dtype
+    postact_dtype = A.dtype if postact_dtype is None else postact_dtype
+    if C is None:
+        out = torch.mm(A, B).to(out_dtype)
+    else:
+        out = (C + torch.mm(A, B)).to(out_dtype)
+    postact = out.to(postact_dtype)
+    return out, postact
 
 
 @autotune(
