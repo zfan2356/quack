@@ -1,5 +1,5 @@
 # Copyright (c) 2025, Tri Dao
-from typing import Optional, List
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -127,8 +127,14 @@ def gemm_t_add_ref(A: Tensor, B: Tensor, C: Tensor) -> Tensor:
     return gemm_add_ref(A, B.T, C)
 
 
-# TODO: how to specify schema when returning multiple tensors? Do we have to write a str schema?
-# @torch.library.custom_op("quack::gemm_act", mutates_args=(), device_types="cuda")
+# Specifying the schema manually here since torch.library._infer_schema doesn't work when return
+# type is a tuple of Tensor
+@torch.library.custom_op(
+    "quack::gemm_act",
+    mutates_args=(),
+    device_types="cuda",
+    schema="(Tensor A, Tensor B, Tensor? C=None, str? activation=None, ScalarType? out_dtype=None, ScalarType? postact_dtype=None) -> (Tensor, Tensor)",
+)
 def gemm_act(
     A: Tensor,
     B: Tensor,
@@ -136,11 +142,11 @@ def gemm_act(
     activation: Optional[str] = None,
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
-) -> List[Tensor]:
+) -> Tuple[Tensor, Tensor]:
     return gemm_act_tuned(A, B, C, activation, out_dtype, postact_dtype)
 
 
-# @torch.library.register_fake("quack::gemm_act")
+@torch.library.register_fake("quack::gemm_act")
 def gemm_act_ref(
     A: Tensor,
     B: Tensor,
@@ -148,7 +154,7 @@ def gemm_act_ref(
     activation: Optional[str] = None,
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
-) -> (Tensor, Tensor):
+) -> Tuple[Tensor, Tensor]:
     out_dtype = A.dtype if out_dtype is None else out_dtype
     postact_dtype = A.dtype if postact_dtype is None else postact_dtype
     if C is None:
