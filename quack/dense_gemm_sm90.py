@@ -255,7 +255,7 @@ class GemmSm90:
         self.shared_storage = None
         self.buffer_align_bytes = 1024
 
-    def _setup_attributes(self, epilogue_args: EpilogueArguments):
+    def _setup_attributes(self, epilogue_args: Optional[EpilogueArguments]):
         """Set up configurations that are dependent on GEMM inputs
 
         This method configures various attributes based on the input tensor properties
@@ -321,7 +321,7 @@ class GemmSm90:
         mB: cute.Tensor,
         mD: cute.Tensor,
         mC: Optional[cute.Tensor],
-        epilogue_args: EpilogueArguments,
+        epilogue_args: Optional[EpilogueArguments],
         mAIdx: Optional[cute.Tensor],
         mCuSeqlensM: Optional[cute.Tensor],
         mTensormaps: Optional[cute.Tensor],
@@ -1478,13 +1478,13 @@ class GemmSm90:
         pass
 
     def epi_to_underlying_arguments(
-        self, args: EpilogueArguments, *, loc=None, ip=None
+        self, args: Optional[EpilogueArguments], *, loc=None, ip=None
     ) -> EpilogueParams:
         return GemmSm90.EpilogueParams()
 
     @staticmethod
     def epi_smem_bytes_per_stage(
-        args: EpilogueArguments,
+        args: Optional[EpilogueArguments],
         tile_shape_mnk: Tuple[int, int, int],
         epi_tile: Tuple[int, int],
     ) -> int:
@@ -1602,7 +1602,7 @@ class GemmSm90:
         b_dtype: Type[cutlass.Numeric],
         d_dtype: Type[cutlass.Numeric],
         c_dtype: Optional[Type[cutlass.Numeric]],
-        epilogue_args: EpilogueArguments,
+        epilogue_args: Optional[EpilogueArguments],
         smem_capacity: int,
         occupancy: int,
         overlap_sD_sA: bool,

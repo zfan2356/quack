@@ -353,6 +353,8 @@ def run(
     else:
         tensormaps_tensor = None
 
+    epilogue_args = None
+
     gemm = GemmSm90(
         acc_dtype,
         a_dtype,
@@ -386,6 +388,7 @@ def run(
         mB,
         mD,
         mC,
+        epilogue_args,
         mAIdx,
         mCuSeqlensM,
         tensormaps_tensor,
@@ -403,6 +406,7 @@ def run(
             mB,
             mD,
             mC,
+            epilogue_args,
             mAIdx,
             mCuSeqlensM,
             tensormaps_tensor,
@@ -515,6 +519,7 @@ def run(
             mB,
             mD,
             mC,
+            epilogue_args,
             mAIdx,
             mCuSeqlensM,
             tensormaps_tensor,
