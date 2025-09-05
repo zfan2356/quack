@@ -6,6 +6,9 @@ from typing import Tuple, Type, Callable, Optional, Union
 from functools import partial
 import math
 
+import torch
+from torch import Tensor
+
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -14,6 +17,7 @@ import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import Int32, Boolean, const_expr
+from cutlass.cute.runtime import from_dlpack, make_ptr
 
 
 from quack.cute_dsl_utils import ParamsBase, ArgumentsBase
@@ -29,6 +33,7 @@ from quack.tensormap_manager import TensorMapManagerSm90
 # return PipelineStateWAdvance instead of PipelineState
 from quack.pipeline import make_pipeline_state, PipelineTmaCpAsync
 import quack.utils as utils
+from quack.cute_dsl_utils import torch2cute_dtype_map, get_max_active_clusters
 
 """
 A high-performance batched dense GEMM (C = A * B) example for the NVIDIA Hopper architecture
@@ -1973,3 +1978,133 @@ class GemmSm90:
         if (a_dtype.width == 8 and a_major != "k") or (b_dtype.width == 8 and b_major != "k"):
             is_valid = False
         return is_valid
+
+
+def gemm_sm90(
+    A: Tensor,  # (l, m, k)
+    B: Tensor,  # (l, n, k)
+    D: Tensor,  # (l, m, n)
+    C: Optional[Tensor],  # (l, m, n)
+    tile_M: int,
+    tile_N: int,
+    cluster_M: int,
+    cluster_N: int,
+    pingpong: bool = False,
+    persistent: bool = True,
+) -> None:
+    tile_count_semaphore = None
+    assert A.dim() == 3 and A.is_cuda, "A must be A 3D CUDA tensor"
+    L, M, K = A.shape
+    assert A.dtype in torch2cute_dtype_map, "Unsupported dtype for A"
+    assert B.dim() == 3 and B.is_cuda, "B must be A 3D CUDA tensor"
+    _, N, _ = B.shape
+    assert B.dtype == A.dtype
+    assert B.shape == (L, N, K), f"B must have shape {(L, N, K)}, got {B.shape}"
+    assert D.dim() == 3 and D.is_cuda, "D must be A 3D CUDA tensor"
+    assert D.dtype in torch2cute_dtype_map, "Unsupported dtype for D"
+    assert D.shape == (L, M, N), f"D must have shape {(L, M, N)}, got {D.shape}"
+    if C is not None:
+        assert C.dim() == 3 and C.is_cuda, "C must be A 3D CUDA tensor"
+        assert C.shape == (L, M, N), f"C must have shape {(L, M, N)}, got {C.shape}"
+        assert C.dtype in torch2cute_dtype_map, "Unsupported dtype for C"
+    A, B, D = [x.permute(1, 2, 0) for x in (A, B, D)]  # (m, k, l), (n, k, l), (m, n, l)
+    C = C.permute(1, 2, 0) if C is not None else None
+
+    a_dtype = torch2cute_dtype_map[A.dtype]
+    b_dtype = a_dtype
+    d_dtype = torch2cute_dtype_map[D.dtype]
+    c_dtype = torch2cute_dtype_map[C.dtype] if C is not None else None
+    acc_dtype = cutlass.Float32
+    tile_shape_mnk = (tile_M, tile_N, 64)  # TODO: adjust for fp8
+    cluster_shape_mnk = (cluster_M, cluster_N, 1)
+    a_major = "k" if A.stride(1) == 1 else "m"
+    b_major = "k" if B.stride(1) == 1 else "n"
+    d_major = "n" if D.stride(1) == 1 else "m"
+    c_major = "n" if C is not None and C.stride(1) == 1 else "m"
+    if not GemmSm90.is_valid_dtypes(a_dtype, b_dtype, acc_dtype, d_dtype, a_major, b_major):
+        raise TypeError(
+            f"Skipping due to unsupported combination of types and majors: {a_dtype}, {b_dtype}, {acc_dtype}, {d_dtype}, {a_major=}, {b_major=}"
+        )
+    if persistent:
+        max_active_clusters = get_max_active_clusters(cluster_M * cluster_N)
+    else:
+        max_active_clusters = 0
+    mA = from_dlpack(A.detach(), assumed_align=16).mark_layout_dynamic(
+        leading_dim=1 if a_major == "k" else 0
+    )
+    mB = from_dlpack(B.detach(), assumed_align=16).mark_layout_dynamic(
+        leading_dim=1 if b_major == "k" else 0
+    )
+    mD = from_dlpack(D.detach(), assumed_align=16).mark_layout_dynamic(
+        leading_dim=1 if d_major == "n" else 0
+    )
+    mC = (
+        from_dlpack(C.detach(), assumed_align=16).mark_layout_dynamic(
+            leading_dim=1 if c_major == "n" else 0
+        )
+        if C is not None
+        else None
+    )
+    tile_count_semaphore_ptr = (
+        make_ptr(Int32, tile_count_semaphore.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
+        if tile_count_semaphore is not None
+        else None
+    )
+    epi_args = GemmSm90.EpilogueArguments()
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    compile_key = (
+        a_dtype,
+        d_dtype,
+        c_dtype,
+        tile_shape_mnk,
+        cluster_shape_mnk,
+        a_major,
+        b_major,
+        d_major,
+        c_major,
+        pingpong,
+        persistent,
+        tile_count_semaphore is not None,
+    )
+
+    cache = gemm_sm90.compile_cache
+    if compile_key not in cache:
+        gemm = GemmSm90(
+            acc_dtype,
+            a_dtype,
+            tile_shape_mnk,
+            cluster_shape_mnk,
+            pingpong=pingpong,
+            is_persistent=persistent,
+        )
+        cache[compile_key] = cute.compile(
+            gemm,
+            mA,
+            mB,
+            mD,
+            mC,
+            epi_args,
+            None,  # mAIdx
+            None,  # mCuSeqlensM
+            None,  # tensormap
+            tile_count_semaphore_ptr,
+            max_active_clusters,
+            current_stream,
+        )
+    cache[compile_key](
+        mA,
+        mB,
+        mD,
+        mC,
+        epi_args,
+        None,
+        None,
+        None,
+        tile_count_semaphore_ptr,
+        max_active_clusters,
+        current_stream,
+    )
+
+
+gemm_sm90.compile_cache = {}

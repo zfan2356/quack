@@ -8,12 +8,12 @@ from dataclasses import dataclass
 class GemmConfig:
     tile_m: int = 128
     tile_n: int = 192
+    pingpong: bool = True
     cluster_m: int = 2
     cluster_n: int = 1
     swap_ab: bool = False
-    pingpong: bool = True
-    # raster_order: int = 2
-    # max_swizzle_size: int = 1
+    # raster_order: int = 1
+    # max_swizzle_size: int = 8
 
 
 def get_all_configs(
@@ -51,10 +51,10 @@ def get_all_configs(
         GemmConfig(
             tile_m=tile_m,
             tile_n=tile_n,
+            pingpong=pingpong,
             cluster_m=cluster_m,
             cluster_n=cluster_n,
             swap_ab=swap_ab,
-            pingpong=pingpong,
             # raster_order=raster_order,
             # max_swizzle_size=max_swizzle_size,
         )

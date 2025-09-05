@@ -2,8 +2,10 @@
 
 import os
 import pathlib
-from functools import partial
+from functools import partial, lru_cache
 from dataclasses import dataclass, fields
+
+import torch
 
 try:
     from triton.tools.disasm import extract
@@ -18,6 +20,18 @@ from cutlass.cutlass_dsl import NumericMeta
 
 load_cubin_module_data_og = cutlass.base_dsl.runtime.cuda.load_cubin_module_data
 cute_compile_og = cute.compile
+
+
+torch2cute_dtype_map = {
+    torch.float16: cutlass.Float16,
+    torch.bfloat16: cutlass.BFloat16,
+    torch.float32: cutlass.Float32,
+}
+
+
+@lru_cache
+def get_max_active_clusters(cluster_size):
+    return cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_size=cluster_size)
 
 
 @dataclass

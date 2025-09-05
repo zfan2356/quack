@@ -51,7 +51,7 @@ from quack.tile_scheduler import (
     RasterOrderOption,
     TriangularTileScheduler,
 )
-from quack.reduction_base import torch2cute_dtype_map
+from quack.cute_dsl_utils import torch2cute_dtype_map
 
 # return PipelineStateWAdvance instead of PipelineState
 from quack.pipeline import make_pipeline_state

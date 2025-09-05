@@ -187,7 +187,8 @@ class Autotuner:
         if len(self.configs) > 1:
             all_args = {**self.nargs, **kwargs}
             _args = {k: v for (k, v) in all_args.items() if k in self.arg_names}
-            key = [_args[key] for key in self.keys if key in _args]
+            # Need "str" to make it json-serializable
+            key = [str(_args[key]) for key in self.keys if key in _args]
             for _, arg in _args.items():
                 if isinstance(arg, Tensor):
                     key.append(str(arg.shape))

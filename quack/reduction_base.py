@@ -1,17 +1,9 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
-import torch
 from typing import Type, Tuple, Optional
 
 import cutlass
 import cutlass.cute as cute
-
-
-torch2cute_dtype_map = {
-    torch.float16: cutlass.Float16,
-    torch.bfloat16: cutlass.BFloat16,
-    torch.float32: cutlass.Float32,
-}
 
 
 class ReductionBase:

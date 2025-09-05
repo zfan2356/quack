@@ -8,6 +8,7 @@ from torch import Tensor
 from quack.gemm_config import GemmConfig, get_all_configs
 
 from quack.autotuner import autotune, AutotuneConfig
+from quack.dense_gemm_sm90 import gemm_sm90
 
 
 def gemm_swiglu_out_ref(
@@ -24,96 +25,62 @@ def gemm_swiglu_out_ref(
     return out, preact
 
 
-@autotune(
-    configs=[AutotuneConfig(config=c) for c in get_all_configs(epilogue=None)], key=["sm_carveout"]
-)
+@autotune(configs=[AutotuneConfig(config=c) for c in get_all_configs("add")], key=["out_dtype"])
 def gemm_tuned(
-    A: Tensor,
-    B: Tensor,
-    sm_carveout: int = 0,
+    A: Tensor,  # (M, K)
+    B: Tensor,  # (K, N)
+    C: Optional[Tensor] = None,  # (M, N)
+    out_dtype: Optional[torch.dtype] = None,
     config: Optional[GemmConfig] = None,
 ) -> (Tensor, Optional[Tensor]):
     if config is None:
-        config = GemmConfig(
-            tile_m=256,
-            tile_n=192,
-            cluster_m=2,
-            cluster_n=1,
-            pingpong=False,
-            raster_order=2,
-            max_swizzle_size=1,
-        )
-    out = torch.ops.quack.gemm_impl.default(
-        A if not config.swap_ab else B.T,
-        B if not config.swap_ab else A.T,
-        sm_carveout,
+        config = GemmConfig(tile_m=128, tile_n=192, cluster_m=2, cluster_n=1, pingpong=True)
+    A, B = A.unsqueeze(0), B.mT.unsqueeze(0)  # (1, M, K), (1, N, K)
+    if C is not None:
+        C = C.unsqueeze(0)  # (1, M, N)
+    out_dtype = A.dtype if out_dtype is None else out_dtype
+    D = torch.empty((1, A.shape[1], B.shape[1]), dtype=out_dtype, device=A.device)
+    gemm_sm90(
+        A if not config.swap_ab else B,
+        B if not config.swap_ab else A,
+        D if not config.swap_ab else D.mT,
+        (C if not config.swap_ab else C.mT) if C is not None else None,
         config.tile_m,
         config.tile_n,
         config.cluster_m,
         config.cluster_n,
-        not config.swap_ab,  # C_rowmajor
         config.pingpong,
-        config.raster_order,
-        config.max_swizzle_size,
     )
-    return out if not config.swap_ab else out.T
+    return D
 
 
 @torch.library.custom_op("quack::gemm", mutates_args=(), device_types="cuda")
-def gemm(A: Tensor, B: Tensor, sm_carveout: int = 0) -> Tensor:
-    return gemm_tuned(A, B, sm_carveout)
+def gemm(A: Tensor, B: Tensor, out_dtype: Optional[torch.dtype] = None) -> Tensor:
+    return gemm_tuned(A, B, None, out_dtype)
 
 
 @torch.library.register_fake("quack::gemm")
-def gemm_ref(A: Tensor, B: Tensor, sm_carveout: int = 0) -> Tensor:
-    return torch.mm(A, B)
-
-
-@autotune(configs=[AutotuneConfig(config=c) for c in get_all_configs("add")])
-def gemm_add_tuned(
-    A: Tensor,
-    B: Tensor,
-    C: Tensor,
-    config: Optional[GemmConfig] = None,
-) -> (Tensor, Optional[Tensor]):
-    if config is None:
-        config = GemmConfig(
-            tile_m=256,
-            tile_n=192,
-            cluster_m=2,
-            cluster_n=1,
-            pingpong=False,
-            raster_order=2,
-            max_swizzle_size=1,
-        )
-    out = torch.ops.quack.gemm_add_impl.default(
-        A if not config.swap_ab else B.T,
-        B if not config.swap_ab else A.T,
-        C if not config.swap_ab else C.T,
-        config.tile_m,
-        config.tile_n,
-        config.cluster_m,
-        config.cluster_n,
-        config.pingpong,
-        config.raster_order,
-        config.max_swizzle_size,
-    )
-    return out if not config.swap_ab else out.T
+def gemm_ref(A: Tensor, B: Tensor, out_dtype: Optional[torch.dtype] = None) -> Tensor:
+    out_dtype = A.dtype if out_dtype is None else out_dtype
+    return torch.mm(A, B).to(out_dtype)
 
 
 @torch.library.custom_op("quack::gemm_add", mutates_args=(), device_types="cuda")
-def gemm_add(A: Tensor, B: Tensor, C: Tensor) -> Tensor:
-    return gemm_add_tuned(A, B, C)
+def gemm_add(A: Tensor, B: Tensor, C: Tensor, out_dtype: Optional[torch.dtype] = None) -> Tensor:
+    return gemm_tuned(A, B, C, out_dtype)
 
 
 @torch.library.register_fake("quack::gemm_add")
-def gemm_add_ref(A: Tensor, B: Tensor, C: Tensor) -> Tensor:
-    return C + torch.mm(A, B)
+def gemm_add_ref(
+    A: Tensor, B: Tensor, C: Tensor, out_dtype: Optional[torch.dtype] = None
+) -> Tensor:
+    out_dtype = A.dtype if out_dtype is None else out_dtype
+    return (C + torch.mm(A, B)).to(out_dtype)
 
 
 @torch.library.custom_op("quack::gemm_add_t", mutates_args=(), device_types="cuda")
 def gemm_t_add(A: Tensor, B: Tensor, C: Tensor) -> Tensor:
-    return gemm_add_tuned(A, B.T, C)
+    return gemm_tuned(A, B.T, C)
 
 
 @torch.library.register_fake("quack::gemm_add_t")
@@ -183,14 +150,11 @@ def gemm_swiglu_ref(A: Tensor, B: Tensor, store_preact: bool) -> (Tensor, Tensor
 #     return gemm_swiglu_ref(A, B.T, store_preact)
 
 
-@autotune(
-    configs=[AutotuneConfig(config=c) for c in get_all_configs("dswiglu")], key=["sm_carveout"]
-)
+@autotune(configs=[AutotuneConfig(config=c) for c in get_all_configs("dswiglu")])
 def gemm_dswiglu_tuned(
     A: Tensor,
     B: Tensor,
     preact: Tensor,
-    sm_carveout: int = 0,
     config: Optional[GemmConfig] = None,
 ) -> (Tensor, Tensor):
     if config is None:
@@ -207,7 +171,6 @@ def gemm_dswiglu_tuned(
         A if not config.swap_ab else B.T,
         B if not config.swap_ab else A.T,
         preact if not config.swap_ab else preact.T,
-        sm_carveout,
         config.tile_m,
         config.tile_n,
         config.cluster_m,
@@ -226,16 +189,14 @@ def gemm_dswiglu_tuned(
     "quack::gemm_dswiglu",
     mutates_args=(),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor preact, int sm_carveout=0) -> (Tensor, Tensor)",
+    schema="(Tensor A, Tensor B, Tensor preact) -> (Tensor, Tensor)",
 )
-def gemm_dswiglu(A: Tensor, B: Tensor, preact: Tensor, sm_carveout: int = 0) -> (Tensor, Tensor):
-    return gemm_dswiglu_tuned(A, B, preact, sm_carveout)
+def gemm_dswiglu(A: Tensor, B: Tensor, preact: Tensor) -> (Tensor, Tensor):
+    return gemm_dswiglu_tuned(A, B, preact)
 
 
 @torch.library.register_fake("quack::gemm_dswiglu")
-def gemm_dswiglu_ref(
-    A: Tensor, B: Tensor, preact: Tensor, sm_carveout: int = 0
-) -> (Tensor, Tensor):
+def gemm_dswiglu_ref(A: Tensor, B: Tensor, preact: Tensor) -> (Tensor, Tensor):
     # A: (M, K), B: (K, N), preact: (M, 2 * N)
     dout = torch.mm(A, B)
     p0, p1 = preact[..., ::2], preact[..., 1::2]

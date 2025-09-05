@@ -14,7 +14,8 @@ import torch
 
 import quack.utils as utils
 from quack.reduce import row_reduce
-from quack.reduction_base import ReductionBase, torch2cute_dtype_map
+from quack.reduction_base import ReductionBase
+from quack.cute_dsl_utils import torch2cute_dtype_map
 
 
 class RMSNorm(ReductionBase):

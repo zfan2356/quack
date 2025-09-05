@@ -12,7 +12,7 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass import const_expr
 
 import quack.utils as utils
-from quack.reduction_base import torch2cute_dtype_map
+from quack.cute_dsl_utils import torch2cute_dtype_map
 from quack.sort.bitonic_sort import bitonic_topk
 
 
@@ -133,6 +133,7 @@ class TopK:
 
         threads_per_row = tv_layout.shape[0][0]
         topk_vals = bitonic_topk(tXrX_f32, self.k, warp_width=threads_per_row)
+
         # Extract indices and clean values
         topk_vals_u32 = cute.recast_tensor(topk_vals, cutlass.Uint32)
         topk_indices = cute.make_fragment(self.k, cutlass.Int32)
