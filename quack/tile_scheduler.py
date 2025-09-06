@@ -47,7 +47,7 @@ def get_raster_order_from_option(
 @dataclass
 class TileSchedulerOptions(ArgumentsBase):
     max_active_clusters: Int32
-    raster_order: Int32 = Int32(int(RasterOrderOption.Heuristic))
+    raster_order: cutlass.Constexpr[RasterOrderOption] = RasterOrderOption.Heuristic
     max_swizzle_size: Int32 = Int32(8)
     tile_count_semaphore: Optional[cute.Pointer] = None
 
@@ -55,7 +55,7 @@ class TileSchedulerOptions(ArgumentsBase):
 @dataclass
 class TileSchedulerArguments(ArgumentsBase):
     problem_shape_ntile_mnl: cute.Shape
-    raster_order: RasterOrderOption
+    raster_order: cutlass.Constexpr[RasterOrderOption]
     group_size: Int32
     cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
     tile_count_semaphore: Optional[cute.Pointer] = None

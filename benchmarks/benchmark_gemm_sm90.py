@@ -14,7 +14,7 @@ import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass import Int32, Boolean
 
-from quack.dense_gemm_sm90 import GemmSm90, TileSchedulerOptions
+from quack.dense_gemm_sm90 import GemmSm90, TileSchedulerOptions, VarlenArguments
 
 """
 To run this example:
@@ -387,6 +387,7 @@ def run(
     )
 
     epi_args = gemm.EpilogueArguments()
+    varlen_args = VarlenArguments(mCuSeqlensM, tensormaps_tensor)
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     # compile gemm kernel
     compiled_gemm = cute.compile(
@@ -397,26 +398,14 @@ def run(
         mC,
         epi_args,
         scheduler_args,
+        varlen_args,
         mAIdx,
-        mCuSeqlensM,
-        tensormaps_tensor,
         current_stream,
     )
 
     if not skip_ref_check:
         # execution
-        compiled_gemm(
-            mA,
-            mB,
-            mD,
-            mC,
-            epi_args,
-            scheduler_args,
-            mAIdx,
-            mCuSeqlensM,
-            tensormaps_tensor,
-            current_stream,
-        )
+        compiled_gemm(mA, mB, mD, mC, epi_args, scheduler_args, varlen_args, mAIdx, current_stream)
         if tile_count_semaphore is not None and varlen_m:
             tile_count_semaphore.zero_()
 
@@ -517,18 +506,7 @@ def run(
     time.sleep(0.5)
 
     def fn():
-        compiled_gemm(
-            mA,
-            mB,
-            mD,
-            mC,
-            epi_args,
-            scheduler_args,
-            mAIdx,
-            mCuSeqlensM,
-            tensormaps_tensor,
-            current_stream,
-        )
+        compiled_gemm(mA, mB, mD, mC, epi_args, scheduler_args, varlen_args, mAIdx, current_stream)
         if tile_count_semaphore is not None and varlen_m:
             tile_count_semaphore.zero_()
 

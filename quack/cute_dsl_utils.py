@@ -18,6 +18,9 @@ from cutlass.base_dsl.typing import JitArgument
 from cutlass.cutlass_dsl import NumericMeta
 
 
+StaticTypes = (cutlass.Constexpr, NumericMeta, int, bool, str, float)
+
+
 load_cubin_module_data_og = cutlass.base_dsl.runtime.cuda.load_cubin_module_data
 cute_compile_og = cute.compile
 
@@ -38,9 +41,7 @@ def get_max_active_clusters(cluster_size):
 class ParamsBase:
     def __extract_mlir_values__(self):
         all_fields = [getattr(self, field.name) for field in fields(self)]
-        non_constexpr_fields = [
-            f for f in all_fields if not isinstance(f, (cutlass.Constexpr, NumericMeta))
-        ]
+        non_constexpr_fields = [f for f in all_fields if not isinstance(f, StaticTypes)]
         values, self._values_pos = [], []
         for obj in non_constexpr_fields:
             obj_values = cutlass.extract_mlir_values(obj)
@@ -50,13 +51,9 @@ class ParamsBase:
 
     def __new_from_mlir_values__(self, values):
         all_fields = {field.name: getattr(self, field.name) for field in fields(self)}
-        constexpr_fields = {
-            n: f for n, f in all_fields.items() if isinstance(f, (cutlass.Constexpr, NumericMeta))
-        }
+        constexpr_fields = {n: f for n, f in all_fields.items() if isinstance(f, StaticTypes)}
         non_constexpr_fields = {
-            n: f
-            for n, f in all_fields.items()
-            if not isinstance(f, (cutlass.Constexpr, NumericMeta))
+            n: f for n, f in all_fields.items() if not isinstance(f, StaticTypes)
         }
         for (name, field), n_items in zip(non_constexpr_fields.items(), self._values_pos):
             non_constexpr_fields[name] = cutlass.new_from_mlir_values(field, values[:n_items])
@@ -68,9 +65,7 @@ class ParamsBase:
 class ArgumentsBase(JitArgument):
     def __c_pointers__(self):
         all_fields = [getattr(self, field.name) for field in fields(self)]
-        non_constexpr_fields = [
-            f for f in all_fields if not isinstance(f, (cutlass.Constexpr, NumericMeta))
-        ]
+        non_constexpr_fields = [f for f in all_fields if not isinstance(f, StaticTypes)]
         c_ptrs = []
         for obj in non_constexpr_fields:
             if hasattr(obj, "__c_pointers__"):
@@ -79,9 +74,7 @@ class ArgumentsBase(JitArgument):
 
     def __get_mlir_types__(self):
         all_fields = [getattr(self, field.name) for field in fields(self)]
-        non_constexpr_fields = [
-            f for f in all_fields if not isinstance(f, (cutlass.Constexpr, NumericMeta))
-        ]
+        non_constexpr_fields = [f for f in all_fields if not isinstance(f, StaticTypes)]
         types = []
         for obj in non_constexpr_fields:
             if hasattr(obj, "__get_mlir_types__"):
@@ -90,13 +83,9 @@ class ArgumentsBase(JitArgument):
 
     def __new_from_mlir_values__(self, values):
         all_fields = {field.name: getattr(self, field.name) for field in fields(self)}
-        constexpr_fields = {
-            n: f for n, f in all_fields.items() if isinstance(f, (cutlass.Constexpr, NumericMeta))
-        }
+        constexpr_fields = {n: f for n, f in all_fields.items() if isinstance(f, StaticTypes)}
         non_constexpr_fields = {
-            n: f
-            for n, f in all_fields.items()
-            if not isinstance(f, (cutlass.Constexpr, NumericMeta))
+            n: f for n, f in all_fields.items() if not isinstance(f, StaticTypes)
         }
         # for (name, field), n_items in zip(non_constexpr_fields.items(), self._values_pos):
         for name, field in non_constexpr_fields.items():

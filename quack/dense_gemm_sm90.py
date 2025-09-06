@@ -28,6 +28,7 @@ from quack.tile_scheduler import (
     VarlenMTileSchedulerArguments,
     VarlenMTileScheduler,
 )
+from quack.varlen_utils import VarlenArguments
 from quack.tensormap_manager import TensorMapManagerSm90
 
 # return PipelineStateWAdvance instead of PipelineState
@@ -161,7 +162,7 @@ class GemmSm90:
         self.gather_A = gather_A
         if gather_A:
             assert cluster_shape_mnk[1] == 1, "Cluster shape N must be 1 for gather A "
-        self.tensormap_update_mode = cutlass.utils.TensorMapUpdateMode.SMEM
+        self.tensormap_update_mode = cutlass.utils.TensorMapUpdateMode.GMEM
 
         self.cluster_shape_mnk = cluster_shape_mnk
         self.tile_shape_mnk = tuple(tile_shape_mnk)
@@ -328,9 +329,8 @@ class GemmSm90:
         mC: Optional[cute.Tensor],
         epilogue_args: Optional[EpilogueArguments],
         scheduler_args: TileSchedulerOptions,
+        varlen_args: Optional[VarlenArguments],
         mAIdx: Optional[cute.Tensor],
-        mCuSeqlensM: Optional[cute.Tensor],
-        mTensormaps: Optional[cute.Tensor],
         stream: cuda.CUstream,
     ):
         """Execute the GEMM operation in steps:
@@ -440,7 +440,7 @@ class GemmSm90:
 
         epilogue_params = self.epi_to_underlying_arguments(epilogue_args)
 
-        if const_expr(mCuSeqlensM is None):
+        if const_expr(varlen_args.mCuSeqlensM is None):
             problem_shape_ntile_mnl = (
                 cute.ceil_div(mA.shape[0], self.tile_shape_mnk[0]),
                 cute.ceil_div(mB.shape[0], self.tile_shape_mnk[1]),
@@ -456,18 +456,17 @@ class GemmSm90:
                 is_persistent=self.is_persistent,
             )
         else:
-            assert mTensormaps is not None
             assert mD is not None or not self.gather_A
             problem_shape_ntile_mnl = (
                 None,
                 cute.ceil_div(mB.shape[0], self.tile_shape_mnk[1]),
-                mCuSeqlensM.shape[0] - 1,
+                varlen_args.mCuSeqlensM.shape[0] - 1,
             )
             TileSchedulerCls = VarlenMTileScheduler
             tile_sched_args = VarlenMTileSchedulerArguments(
                 problem_shape_ntile_mnl=problem_shape_ntile_mnl,
                 total_m=mD.shape[0] if mD is not None else mAIdx.shape[0],
-                cu_seqlens_m=mCuSeqlensM,
+                cu_seqlens_m=varlen_args.mCuSeqlensM,
                 raster_order=scheduler_args.raster_order,
                 group_size=scheduler_args.max_swizzle_size,
                 tile_shape_mnk=self.tile_shape_mnk,
@@ -487,7 +486,7 @@ class GemmSm90:
 
         size_tensormap_in_i64 = (
             0
-            if mCuSeqlensM is None
+            if varlen_args.mCuSeqlensM is None
             or self.tensormap_update_mode == cutlass.utils.TensorMapUpdateMode.GMEM
             else GemmSm90.num_tensormaps * GemmSm90.bytes_per_tensormap // 8
         ) * (1 if not self.pingpong else 2)
@@ -538,8 +537,8 @@ class GemmSm90:
             tma_tensor_c,
             epilogue_params,
             mAIdx,
-            mCuSeqlensM,
-            mTensormaps,
+            varlen_args.mCuSeqlensM,
+            varlen_args.mTensormaps,
             tiled_mma,
             self.cluster_layout_mnk,
             self.a_smem_layout_staged,
