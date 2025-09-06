@@ -15,7 +15,7 @@ from cutlass import Int32, Boolean, const_expr
 from cutlass.cute.runtime import from_dlpack, make_ptr
 
 from quack.cute_dsl_utils import ArgumentsBase, ParamsBase
-from quack.dense_gemm_sm90 import GemmSm90
+from quack.dense_gemm_sm90 import GemmSm90, TileSchedulerOptions
 from quack.cute_dsl_utils import torch2cute_dtype_map, get_max_active_clusters
 import quack.activation
 
@@ -325,13 +325,16 @@ def gemm_act_sm90(
         if C is not None
         else None
     )
-    tile_count_semaphore_ptr = (
-        make_ptr(Int32, tile_count_semaphore.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
-        if tile_count_semaphore is not None
-        else None
-    )
     act_fn = act_fn_map[activation]
     epi_args = GemmActSm90.EpilogueArguments(mPostAct, act_fn)
+    scheduler_args = TileSchedulerOptions(
+        Int32(max_active_clusters),
+        tile_count_semaphore=make_ptr(
+            Int32, tile_count_semaphore.data_ptr(), cute.AddressSpace.gmem, assumed_align=4
+        )
+        if tile_count_semaphore is not None
+        else None,
+    )
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     compile_key = (
@@ -368,26 +371,12 @@ def gemm_act_sm90(
             mD,
             mC,
             epi_args,
+            scheduler_args,
+            None,  # varlen_args
             None,  # mAIdx
-            None,  # mCuSeqlensM
-            None,  # tensormap
-            tile_count_semaphore_ptr,
-            max_active_clusters,
             current_stream,
         )
-    cache[compile_key](
-        mA,
-        mB,
-        mD,
-        mC,
-        epi_args,
-        None,
-        None,
-        None,
-        tile_count_semaphore_ptr,
-        max_active_clusters,
-        current_stream,
-    )
+    cache[compile_key](mA, mB, mD, mC, epi_args, scheduler_args, None, None, current_stream)
 
 
 gemm_act_sm90.compile_cache = {}
