@@ -440,6 +440,8 @@ class GemmSm90:
 
         epilogue_params = self.epi_to_underlying_arguments(epilogue_args)
 
+        if const_expr(varlen_args is None):
+            varlen_args = VarlenArguments()
         if const_expr(varlen_args.mCuSeqlensM is None):
             problem_shape_ntile_mnl = (
                 cute.ceil_div(mA.shape[0], self.tile_shape_mnk[0]),
