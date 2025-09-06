@@ -22,11 +22,11 @@ from cutlass.cute.runtime import from_dlpack, make_ptr
 
 from quack.cute_dsl_utils import ParamsBase, ArgumentsBase
 from quack.tile_scheduler import (
+    TileSchedulerOptions,
     TileSchedulerArguments,
     TileScheduler,
     VarlenMTileSchedulerArguments,
     VarlenMTileScheduler,
-    RasterOrderOption,
 )
 from quack.tensormap_manager import TensorMapManagerSm90
 
@@ -327,11 +327,10 @@ class GemmSm90:
         mD: Optional[cute.Tensor],
         mC: Optional[cute.Tensor],
         epilogue_args: Optional[EpilogueArguments],
+        scheduler_args: TileSchedulerOptions,
         mAIdx: Optional[cute.Tensor],
         mCuSeqlensM: Optional[cute.Tensor],
         mTensormaps: Optional[cute.Tensor],
-        tile_count_semaphore: Optional[cute.Pointer],
-        max_active_clusters: Int32,
         stream: cuda.CUstream,
     ):
         """Execute the GEMM operation in steps:
@@ -450,10 +449,10 @@ class GemmSm90:
             TileSchedulerCls = TileScheduler
             tile_sched_args = TileSchedulerArguments(
                 problem_shape_ntile_mnl=problem_shape_ntile_mnl,
-                raster_order=RasterOrderOption.Heuristic,
-                group_size=8,
+                raster_order=scheduler_args.raster_order,
+                group_size=scheduler_args.max_swizzle_size,
                 cluster_shape_mnk=self.cluster_shape_mnk,
-                tile_count_semaphore=tile_count_semaphore,
+                tile_count_semaphore=scheduler_args.tile_count_semaphore,
                 is_persistent=self.is_persistent,
             )
         else:
@@ -469,15 +468,17 @@ class GemmSm90:
                 problem_shape_ntile_mnl=problem_shape_ntile_mnl,
                 total_m=mD.shape[0] if mD is not None else mAIdx.shape[0],
                 cu_seqlens_m=mCuSeqlensM,
-                raster_order=RasterOrderOption.Heuristic,
-                group_size=8,
+                raster_order=scheduler_args.raster_order,
+                group_size=scheduler_args.max_swizzle_size,
                 tile_shape_mnk=self.tile_shape_mnk,
                 cluster_shape_mnk=self.cluster_shape_mnk,
-                tile_count_semaphore=tile_count_semaphore,
+                tile_count_semaphore=scheduler_args.tile_count_semaphore,
                 is_persistent=self.is_persistent,
             )
         tile_sched_params = TileSchedulerCls.to_underlying_arguments(tile_sched_args)
-        grid = TileSchedulerCls.get_grid_shape(tile_sched_params, max_active_clusters)
+        grid = TileSchedulerCls.get_grid_shape(
+            tile_sched_params, scheduler_args.max_active_clusters
+        )
 
         epi_smem_size = (
             cute.cosize(self.epi_smem_layout_staged) if self.is_persistent and mD is not None else 0

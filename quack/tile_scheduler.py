@@ -11,7 +11,7 @@ from cutlass import Int32, Boolean, const_expr
 import quack.utils as utils
 from quack.fast_math import FastDivmod
 from quack.pipeline import PipelineStateWAdvance
-from quack.cute_dsl_utils import ParamsBase
+from quack.cute_dsl_utils import ArgumentsBase, ParamsBase
 
 
 class RasterOrderOption(IntEnum):
@@ -43,8 +43,17 @@ def get_raster_order_from_option(
     return raster_order
 
 
+# Grouping arguments together that's should be passed to __call__
 @dataclass
-class TileSchedulerArguments(ParamsBase):
+class TileSchedulerOptions(ArgumentsBase):
+    max_active_clusters: Int32
+    raster_order: Int32 = Int32(int(RasterOrderOption.Heuristic))
+    max_swizzle_size: Int32 = Int32(8)
+    tile_count_semaphore: Optional[cute.Pointer] = None
+
+
+@dataclass
+class TileSchedulerArguments(ArgumentsBase):
     problem_shape_ntile_mnl: cute.Shape
     raster_order: RasterOrderOption
     group_size: Int32
@@ -244,7 +253,7 @@ class TileScheduler:
         return self.get_current_work(loc=loc, ip=ip)
 
     @cute.jit
-    def fetch_next_work(self, is_scheduler_warp: bool | Boolean=False, *, loc=None, ip=None):
+    def fetch_next_work(self, is_scheduler_warp: bool | Boolean = False, *, loc=None, ip=None):
         """is_scheduler_warp should only be true for one warp in the whole cluster"""
         if const_expr(self.params.tile_count_semaphore is not None):
             params = self.params

@@ -57,7 +57,7 @@ def gemm_tuned(
 
 @autotune(
     configs=[AutotuneConfig(config=c) for c in get_all_configs()],
-    key=["activation", "out_dtype", "postact_dtype"],
+    key=["activation", "out_dtype", "postact_dtype", "store_preact"],
 )
 def gemm_act_tuned(
     A: Tensor,  # (M, K)

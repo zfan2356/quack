@@ -14,7 +14,7 @@ import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass import Int32, Boolean
 
-from quack.dense_gemm_sm90 import GemmSm90
+from quack.dense_gemm_sm90 import GemmSm90, TileSchedulerOptions
 
 """
 To run this example:
@@ -379,7 +379,14 @@ def run(
     else:
         max_active_clusters = 0
         tile_count_semaphore = None
+    scheduler_args = TileSchedulerOptions(
+        Int32(max_active_clusters),
+        tile_count_semaphore=make_ptr(
+            Int32, tile_count_semaphore.data_ptr(), cute.AddressSpace.gmem, assumed_align=4
+        ) if tile_count_semaphore is not None else None,
+    )
 
+    epi_args = gemm.EpilogueArguments()
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     # compile gemm kernel
     compiled_gemm = cute.compile(
@@ -388,14 +395,11 @@ def run(
         mB,
         mD,
         mC,
-        epilogue_args,
+        epi_args,
+        scheduler_args,
         mAIdx,
         mCuSeqlensM,
         tensormaps_tensor,
-        make_ptr(Int32, tile_count_semaphore.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
-        if tile_count_semaphore is not None
-        else None,
-        max_active_clusters,
         current_stream,
     )
 
@@ -406,12 +410,11 @@ def run(
             mB,
             mD,
             mC,
-            epilogue_args,
+            epi_args,
+            scheduler_args,
             mAIdx,
             mCuSeqlensM,
             tensormaps_tensor,
-            tile_count_semaphore,
-            max_active_clusters,
             current_stream,
         )
         if tile_count_semaphore is not None and varlen_m:
@@ -519,12 +522,11 @@ def run(
             mB,
             mD,
             mC,
-            epilogue_args,
+            epi_args,
+            scheduler_args,
             mAIdx,
             mCuSeqlensM,
             tensormaps_tensor,
-            tile_count_semaphore,
-            max_active_clusters,
             current_stream,
         )
         if tile_count_semaphore is not None and varlen_m:
