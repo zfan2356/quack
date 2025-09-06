@@ -113,7 +113,7 @@ class GemmActSm90(GemmSm90):
         tiled_copy_s2r: Optional[cute.core.ThrCopy],
         tSR_rC: Optional[cute.Tensor],
         tSR_sC: Optional[cute.Tensor],
-        copy_D: Callable,
+        copy_D: Optional[Callable],
         bSG_sD: cute.Tensor,
         bSG_gD: cute.Tensor,
         epi_load_g2s: Optional[Callable],
@@ -125,6 +125,7 @@ class GemmActSm90(GemmSm90):
         is_tma_warp: Boolean,
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
         has_C = const_expr(tRS_rC is not None)
+        has_D = const_expr(copy_D is not None)
         assert cu_seqlens_m is None, "GemmActSm90 doesn't support varlen_m for now"
 
         tma_atom_postact = params.tma_atom_postact
@@ -148,8 +149,10 @@ class GemmActSm90(GemmSm90):
         )
 
         # We iterate over epi tiles in the N dimension first before the M dimension
-        epi_tile_layout = cute.make_layout(bSG_gD.shape[1], stride=(bSG_gD.shape[1][1], 1))
-        epi_tile_num = cute.size(bSG_gD.shape[1])
+        epi_tile_layout = cute.make_layout(
+            bSG_gPostAct.shape[1], stride=(bSG_gPostAct.shape[1][1], 1)
+        )
+        epi_tile_num = cute.size(bSG_gPostAct.shape[1])
         num_prev_subtiles = tile_scheduler.num_tiles_executed * epi_tile_num
 
         if const_expr(epi_load_g2s is not None):
@@ -176,12 +179,13 @@ class GemmActSm90(GemmSm90):
                     epi_producer_state, epi_idx + self.epi_c_stage, is_tma_warp
                 )
             tRS_rPostAct = self.epi_visit_acc_subtile(params, tRS_rD, tRS_rC)
-            # Type conversion
-            tRS_rD_out = cute.make_fragment_like(tRS_rD, self.d_dtype)
-            tRS_rD_out.store(tRS_rD.load().to(self.d_dtype))
+            epi_buffer = (num_prev_subtiles + epi_idx) % cute.size(tRS_sPostAct, mode=[3])
             # Copy from D registers to shared memory
-            epi_buffer = (num_prev_subtiles + epi_idx) % cute.size(tRS_sD, mode=[3])
-            cute.copy(tiled_copy_r2s, tRS_rD_out, tRS_sD[None, None, None, epi_buffer])
+            if const_expr(has_D):
+                # Type conversion
+                tRS_rD_out = cute.make_fragment_like(tRS_rD, self.d_dtype)
+                tRS_rD_out.store(tRS_rD.load().to(self.d_dtype))
+                cute.copy(tiled_copy_r2s, tRS_rD_out, tRS_sD[None, None, None, epi_buffer])
             cute.copy(
                 tiled_copy_postact_r2s,
                 tiled_copy_postact_r2s.retile(tRS_rPostAct),
@@ -196,7 +200,8 @@ class GemmActSm90(GemmSm90):
             gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
             # Copy from shared memory to global memory
             if is_tma_warp:
-                copy_D(bSG_sD[None, epi_buffer], bSG_gD[None, gmem_coord])
+                if const_expr(has_D):
+                    copy_D(bSG_sD[None, epi_buffer], bSG_gD[None, gmem_coord])
                 cute.copy(
                     tma_atom_postact,
                     bSG_sPostAct[None, epi_buffer],
@@ -241,7 +246,7 @@ act_fn_map = {
 def gemm_act_sm90(
     A: Tensor,  # (l, m, k)
     B: Tensor,  # (l, n, k)
-    D: Tensor,  # (l, m, n)
+    D: Optional[Tensor],  # (l, m, n)
     C: Optional[Tensor],  # (l, m, n)
     PostAct: Tensor,  # (l, m, n)
     activation: Optional[str],
@@ -260,9 +265,10 @@ def gemm_act_sm90(
     _, N, _ = B.shape
     assert B.dtype == A.dtype
     assert B.shape == (L, N, K), f"B must have shape {(L, N, K)}, got {B.shape}"
-    assert D.dim() == 3 and D.is_cuda, "D must be A 3D CUDA tensor"
-    assert D.dtype in torch2cute_dtype_map, "Unsupported dtype for D"
-    assert D.shape == (L, M, N), f"D must have shape {(L, M, N)}, got {D.shape}"
+    if D is not None:
+        assert D.dim() == 3 and D.is_cuda, "D must be A 3D CUDA tensor"
+        assert D.dtype in torch2cute_dtype_map, "Unsupported dtype for D"
+        assert D.shape == (L, M, N), f"D must have shape {(L, M, N)}, got {D.shape}"
     assert PostAct.dim() == 3 and PostAct.is_cuda, "PostAct must be A 3D CUDA tensor"
     assert PostAct.dtype in torch2cute_dtype_map, "Unsupported dtype for PostAct"
     assert PostAct.shape == (L, M, N), f"PostAct must have shape {(L, M, N)}, got {PostAct.shape}"
@@ -271,14 +277,13 @@ def gemm_act_sm90(
         assert C.shape == (L, M, N), f"C must have shape {(L, M, N)}, got {C.shape}"
         assert C.dtype in torch2cute_dtype_map, "Unsupported dtype for C"
     assert activation in act_fn_map, f"Unsupported activation {activation}"
-    A, B, D, PostAct = [
-        x.permute(1, 2, 0) for x in (A, B, D, PostAct)
+    A, B, D, C, PostAct = [
+        x.permute(1, 2, 0) if x is not None else None for x in (A, B, D, C, PostAct)
     ]  # (m, k, l), (n, k, l), (m, n, l)
-    C = C.permute(1, 2, 0) if C is not None else None
 
     a_dtype = torch2cute_dtype_map[A.dtype]
     b_dtype = a_dtype
-    d_dtype = torch2cute_dtype_map[D.dtype]
+    d_dtype = torch2cute_dtype_map[D.dtype] if D is not None else None
     postact_dtype = torch2cute_dtype_map[PostAct.dtype]
     c_dtype = torch2cute_dtype_map[C.dtype] if C is not None else None
     acc_dtype = cutlass.Float32
@@ -286,7 +291,7 @@ def gemm_act_sm90(
     cluster_shape_mnk = (cluster_M, cluster_N, 1)
     a_major = "k" if A.stride(1) == 1 else "m"
     b_major = "k" if B.stride(1) == 1 else "n"
-    d_major = "n" if D.stride(1) == 1 else "m"
+    d_major = "n" if D is not None and D.stride(1) == 1 else "m"
     postact_major = "n" if PostAct.stride(1) == 1 else "m"
     c_major = "n" if C is not None and C.stride(1) == 1 else "m"
     if not GemmActSm90.is_valid_dtypes(a_dtype, b_dtype, acc_dtype, d_dtype, a_major, b_major):
@@ -303,8 +308,12 @@ def gemm_act_sm90(
     mB = from_dlpack(B.detach(), assumed_align=16).mark_layout_dynamic(
         leading_dim=1 if b_major == "k" else 0
     )
-    mD = from_dlpack(D.detach(), assumed_align=16).mark_layout_dynamic(
-        leading_dim=1 if d_major == "n" else 0
+    mD = (
+        from_dlpack(D.detach(), assumed_align=16).mark_layout_dynamic(
+            leading_dim=1 if d_major == "n" else 0
+        )
+        if D is not None
+        else None
     )
     mPostAct = from_dlpack(PostAct.detach(), assumed_align=16).mark_layout_dynamic(
         leading_dim=1 if postact_major == "n" else 0

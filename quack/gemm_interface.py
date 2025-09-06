@@ -66,6 +66,7 @@ def gemm_act_tuned(
     activation: Optional[str] = None,  # None, "relu", "relu_sq", "gelu_tanh_approx"
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
+    store_preact: bool = True,
     config: Optional[GemmConfig] = None,
 ) -> (Tensor, Optional[Tensor]):
     if config is None:
@@ -75,12 +76,15 @@ def gemm_act_tuned(
         C = C.unsqueeze(0)  # (1, M, N)
     out_dtype = A.dtype if out_dtype is None else out_dtype
     postact_dtype = A.dtype if postact_dtype is None else postact_dtype
-    D = torch.empty((1, A.shape[1], B.shape[1]), dtype=out_dtype, device=A.device)
+    if store_preact:
+        D = torch.empty((1, A.shape[1], B.shape[1]), dtype=out_dtype, device=A.device)
+    else:
+        D = None
     PostAct = torch.empty((1, A.shape[1], B.shape[1]), dtype=postact_dtype, device=A.device)
     gemm_act_sm90(
         A if not config.swap_ab else B,
         B if not config.swap_ab else A,
-        D if not config.swap_ab else D.mT,
+        (D if not config.swap_ab else D.mT) if D is not None else None,
         (C if not config.swap_ab else C.mT) if C is not None else None,
         PostAct if not config.swap_ab else PostAct.mT,
         activation,
@@ -133,7 +137,7 @@ def gemm_t_add_ref(A: Tensor, B: Tensor, C: Tensor) -> Tensor:
     "quack::gemm_act",
     mutates_args=(),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor? C=None, str? activation=None, ScalarType? out_dtype=None, ScalarType? postact_dtype=None) -> (Tensor, Tensor)",
+    schema="(Tensor A, Tensor B, Tensor? C=None, str? activation=None, ScalarType? out_dtype=None, ScalarType? postact_dtype=None, bool store_preact=True) -> (Tensor?, Tensor)",
 )
 def gemm_act(
     A: Tensor,
@@ -142,8 +146,9 @@ def gemm_act(
     activation: Optional[str] = None,
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
+    store_preact: bool = True,
 ) -> Tuple[Tensor, Tensor]:
-    return gemm_act_tuned(A, B, C, activation, out_dtype, postact_dtype)
+    return gemm_act_tuned(A, B, C, activation, out_dtype, postact_dtype, store_preact)
 
 
 @torch.library.register_fake("quack::gemm_act")
