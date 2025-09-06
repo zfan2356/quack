@@ -26,12 +26,16 @@ def gemm_swiglu_out_ref(
     return out, preact
 
 
-@autotune(configs=[AutotuneConfig(config=c) for c in get_all_configs()], key=["out_dtype"])
+@autotune(
+    configs=[AutotuneConfig(config=c) for c in get_all_configs()],
+    key=["out_dtype", "dynamic_scheduler"],
+)
 def gemm_tuned(
     A: Tensor,  # (M, K)
     B: Tensor,  # (K, N)
     C: Optional[Tensor] = None,  # (M, N)
     out_dtype: Optional[torch.dtype] = None,
+    dynamic_scheduler: bool = False,
     config: Optional[GemmConfig] = None,
 ) -> (Tensor, Optional[Tensor]):
     if config is None:
@@ -41,11 +45,15 @@ def gemm_tuned(
         C = C.unsqueeze(0)  # (1, M, N)
     out_dtype = A.dtype if out_dtype is None else out_dtype
     D = torch.empty((1, A.shape[1], B.shape[1]), dtype=out_dtype, device=A.device)
+    tile_count_semaphore = (
+        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
+    )
     gemm_sm90(
         A if not config.swap_ab else B,
         B if not config.swap_ab else A,
         D if not config.swap_ab else D.mT,
         (C if not config.swap_ab else C.mT) if C is not None else None,
+        tile_count_semaphore,
         config.tile_m,
         config.tile_n,
         config.cluster_m,
@@ -98,24 +106,38 @@ def gemm_act_tuned(
 
 
 @torch.library.custom_op("quack::gemm", mutates_args=(), device_types="cuda")
-def gemm(A: Tensor, B: Tensor, out_dtype: Optional[torch.dtype] = None) -> Tensor:
-    return gemm_tuned(A, B, None, out_dtype)
+def gemm(
+    A: Tensor, B: Tensor, out_dtype: Optional[torch.dtype] = None, dynamic_scheduler: bool = False
+) -> Tensor:
+    return gemm_tuned(A, B, None, out_dtype, dynamic_scheduler)
 
 
 @torch.library.register_fake("quack::gemm")
-def gemm_ref(A: Tensor, B: Tensor, out_dtype: Optional[torch.dtype] = None) -> Tensor:
+def gemm_ref(
+    A: Tensor, B: Tensor, out_dtype: Optional[torch.dtype] = None, dynamic_scheduler: bool = False
+) -> Tensor:
     out_dtype = A.dtype if out_dtype is None else out_dtype
     return torch.mm(A, B).to(out_dtype)
 
 
 @torch.library.custom_op("quack::gemm_add", mutates_args=(), device_types="cuda")
-def gemm_add(A: Tensor, B: Tensor, C: Tensor, out_dtype: Optional[torch.dtype] = None) -> Tensor:
-    return gemm_tuned(A, B, C, out_dtype)
+def gemm_add(
+    A: Tensor,
+    B: Tensor,
+    C: Tensor,
+    out_dtype: Optional[torch.dtype] = None,
+    dynamic_scheduler: bool = False,
+) -> Tensor:
+    return gemm_tuned(A, B, C, out_dtype, dynamic_scheduler)
 
 
 @torch.library.register_fake("quack::gemm_add")
 def gemm_add_ref(
-    A: Tensor, B: Tensor, C: Tensor, out_dtype: Optional[torch.dtype] = None
+    A: Tensor,
+    B: Tensor,
+    C: Tensor,
+    out_dtype: Optional[torch.dtype] = None,
+    dynamic_scheduler: bool = False,
 ) -> Tensor:
     out_dtype = A.dtype if out_dtype is None else out_dtype
     return (C + torch.mm(A, B)).to(out_dtype)
@@ -170,114 +192,6 @@ def gemm_act_ref(
     return out, postact
 
 
-@autotune(
-    configs=[AutotuneConfig(config=c) for c in get_all_configs("swiglu")], key=["store_preact"]
-)
-def gemm_swiglu_tuned(
-    A: Tensor,
-    B: Tensor,
-    store_preact: bool = True,
-    config: Optional[GemmConfig] = None,
-) -> (Tensor, Optional[Tensor]):
-    if config is None:
-        config = GemmConfig(
-            tile_m=256,
-            tile_n=192,
-            cluster_m=2,
-            cluster_n=1,
-            pingpong=False,
-            raster_order=2,
-            max_swizzle_size=1,
-        )
-    # out, preact
-    return torch.ops.quack.gemm_swiglu_impl.default(
-        A,
-        B,
-        store_preact,
-        config.tile_m,
-        config.tile_n,
-        config.cluster_m,
-        config.cluster_n,
-        config.pingpong,
-        config.raster_order,
-        config.max_swizzle_size,
-    )
-
-
-# Specifying the schema manually here since torch.library._infer_schema doesn't work when return
-# type is a tuple of Tensor
-@torch.library.custom_op(
-    "quack::gemm_swiglu",
-    mutates_args=(),
-    device_types="cuda",
-    schema="(Tensor A, Tensor B, bool store_preact) -> (Tensor, Tensor)",
-)
-def gemm_swiglu(A: Tensor, B: Tensor, store_preact: bool = True) -> (Tensor, Tensor):
-    return gemm_swiglu_tuned(A, B, store_preact=store_preact)
-
-
-@torch.library.register_fake("quack::gemm_swiglu")
-def gemm_swiglu_ref(A: Tensor, B: Tensor, store_preact: bool) -> (Tensor, Tensor):
-    return gemm_swiglu_out_ref(A, B, None, store_preact)
-
-
-# @torch.library.custom_op("quack::gemm_swiglu_t", mutates_args=(), device_types="cuda",
-#                          schema="(Tensor A, Tensor B, bool store_preact) -> (Tensor, Tensor)")
-# def gemm_swiglu_t(A: Tensor, B: Tensor, store_preact: bool = True) -> (Tensor, Tensor):
-#     return gemm_swiglu_tuned(A, B.T, store_preact=store_preact)
-
-
-# @torch.library.register_fake("quack::gemm_swiglu_t")
-# def gemm_swiglu_t_ref(A: Tensor, B: Tensor, store_preact: bool) -> (Tensor, Tensor):
-#     return gemm_swiglu_ref(A, B.T, store_preact)
-
-
-@autotune(configs=[AutotuneConfig(config=c) for c in get_all_configs("dswiglu")])
-def gemm_dswiglu_tuned(
-    A: Tensor,
-    B: Tensor,
-    preact: Tensor,
-    config: Optional[GemmConfig] = None,
-) -> (Tensor, Tensor):
-    if config is None:
-        config = GemmConfig(
-            tile_m=128,
-            tile_n=192,
-            cluster_m=2,
-            cluster_n=1,
-            pingpong=True,
-            raster_order=2,
-            max_swizzle_size=1,
-        )
-    out, postact = torch.ops.quack.gemm_dswiglu_impl.default(
-        A if not config.swap_ab else B.T,
-        B if not config.swap_ab else A.T,
-        preact if not config.swap_ab else preact.T,
-        config.tile_m,
-        config.tile_n,
-        config.cluster_m,
-        config.cluster_n,
-        not config.swap_ab,  # C_rowmajor
-        config.pingpong,
-        config.raster_order,
-        config.max_swizzle_size,
-    )
-    return (out, postact) if not config.swap_ab else (out.T, postact.T)
-
-
-# Specifying the schema manually here since torch.library._infer_schema doesn't work when return
-# type is a tuple of Tensor
-@torch.library.custom_op(
-    "quack::gemm_dswiglu",
-    mutates_args=(),
-    device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor preact) -> (Tensor, Tensor)",
-)
-def gemm_dswiglu(A: Tensor, B: Tensor, preact: Tensor) -> (Tensor, Tensor):
-    return gemm_dswiglu_tuned(A, B, preact)
-
-
-@torch.library.register_fake("quack::gemm_dswiglu")
 def gemm_dswiglu_ref(A: Tensor, B: Tensor, preact: Tensor) -> (Tensor, Tensor):
     # A: (M, K), B: (K, N), preact: (M, 2 * N)
     dout = torch.mm(A, B)

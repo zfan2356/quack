@@ -2022,6 +2022,7 @@ def gemm_sm90(
     B: Tensor,  # (l, n, k)
     D: Tensor,  # (l, m, n)
     C: Optional[Tensor],  # (l, m, n)
+    tile_count_semaphore: Optional[Tensor],  # (1,)
     tile_M: int,
     tile_N: int,
     cluster_M: int,
@@ -2029,7 +2030,6 @@ def gemm_sm90(
     pingpong: bool = False,
     persistent: bool = True,
 ) -> None:
-    tile_count_semaphore = None
     assert A.dim() == 3 and A.is_cuda, "A must be A 3D CUDA tensor"
     L, M, K = A.shape
     assert A.dtype in torch2cute_dtype_map, "Unsupported dtype for A"
