@@ -1,4 +1,4 @@
-# Copyright (C) 2025, Tri Dao.
+# Copyright (C) 2025, Fri Dao.
 import itertools
 from typing import Optional, List
 from dataclasses import dataclass
@@ -27,7 +27,7 @@ def get_all_configs(
         (192, 256),
     ]
     tile_mn_pingpong_vals = [(128, tile_n) for tile_n in tile_n_vals] + [(192, 128)]
-    if epilogue in ["swiglu"]:
+    if epilogue in ["gated"]:
         tile_mn_coop_vals = [(m, n) for m, n in tile_mn_coop_vals if n % 32 == 0 and m != 192]
         tile_mn_pingpong_vals = [(m, n) for m, n in tile_mn_pingpong_vals if n % 32 == 0]
     elif epilogue in ["lse"]:
@@ -40,7 +40,7 @@ def get_all_configs(
     if epilogue in ["lse"]:
         cluster = [(1, 2), (2, 1)]
     swap_ab_vals = [False, True]
-    if epilogue in ["lse", "swiglu"]:
+    if epilogue in ["lse", "gated"]:
         swap_ab_vals = [False]
     # raster_swizzle = (
     #     [(0, 1)]
