@@ -149,10 +149,11 @@ class GemmActSm90(GemmSm90):
         )
 
         # We iterate over epi tiles in the N dimension first before the M dimension
-        epi_tile_layout = cute.make_layout(
-            bSG_gPostAct.shape[1], stride=(bSG_gPostAct.shape[1][1], 1)
-        )
-        epi_tile_num = cute.size(bSG_gPostAct.shape[1])
+        epi_tile_shape = cute.zipped_divide(
+            cute.make_layout(self.tile_shape_mnk[:2]), self.epi_tile
+        ).shape[1]
+        epi_tile_layout = cute.make_layout(epi_tile_shape, stride=(epi_tile_shape[1], 1))
+        epi_tile_num = cute.size(epi_tile_shape)
         num_prev_subtiles = tile_scheduler.num_tiles_executed * epi_tile_num
 
         if const_expr(epi_load_g2s is not None):
@@ -179,7 +180,7 @@ class GemmActSm90(GemmSm90):
                     epi_producer_state, epi_idx + self.epi_c_stage, is_tma_warp
                 )
             tRS_rPostAct = self.epi_visit_acc_subtile(params, tRS_rD, tRS_rC)
-            epi_buffer = (num_prev_subtiles + epi_idx) % cute.size(tRS_sPostAct, mode=[3])
+            epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
             # Copy from D registers to shared memory
             if const_expr(has_D):
                 # Type conversion
