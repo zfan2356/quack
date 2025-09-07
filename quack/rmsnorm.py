@@ -1022,11 +1022,7 @@ class RMSNormFunction(torch.autograd.Function):
         x = x.reshape(-1, x.shape[-1])
         if residual is not None:
             residual = residual.reshape(-1, residual.shape[-1])
-        need_grad = (
-            x.requires_grad
-            or weight.requires_grad
-            or (residual is not None and residual.requires_grad)
-        )
+        need_grad = any(ctx.needs_input_grad[:3])
         out, residual_out, rstd = rmsnorm_fwd(
             x,
             weight,
