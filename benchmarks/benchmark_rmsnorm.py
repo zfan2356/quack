@@ -8,7 +8,7 @@ from triton.testing import do_bench
 import cutlass
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
-from quack.rmsnorm import _rmsnorm_fwd, rmsnorm_ref, rmsnorm, _rmsnorm_backward
+from quack.rmsnorm import rmsnorm_fwd, rmsnorm_ref, rmsnorm, _rmsnorm_backward
 import cutlass.cute as cute
 
 try:
@@ -43,11 +43,11 @@ def run_rmsnorm(
     eps = 1e-6
 
     print("Executing kernel...")
-    out, rstd = _rmsnorm_fwd(x, w, eps=eps, return_rstd=True)
+    out, _, rstd = rmsnorm_fwd(x, w, eps=eps, store_rstd=True)
 
     compiled_func_ref = torch.compile(rmsnorm_ref)
 
-    fn = lambda: _rmsnorm_fwd(x, w, eps=eps)
+    fn = lambda: rmsnorm_fwd(x, w, eps=eps)
     time.sleep(0.5)
     avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
     # mem_bw = (2 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9
