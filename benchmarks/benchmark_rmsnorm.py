@@ -1,6 +1,6 @@
 import argparse
 import time
-from typing import Type
+from typing import Type, Optional
 
 import torch
 from triton.testing import do_bench
@@ -8,7 +8,7 @@ from triton.testing import do_bench
 import cutlass
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
-from quack.rmsnorm import rmsnorm_fwd, rmsnorm_ref, rmsnorm, _rmsnorm_backward
+from quack.rmsnorm import rmsnorm_fwd, rmsnorm_ref, rmsnorm, rmsnorm_bwd
 import cutlass.cute as cute
 
 try:
@@ -20,9 +20,10 @@ except ImportError:
 def run_rmsnorm(
     M,
     N,
-    dtype: Type[cutlass.Numeric],
-    warmup_iterations=2,
-    iterations=200,
+    dtype: torch.dtype,
+    residual_dtype: Optional[torch.dtype] = None,
+    warmup_iterations=5,
+    iterations=100,
 ):
     if not torch.cuda.is_available():
         raise RuntimeError(f"Ampere GPU is required to run this example!")
@@ -30,10 +31,12 @@ def run_rmsnorm(
     print(f"Tensor dimensions: [{M}, {N}]")
     print(f"Input and Output Data type: {dtype}")
 
-    torch_dtype = cutlass_torch.dtype(dtype)
-
     device = "cuda"
-    x = torch.randn(M, N, device=device, dtype=torch_dtype)
+    x = torch.randn(M, N, device=device, dtype=dtype)
+    if residual_dtype is not None:
+        residual = torch.randn(M, N, device=device, dtype=residual_dtype)
+    else:
+        residual = None
     w = torch.randn(N, device=device, dtype=torch.float32)
 
     print(f"Input tensor shapes:")
@@ -43,35 +46,34 @@ def run_rmsnorm(
     eps = 1e-6
 
     print("Executing kernel...")
-    out, _, rstd = rmsnorm_fwd(x, w, eps=eps, store_rstd=True)
+    rmsnorm_fwd(x, w, residual=residual, eps=eps, store_rstd=True)
 
     compiled_func_ref = torch.compile(rmsnorm_ref)
 
-    fn = lambda: rmsnorm_fwd(x, w, eps=eps)
+    fn = lambda: rmsnorm_fwd(x, w, residual=residual, eps=eps)
     time.sleep(0.5)
     avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
-    # mem_bw = (2 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9
-    mem_bytes = (2 * x.numel() * dtype.width // 8 + w.numel() * 4)
+    mem_bytes = (2 * x.numel() * dtype.itemsize + w.numel() * 4)
+    if residual is not None:
+        mem_bytes += 2 * residual.numel() * residual.dtype.itemsize
     mem_bw = round(mem_bytes / (avg_time / 1000) / 1e9)
     print(f"Kernel execution time: {avg_time:.4f} ms")
     print(f"Mem throughput: {mem_bw:.2f} GB/s")
 
-    fn = lambda: compiled_func_ref(x, w, eps=eps)
+    fn = lambda: compiled_func_ref(x, w, residual=residual, eps=eps)
     for _ in range(5): fn()  # warm up
     time.sleep(0.5)
     avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
-    # mem_bw_ref = (2 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9
-    mem_bytes_ref = (2 * x.numel() * dtype.width // 8 + w.numel() * 4)
+    mem_bytes_ref = mem_bytes
     mem_bw_ref = round(mem_bytes_ref / (avg_time / 1000) / 1e9)
     print(f"Ref kernel execution time: {avg_time:.4f} ms")
     print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
 
     if cudnn is not None:
-        run_cudnn = rmsnorm_cudnn_setup(M, N, torch_dtype)
+        run_cudnn = rmsnorm_cudnn_setup(M, N, dtype)
         time.sleep(0.5)
         avg_time = do_bench(run_cudnn, warmup=warmup_iterations, rep=iterations)
-        # mem_bw_cudnn = (2 * x.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9
-        mem_bytes_cudnn = (2 * x.numel() * dtype.width // 8 + w.numel() * 4)
+        mem_bytes_cudnn = (2 * x.numel() * dtype.itemsize + w.numel() * 4)
         mem_bw_cudnn = round(mem_bytes_cudnn / (avg_time / 1000) / 1e9)
         print(f"Cudnn kernel execution time: {avg_time:.4f} ms")
         print(f"Cudnn mem throughput: {mem_bw_cudnn:.2f} GB/s")
@@ -126,7 +128,8 @@ def rmsnorm_cudnn_setup(M, N, dtype):
 def run_rmsnorm_bwd(
     M,
     N,
-    dtype: Type[cutlass.Numeric],
+    dtype: torch.dtype,
+    residual_dtype: Optional[torch.dtype] = None,
     warmup_iterations=5,
     iterations=100,
 ):
@@ -136,14 +139,18 @@ def run_rmsnorm_bwd(
     print(f"Tensor dimensions: [{M}, {N}]")
     print(f"Input and Output Data type: {dtype}")
 
-    torch_dtype = cutlass_torch.dtype(dtype)
     device = "cuda"
 
     # Set up forward pass inputs with gradients enabled
-    x = torch.randn(M, N, device=device, dtype=torch_dtype, requires_grad=True)
+    x = torch.randn(M, N, device=device, dtype=dtype, requires_grad=True)
     x_ref = x.detach().clone().requires_grad_()
     w = torch.randn(N, device=device, dtype=torch.float32, requires_grad=True)
     w_ref = w.detach().clone().requires_grad_()
+    if residual_dtype is not None:
+        residual = torch.randn(M, N, device=device, dtype=residual_dtype, requires_grad=True)
+        residual_ref = residual.detach().clone().requires_grad_()
+    else:
+        residual, residual_ref = None, None
 
     print(f"Input tensor shapes:")
     print(f"x: {x.shape}, dtype: {x.dtype}")
@@ -152,11 +159,19 @@ def run_rmsnorm_bwd(
     eps = 1e-6
 
     # Forward pass to get outputs and rstd
-    y = rmsnorm(x, w, eps=eps)
+    y = rmsnorm(x, w, residual=residual, eps=eps)
+    if residual is not None:
+        y, residual_out = y
+    else:
+        residual_out = None
 
     # Create upstream gradients
     dy = torch.randn_like(y)
     rstd = torch.randn(M, device=device, dtype=torch.float32)
+    dresidual_out = torch.randn_like(residual_out) if residual is not None else None
+
+    def mem_in_bytes(*args):
+        return sum(t.numel() * t.dtype.itemsize for t in args if t is not None)
 
     time.sleep(0.5)
     # Benchmark custom backward pass
@@ -164,16 +179,16 @@ def run_rmsnorm_bwd(
     def fn():
         # x.grad = None  # Reset gradients to avoid accumulation
         # y.backward(dy, retain_graph=True)
-        _rmsnorm_backward(x, w, dy, rstd)
+        rmsnorm_bwd(x if residual is None else residual_out, w, dy, rstd, dresidual_out=dresidual_out)
 
     avg_time = do_bench(fn, grad_to_none=(x,), warmup=warmup_iterations, rep=iterations)
     sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count * 2
-    mem_bytes = (3 * x.numel() * dtype.width // 8 + w.numel() * 8)
+    mem_bytes = mem_in_bytes(x if residual is None else residual_out, w, dy, dresidual_out, x, residual if residual is not None and residual.dtype != x.dtype else None)
     mem_bw = round(mem_bytes / (avg_time / 1000) / 1e9)
     print(f"Kernel execution time: {avg_time:.4f} ms")
     print(f"Mem throughput: {mem_bw:.2f} GB/s")
-    # from flash_attn.utils.benchmark import pytorch_profiler
-    # pytorch_profiler(fn)
+    from flash_attn.utils.benchmark import pytorch_profiler
+    pytorch_profiler(fn)
 
     # Reference implementation
     y_ref = torch.compile(rmsnorm_ref)(x_ref, w_ref, eps=eps)
@@ -187,11 +202,11 @@ def run_rmsnorm_bwd(
     for _ in range(5): compiled_func_ref()  # warm up
     time.sleep(0.5)
     avg_time_ref = do_bench(compiled_func_ref, warmup=warmup_iterations, rep=iterations)
-    mem_bytes_ref = (3 * x.numel() * dtype.width // 8 + w.numel() * 4 + x.shape[0] * 4 + sm_count * w.numel() * 4)
+    mem_bytes_ref = (3 * x.numel() * dtype.itemsize + w.numel() * 4 + x.shape[0] * 4 + sm_count * w.numel() * 4)
     mem_bw_ref = round(mem_bytes_ref / (avg_time_ref / 1000) / 1e9)
     print(f"Ref kernel execution time: {avg_time_ref:.4f} ms")
     print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
-    # pytorch_profiler(compiled_func_ref)
+    pytorch_profiler(compiled_func_ref)
 
     return mem_bw, mem_bw_ref
 
@@ -203,6 +218,7 @@ if __name__ == "__main__":
     parser.add_argument("--M", default=32768, type=int)
     parser.add_argument("--N", default=32768, type=int)
     parser.add_argument("--dtype", type=cutlass.dtype, choices=[cutlass.BFloat16, cutlass.Float16, cutlass.Float32], default=cutlass.BFloat16)
+    parser.add_argument("--residual_dtype", type=cutlass.dtype, choices=[None, cutlass.BFloat16, cutlass.Float16, cutlass.Float32], default=None)
     parser.add_argument("--warmup_iterations", default=10, type=int)
     parser.add_argument("--iterations", default=100, type=int)
     parser.add_argument("--backward", action="store_true", help="Benchmark backward pass instead of forward pass")
@@ -214,7 +230,8 @@ if __name__ == "__main__":
         run_rmsnorm_bwd(
             args.M,
             args.N,
-            dtype=args.dtype,
+            dtype=cutlass.torch.dtype(args.dtype),
+            residual_dtype=cutlass.torch.dtype(args.residual_dtype) if args.residual_dtype else None,
             warmup_iterations=args.warmup_iterations,
             iterations=args.iterations,
         )
@@ -223,7 +240,8 @@ if __name__ == "__main__":
         run_rmsnorm(
             args.M,
             args.N,
-            dtype=args.dtype,
+            dtype=cutlass.torch.dtype(args.dtype),
+            residual_dtype=cutlass.torch.dtype(args.residual_dtype) if args.residual_dtype else None,
             warmup_iterations=args.warmup_iterations,
             iterations=args.iterations,
         )
