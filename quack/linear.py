@@ -11,7 +11,14 @@ from torch.amp import custom_fwd, custom_bwd
 # from gemm_cublas import gemm as gemm_cb, gemm_add_ as gemm_add_cb_
 # from gemm_cublas.interface import gemm_tuned as gemm_cb, gemm_add_tuned_ as gemm_add_cb_
 
-from quack.gemm_interface import gemm, gemm_tuned, gemm_act, gemm_act_tuned
+from quack.gemm_interface import (
+    gemm,
+    gemm_tuned,
+    gemm_act,
+    gemm_act_tuned,
+    gemm_dact,
+    gemm_dact_tuned,
+)
 
 
 def linear_fwd_convert_type(*tensors):
@@ -123,6 +130,7 @@ class LinearActFunc(LinearFunc):
         x: (..., in_features)
         weight: (out_features, in_features)
         out: (..., out_features)
+        Return both out and post-activation, but only out is differentiable.
         """
         ctx.weight_dtype = weight.dtype
         ctx.fuse_grad_accum = fuse_grad_accum
@@ -137,6 +145,7 @@ class LinearActFunc(LinearFunc):
         if out is not None:
             out = out.reshape(*batch_shape, out.shape[-1])
         ctx.mark_non_differentiable(postact)
+        ctx.set_materialize_grads(False)  # We don't want to materialize grads for postact
         return out, postact.reshape(*batch_shape, postact.shape[-1])
 
 
@@ -152,6 +161,68 @@ def linear_act_func(x, weight, activation, store_preact=True, fuse_grad_accum=Fa
         return LinearActFunc.apply(x, weight, activation, store_preact, fuse_grad_accum)
     else:
         return LinearActUntunedFunc.apply(x, weight, activation, store_preact, fuse_grad_accum)
+
+
+class DActLinearFunc(LinearFunc):
+    matmul_bwd_dx = partial(gemm_dact, dynamic_scheduler=True)
+
+    # Use classmethod instead of staticmethod to allow inheritance
+    @classmethod
+    @custom_fwd(device_type="cuda")
+    def forward(cls, ctx, preact, weight, x, activation, fuse_grad_accum=False):
+        """
+        x: (..., in_features)
+        weight: (out_features, in_features)
+        out: (..., out_features)
+        Takes in an extra preact argument which is the pre-activation, to be used in the backward pass.
+        """
+        ctx.weight_dtype = weight.dtype
+        ctx.fuse_grad_accum = fuse_grad_accum
+        weight_og = weight
+        x, weight = linear_fwd_convert_type(x, weight)
+        batch_shape = x.shape[:-1]
+        x = x.reshape(-1, x.shape[-1])
+        out = cls.matmul_fwd_fn(x, weight.T)
+        # Store preact instead of x, we will recompute x in the backward pass
+        linear_fwd_postprocess(
+            ctx, preact, weight, weight_og, needs_x_w_grad=ctx.needs_input_grad[:2]
+        )
+        ctx.activation = activation
+        return out.reshape(*batch_shape, out.shape[-1])
+
+    @classmethod
+    @custom_bwd(device_type="cuda")
+    def backward(cls, ctx, dout):
+        """
+        dout: (..., out_features)
+        """
+        # weight_og is None if not ctx.fuse_grad_accum
+        preact, weight, weight_og = ctx.saved_tensors
+        batch_shape = dout.shape[:-1]
+        dout = dout.reshape(-1, dout.shape[-1])
+        preact = preact.reshape(-1, preact.shape[-1])
+        if ctx.needs_input_grad[0]:
+            assert weight is not None
+            dpreact, x = cls.matmul_bwd_dx(dout, weight, preact, activation=ctx.activation)
+        else:
+            dpreact, x = None, None
+        dpreact = dpreact.reshape(*batch_shape, dpreact.shape[-1]) if dpreact is not None else None
+        dweight = linear_bwd_compute_weight_grad(ctx, dout, x, weight_og, cls.matmul_bwd_dw)
+        return dpreact, dweight, *([None] * 3)
+
+
+class DActLinearUntunedFunc(DActLinearFunc):
+    # Passing in config=None to disable tuning at runtime
+    matmul_fwd_fn = partial(gemm_tuned.fn, config=None)
+    matmul_bwd_dx = partial(gemm_dact_tuned.fn, dynamic_scheduler=True, config=None)
+    matmul_bwd_dw = partial(gemm_tuned.fn, dynamic_scheduler=True, config=None)
+
+
+def act_linear_func(preact, weight, x, activation, fuse_grad_accum=False, tuned=True):
+    if tuned:
+        return DActLinearFunc.apply(preact, weight, x, activation, fuse_grad_accum)
+    else:
+        return DActLinearUntunedFunc.apply(preact, weight, x, activation, fuse_grad_accum)
 
 
 class Linear(nn.Linear):

@@ -87,7 +87,8 @@ def dgelu_tanh_approx(x: Float32, dout: Float32, *, loc=None, ip=None) -> Tuple[
     # Compute z = x * (c1 + c2 * x^2)
     x_sq = x * x
     tanh_z = tanh(x * (sqrt_2_over_pi + sqrt_2_over_pi_coeff * x_sq))
-    gelu_out = 0.5 * (x * (1 + tanh_z))
+    half_tanh_z_plus_one = 0.5 + 0.5 * tanh_z
+    gelu_out = x * half_tanh_z_plus_one
 
     # Compute gradient
     # sech^2(z) = 1 - tanh^2(z)
@@ -95,7 +96,7 @@ def dgelu_tanh_approx(x: Float32, dout: Float32, *, loc=None, ip=None) -> Tuple[
     # dz/dx = c1 + 3 * c2 * x^2
     dz_dx = sqrt_2_over_pi + sqrt_2_over_pi_coeff_3 * x_sq
     # d/dx[gelu(x)] = 0.5 * (1 + tanh(z)) + 0.5 * x * sech^2(z) * dz/dx
-    dgelu = (0.5 + 0.5 * tanh_z) + 0.5 * x * sech2_z * dz_dx
+    dgelu = half_tanh_z_plus_one + x * (0.5 * (sech2_z * dz_dx))
 
     dx = dout * dgelu
     return dx, gelu_out
