@@ -577,10 +577,10 @@ class GemmSm90:
         tensormaps: Optional[cute.Tensor],
         tiled_mma: cute.TiledMma,
         cluster_layout_mnk: cute.Layout,
-        a_smem_layout_staged: cute.ComposedLayout,
-        b_smem_layout_staged: cute.ComposedLayout,
-        epi_smem_layout_staged: cute.ComposedLayout,
-        epi_c_smem_layout_staged: cute.ComposedLayout,
+        a_smem_layout: cute.ComposedLayout,
+        b_smem_layout: cute.ComposedLayout,
+        epi_smem_layout: cute.ComposedLayout,
+        epi_c_smem_layout: cute.ComposedLayout,
         tile_sched_params: ParamsBase,
         TileSchedulerCls: cutlass.Constexpr[Callable],
     ):
@@ -603,12 +603,12 @@ class GemmSm90:
         :type tiled_mma: cute.TiledMma
         :param cluster_layout_mnk: CTA layout
         :type cluster_layout_mnk: cute.Layout
-        :param a_smem_layout_staged: Shared memory layout for A
-        :type a_smem_layout_staged: cute.ComposedLayout
-        :param b_smem_layout_staged: Shared memory layout for B
-        :type b_smem_layout_staged: cute.ComposedLayout
-        :param epi_smem_layout_staged: Shared memory layout for epilogue
-        :type epi_smem_layout_staged: cute.ComposedLayout
+        :param a_smem_layout: Shared memory layout for A
+        :type a_smem_layout: cute.ComposedLayout
+        :param b_smem_layout: Shared memory layout for B
+        :type b_smem_layout: cute.ComposedLayout
+        :param epi_smem_layout: Shared memory layout for epilogue
+        :type epi_smem_layout: cute.ComposedLayout
         """
 
         varlen = const_expr(cu_seqlens_m is not None)
@@ -621,19 +621,9 @@ class GemmSm90:
         #  Prefetch Tma desc
         # /////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.ab_load_warp_id:
-            if const_expr(tma_atom_a is not None):
-                cpasync.prefetch_descriptor(tma_atom_a)
-            cpasync.prefetch_descriptor(tma_atom_b)
-            if const_expr(tma_atom_d is not None):
-                cpasync.prefetch_descriptor(tma_atom_d)
-            if const_expr(tma_atom_c is not None):
-                cpasync.prefetch_descriptor(tma_atom_c)
-
-        a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
-        b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, 0))
-        tma_copy_bytes = cute.size_in_bytes(self.b_dtype, b_smem_layout)
-        if const_expr(not self.gather_A):
-            tma_copy_bytes += cute.size_in_bytes(self.a_dtype, a_smem_layout)
+            for tma_atom in (tma_atom_a, tma_atom_b, tma_atom_d, tma_atom_c):
+                if const_expr(tma_atom is not None):
+                    cpasync.prefetch_descriptor(tma_atom)
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Alloc and init AB full/empty + ACC full mbar (pipeline)
@@ -641,95 +631,44 @@ class GemmSm90:
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        # Threads/warps participating in this pipeline
-        producer_cnt = 1 if const_expr(not self.gather_A) else 1 + self.num_ab_load_threads
-        ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, producer_cnt)
-        # Each warp will contribute to the arrive count with the number of mcast size
-        mcast_size = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
-        consumer_arrive_cnt = mcast_size * (tiled_mma.size // cute.arch.WARP_SIZE)
-        ab_pipeline_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, consumer_arrive_cnt
+        ab_pipeline = self.make_ab_pipeline(
+            a_smem_layout=cute.slice_(a_smem_layout, (None, None, 0)),
+            b_smem_layout=cute.slice_(b_smem_layout, (None, None, 0)),
+            tiled_mma=tiled_mma,
+            cluster_layout_vmnk=cute.make_layout((1, *cluster_layout_mnk.shape)),
+            ab_pipeline_mbar_ptr=storage.ab_pipeline_array_ptr.data_ptr(),
         )
-
-        cta_layout_vmnk = cute.make_layout((1, *cluster_layout_mnk.shape))
-        pipeline_cls = pipeline.PipelineTmaAsync if not self.gather_A else PipelineTmaCpAsync
-        ab_pipeline = pipeline_cls.create(
-            barrier_storage=storage.ab_pipeline_array_ptr.data_ptr(),
-            num_stages=self.ab_stage,
-            producer_group=ab_pipeline_producer_group,
-            consumer_group=ab_pipeline_consumer_group,
-            tx_count=tma_copy_bytes,
-            cta_layout_vmnk=cta_layout_vmnk,
-        )
-
+        epi_pipeline = None
         if const_expr(has_C):
-            # Threads/warps participating in this pipeline
-            epi_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-            # Each warp will contribute 1 to the arrive count
-            consumer_arrive_cnt = self.num_epi_threads // cute.arch.WARP_SIZE
-            epi_pipeline_consumer_group = pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, consumer_arrive_cnt
+            epi_pipeline = self.make_epi_pipeline(
+                c_smem_layout=cute.slice_(epi_c_smem_layout, (None, None, 0)),
+                epi_pipeline_mbar_ptr=storage.epi_pipeline_array_ptr.data_ptr(),
             )
-            c_smem_layout = cute.slice_(epi_c_smem_layout_staged, (None, None, 0))
-            tma_copy_c_bytes = cute.size_in_bytes(self.c_dtype, c_smem_layout)
-            epi_pipeline = pipeline.PipelineTmaAsync.create(
-                barrier_storage=storage.epi_pipeline_array_ptr.data_ptr(),
-                num_stages=self.epi_c_stage,
-                producer_group=epi_pipeline_producer_group,
-                consumer_group=epi_pipeline_consumer_group,
-                tx_count=tma_copy_c_bytes,
-            )
-        else:
-            epi_pipeline = None
-
+        sched_pipeline = None
+        tile_count = None
         if const_expr(tile_sched_params.tile_count_semaphore is not None):
             # Dynamic persistent scheduler
-            # Threads/warps participating in this pipeline
-            sched_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-            cluster_size = cute.size(cluster_layout_mnk)
-            # Each warp that are not the scheduler warp will contribute 1 to the arrive count
-            consumer_arrive_cnt = (
-                (self.mma_warp_groups if not self.pingpong else 1) * 4 + self.num_ab_load_warps
-            ) * cluster_size - 1
-            sched_pipeline_consumer_group = pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, consumer_arrive_cnt
-            )
-            sched_pipeline = pipeline.PipelineAsync.create(
-                barrier_storage=storage.sched_pipeline_array_ptr.data_ptr(),
-                num_stages=self.sched_stage,
-                producer_group=sched_pipeline_producer_group,
-                consumer_group=sched_pipeline_consumer_group,
-                # If there's cluster, the consumers must arrive at the mbar of CTA 0 in the cluster.
-                consumer_mask=None if const_expr(cute.size(cluster_layout_mnk) == 1) else 0,
+            sched_pipeline = self.make_sched_pipeline(
+                cluster_layout_mnk,
+                sched_pipeline_mbar_ptr=storage.sched_pipeline_array_ptr.data_ptr(),
             )
             tile_count = storage.tile_count.get_tensor((self.sched_stage,))
-        else:
-            sched_pipeline = None
-            tile_count = None
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Generate smem tensor A/B
         # ///////////////////////////////////////////////////////////////////////////////
-        sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
-        sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
+        sA = storage.sA.get_tensor(a_smem_layout.outer, swizzle=a_smem_layout.inner)
+        sB = storage.sB.get_tensor(b_smem_layout.outer, swizzle=b_smem_layout.inner)
+        sD = None
         if const_expr(has_D):
             if const_expr(not self.is_persistent):
-                sD_ptr = cute.recast_ptr(
-                    sA.iterator, epi_smem_layout_staged.inner, dtype=self.d_dtype
-                )
-                sD = cute.make_tensor(sD_ptr, epi_smem_layout_staged.outer)
+                sD_ptr = cute.recast_ptr(sA.iterator, epi_smem_layout.inner, dtype=self.d_dtype)
+                sD = cute.make_tensor(sD_ptr, epi_smem_layout.outer)
             else:
-                sD = storage.sD.get_tensor(
-                    epi_smem_layout_staged.outer, swizzle=epi_smem_layout_staged.inner
-                )
-        else:
-            sD = None
+                sD = storage.sD.get_tensor(epi_smem_layout.outer, swizzle=epi_smem_layout.inner)
+        sC = None
         if const_expr(has_C):
-            sC = storage.sC.get_tensor(
-                epi_c_smem_layout_staged.outer, swizzle=epi_c_smem_layout_staged.inner
-            )
-        else:
-            sC = None
+            sC = storage.sC.get_tensor(epi_c_smem_layout.outer, swizzle=epi_c_smem_layout.inner)
         epi_smem_tensors = self.epi_get_smem_tensors(epilogue_params, storage)
 
         # Get tensormap buffer address
@@ -771,9 +710,6 @@ class GemmSm90:
         TileSchedulerCls = partial(
             TileSchedulerCls.create, tile_sched_params, tile_count, sched_pipeline
         )
-
-        k_tile_cnt = cute.ceil_div(cute.size(mA_mkl.shape[1]), self.tile_shape_mnk[2])
-        c_tile_cnt = cute.size(cute.ceil_div(self.tile_shape_mnk[:2], self.epi_tile))
 
         if warp_idx >= self.ab_load_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_load)
@@ -959,16 +895,18 @@ class GemmSm90:
 
             acc_shape = tiled_mma.partition_shape_C(cute.select(self.tile_shape_mnk, mode=[0, 1]))
             acc = cute.make_fragment(acc_shape, self.acc_dtype)
+            acc_slow = None
             if const_expr(self.fp8_slow_accum):
                 acc_slow = cute.make_fragment(acc_shape, self.acc_dtype)
-            else:
-                acc_slow = None
 
             if const_expr(self.pingpong):
                 if warp_group_idx == 0:
                     # WG0 needs a start signal at the very beginning
                     self.pingpong_barrier_arrive(warp_group_idx=0, stage="mma")
                     self.pingpong_barrier_arrive(warp_group_idx=0, stage="epi")
+
+            k_tile_cnt = cute.ceil_div(cute.size(mA_mkl.shape[1]), self.tile_shape_mnk[2])
+            c_tile_cnt = cute.size(cute.ceil_div(self.tile_shape_mnk[:2], self.epi_tile))
 
             ab_read_state = make_pipeline_state(pipeline.PipelineUserType.Consumer, self.ab_stage)
             epi_read_state = make_pipeline_state(
@@ -1039,8 +977,7 @@ class GemmSm90:
                         if is_tma_warp:
                             tensormap_manager.fence_tensormap_update(tensormap_d_ptr)
                     tma_desc_ptr = tensormap_manager.get_tensormap_ptr(
-                        tensormap_d_ptr,
-                        cute.AddressSpace.generic,
+                        tensormap_d_ptr, cute.AddressSpace.generic
                     )
                 else:
                     tma_desc_ptr = None
@@ -1164,16 +1101,8 @@ class GemmSm90:
             # Also sets the transaction barrier for the A/B buffers
             ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
             tma_bar_ptr = ab_pipeline.producer_get_barrier(ab_producer_state)
-            copy_A(
-                tAgA[None, k_tile],
-                tAsA[None, ab_producer_state.index],
-                tma_bar_ptr=tma_bar_ptr,
-            )
-            copy_B(
-                tBgB[None, k_tile],
-                tBsB[None, ab_producer_state.index],
-                tma_bar_ptr=tma_bar_ptr,
-            )
+            copy_A(tAgA[None, k_tile], tAsA[None, ab_producer_state.index], tma_bar_ptr=tma_bar_ptr)
+            copy_B(tBgB[None, k_tile], tBsB[None, ab_producer_state.index], tma_bar_ptr=tma_bar_ptr)
             # Mainloop pipeline's producer commit is a NOP
             ab_pipeline.producer_commit(ab_producer_state)
             ab_producer_state.advance()
@@ -1632,6 +1561,77 @@ class GemmSm90:
         )
         return bSG_sD, bSG_gD
 
+    def make_ab_pipeline(
+        self,
+        a_smem_layout: cute.Layout | cute.ComposedLayout,
+        b_smem_layout: cute.Layout | cute.ComposedLayout,
+        tiled_mma: cute.TiledMma,
+        cluster_layout_vmnk: cute.Layout,
+        ab_pipeline_mbar_ptr: cute.Pointer,
+    ):
+        # Threads/warps participating in this pipeline
+        producer_cnt = 1 if const_expr(not self.gather_A) else 1 + self.num_ab_load_threads
+        ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, producer_cnt)
+        # Each warp will contribute to the arrive count with the number of mcast size
+        mcast_size = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
+        consumer_arrive_cnt = mcast_size * (tiled_mma.size // cute.arch.WARP_SIZE)
+        ab_pipeline_consumer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, consumer_arrive_cnt
+        )
+        pipeline_cls = pipeline.PipelineTmaAsync if not self.gather_A else PipelineTmaCpAsync
+        tma_copy_bytes = cute.size_in_bytes(self.b_dtype, b_smem_layout)
+        if const_expr(not self.gather_A):
+            tma_copy_bytes += cute.size_in_bytes(self.a_dtype, a_smem_layout)
+        return pipeline_cls.create(
+            barrier_storage=ab_pipeline_mbar_ptr,
+            num_stages=self.ab_stage,
+            producer_group=ab_pipeline_producer_group,
+            consumer_group=ab_pipeline_consumer_group,
+            tx_count=tma_copy_bytes,
+            cta_layout_vmnk=cluster_layout_vmnk,
+        )
+
+    def make_epi_pipeline(
+        self, c_smem_layout: cute.Layout | cute.ComposedLayout, epi_pipeline_mbar_ptr: cute.Pointer
+    ):
+        # Threads/warps participating in this pipeline
+        epi_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        # Each warp will contribute 1 to the arrive count
+        consumer_arrive_cnt = self.num_epi_threads // cute.arch.WARP_SIZE
+        epi_pipeline_consumer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, consumer_arrive_cnt
+        )
+        tma_copy_c_bytes = cute.size_in_bytes(self.c_dtype, c_smem_layout)
+        return pipeline.PipelineTmaAsync.create(
+            barrier_storage=epi_pipeline_mbar_ptr,
+            num_stages=self.epi_c_stage,
+            producer_group=epi_pipeline_producer_group,
+            consumer_group=epi_pipeline_consumer_group,
+            tx_count=tma_copy_c_bytes,
+        )
+
+    def make_sched_pipeline(
+        self, cluster_layout_mnk: cute.Layout, sched_pipeline_mbar_ptr: cute.Pointer
+    ):
+        # Threads/warps participating in this pipeline
+        sched_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        cluster_size = cute.size(cluster_layout_mnk)
+        # Each warp that are not the scheduler warp will contribute 1 to the arrive count
+        consumer_arrive_cnt = (
+            (self.mma_warp_groups if not self.pingpong else 1) * 4 + self.num_ab_load_warps
+        ) * cluster_size - 1
+        sched_pipeline_consumer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, consumer_arrive_cnt
+        )
+        return pipeline.PipelineAsync.create(
+            barrier_storage=sched_pipeline_mbar_ptr,
+            num_stages=self.sched_stage,
+            producer_group=sched_pipeline_producer_group,
+            consumer_group=sched_pipeline_consumer_group,
+            # If there's cluster, the consumers must arrive at the mbar of CTA 0 in the cluster.
+            consumer_mask=None if const_expr(cluster_size == 1) else 0,
+        )
+
     @classmethod
     def _compute_stages(
         cls,
@@ -1789,11 +1789,7 @@ class GemmSm90:
         b_is_k_major = b_layout.sm90_mma_major_mode() == warpgroup.OperandMajorMode.K
         a_major_mode_size = tile_shape_mnk[2 if a_is_k_major else 0]
         a_smem_layout_atom = warpgroup.make_smem_layout_atom(
-            sm90_utils.get_smem_layout_atom(
-                a_layout,
-                a_dtype,
-                a_major_mode_size,
-            ),
+            sm90_utils.get_smem_layout_atom(a_layout, a_dtype, a_major_mode_size),
             a_dtype,
         )
         a_smem_layout_staged = cute.tile_to_shape(
@@ -1806,11 +1802,7 @@ class GemmSm90:
 
         b_major_mode_size = tile_shape_mnk[2 if b_is_k_major else 1]
         b_smem_layout_atom = warpgroup.make_smem_layout_atom(
-            sm90_utils.get_smem_layout_atom(
-                b_layout,
-                b_dtype,
-                b_major_mode_size,
-            ),
+            sm90_utils.get_smem_layout_atom(b_layout, b_dtype, b_major_mode_size),
             b_dtype,
         )
         b_smem_layout_staged = cute.tile_to_shape(
