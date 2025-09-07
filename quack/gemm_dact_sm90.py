@@ -31,7 +31,6 @@ class GemmDActSm90(GemmActSm90):
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
         assert tRS_rC is not None
-        tRS_rD.store(tRS_rD.load() + tRS_rC.load().to(tRS_rD.element_type))
         tRS_rC_acc = cute.make_fragment_like(tRS_rC, self.acc_dtype)
         tRS_rC_acc.store(tRS_rC.load().to(self.acc_dtype))
         # If we don't have .shape here, the compiler generates local stores and loads
