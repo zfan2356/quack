@@ -27,10 +27,6 @@ def gemm_swiglu_out_ref(
     return out, preact
 
 
-@autotune(
-    configs=[AutotuneConfig(config=c) for c in get_all_configs()],
-    key=["out_dtype", "dynamic_scheduler"],
-)
 def gemm_tuned(
     A: Tensor,  # (M, K)
     B: Tensor,  # (K, N)
@@ -61,7 +57,7 @@ def gemm_tuned(
         config.cluster_n,
         config.pingpong,
     )
-    return D
+    return D.squeeze(0)
 
 
 @autotune(
@@ -103,7 +99,7 @@ def gemm_act_tuned(
         config.cluster_n,
         config.pingpong,
     )
-    return D, PostAct
+    return D.squeeze(0), PostAct.squeeze(0)
 
 
 @autotune(
@@ -145,7 +141,7 @@ def gemm_dact_tuned(
         config.cluster_n,
         config.pingpong,
     )
-    return D, PostAct
+    return D.squeeze(0), PostAct.squeeze(0)
 
 
 @torch.library.custom_op("quack::gemm", mutates_args=(), device_types="cuda")
@@ -235,6 +231,13 @@ def gemm_act_ref(
     return out, postact
 
 
+def gemm_relu_ref(A: Tensor, B: Tensor) -> Tensor:
+    # A: (M, K), B: (K, N)
+    out = torch.mm(A, B)
+    postact = torch.clamp(out, min=0.0)
+    return out, postact
+
+
 # Specifying the schema manually here since torch.library._infer_schema doesn't work when return
 # type is a tuple of Tensor
 @torch.library.custom_op(
@@ -255,6 +258,14 @@ def gemm_dact(
     return gemm_dact_tuned(A, B, PreAct, activation, out_dtype, postact_dtype, dynamic_scheduler)
 
 
+def gemm_drelu_ref(A: Tensor, B: Tensor, preact: Tensor) -> (Tensor, Tensor):
+    # A: (M, K), B: (K, N), preact: (M, N)
+    dout = torch.mm(A, B)
+    dx = torch.where(preact > 0, dout, torch.zeros_like(dout))
+    postact = torch.clamp(preact, min=0.0)
+    return dx, postact
+
+
 def gemm_dswiglu_ref(A: Tensor, B: Tensor, preact: Tensor) -> (Tensor, Tensor):
     # A: (M, K), B: (K, N), preact: (M, 2 * N)
     dout = torch.mm(A, B)
@@ -266,3 +277,37 @@ def gemm_dswiglu_ref(A: Tensor, B: Tensor, preact: Tensor) -> (Tensor, Tensor):
     d1 = F.silu(p0) * dout
     out = torch.stack([d0, d1], dim=-1).reshape(d0.shape[:-1] + (2 * d0.shape[-1],))
     return out, postact
+
+
+def grouped_gemm(
+    A: Tensor,  # (M, K), M is sum(cu_seqlens_m)
+    B: Tensor,  # (L, K, N), L is len(cu_seqlens_m)
+    C: Optional[Tensor] = None,  # (L, M, N)
+    out_dtype: Optional[torch.dtype] = None,
+    cu_seqlens_m: Optional[Tensor] = None,
+    dynamic_scheduler: bool = False,
+    config: Optional[GemmConfig] = None,
+) -> (Tensor, Optional[Tensor]):
+    if config is None:
+        config = GemmConfig(tile_m=128, tile_n=192, cluster_m=2, cluster_n=1, pingpong=True)
+    A, B = A.unsqueeze(0), B.mT.unsqueeze(0)  # (1, M, K), (1, N, K)
+    if C is not None:
+        C = C.unsqueeze(0)  # (1, M, N)
+    out_dtype = A.dtype if out_dtype is None else out_dtype
+    D = torch.empty((1, A.shape[1], B.shape[1]), dtype=out_dtype, device=A.device)
+    tile_count_semaphore = (
+        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
+    )
+    gemm_sm90(
+        A if not config.swap_ab else B,
+        B if not config.swap_ab else A,
+        D if not config.swap_ab else D.mT,
+        (C if not config.swap_ab else C.mT) if C is not None else None,
+        tile_count_semaphore,
+        config.tile_m,
+        config.tile_n,
+        config.cluster_m,
+        config.cluster_n,
+        config.pingpong,
+    )
+    return D.squeeze(0)

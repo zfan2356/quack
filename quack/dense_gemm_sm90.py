@@ -382,6 +382,10 @@ class GemmSm90:
 
         self._setup_attributes(epilogue_args)
 
+        cute.printf("a smem layout: {}", self.a_smem_layout_staged)
+        cute.printf("b smem layout: {}", self.b_smem_layout_staged)
+        cute.printf("epi smem layout: {}", self.epi_smem_layout_staged)
+
         tiled_mma = sm90_utils.make_trivial_tiled_mma(
             self.a_dtype,
             self.b_dtype,
@@ -743,6 +747,12 @@ class GemmSm90:
                 while work_tile.is_valid_tile:
                     tile_coord_mnkl = work_tile.tile_idx
                     batch_idx = tile_coord_mnkl[3]
+
+                    if is_scheduler_warp:
+                        lane_id = cute.arch.lane_idx()
+                        if lane_id == 0:
+                            cute.printf("tile_coord_mnkl: {}", tile_coord_mnkl)
+
                     # ///////////////////////////////////////////////////////////////////////////
                     #  Local_tile partition global tensors
                     # ///////////////////////////////////////////////////////////////////////////

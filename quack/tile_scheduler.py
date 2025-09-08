@@ -168,6 +168,23 @@ class TileScheduler:
                 assert tile_count is not None
                 assert scheduler_pipeline is not None
                 stages = const_expr(cute.size(tile_count))
+
+        # if (
+        #     cute.arch.lane_idx() == 0
+        #     and cute.arch.thread_idx()[0] == 0
+        #     and cute.arch.block_idx()[0] == 0
+        # ):
+        #     cute.printf(
+        #         "params: problem_shape_ncluster_mnl={}, raster_order={}, num_clusters_per_problem_divmod.divisor={}, num_groups_regular={}, group_size_divmod.divisor={}, group_size_tail_divmod.divisor={}, num_clusters_in_group_divmod.divisor={}, cluster_shape_mn={}",
+        #         params.problem_shape_ncluster_mnl,
+        #         params.raster_order,
+        #         params.num_clusters_per_problem_divmod.divisor,
+        #         params.num_groups_regular,
+        #         params.group_size_divmod.divisor,
+        #         params.group_size_tail_divmod.divisor,
+        #         params.num_clusters_in_group_divmod.divisor,
+        #         params.cluster_shape_mn,
+        #     )
         return TileScheduler(
             current_work_linear_idx,
             Int32(0),  # num_tiles_executed
