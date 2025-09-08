@@ -30,6 +30,7 @@ def relu(x: Float32, *, loc=None, ip=None) -> Float32:
     return cute.arch.fmax(x, Float32(0.0))
 
 
+@cute.jit
 @dsl_user_op
 def drelu(x: Float32, dout: Float32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
     x_pos = cutlass.Boolean(x > 0)
@@ -41,6 +42,7 @@ def relu_sq(x: Float32, *, loc=None, ip=None) -> Float32:
     return cute.arch.fmax(x, Float32(0.0)) * x
 
 
+@cute.jit
 @dsl_user_op
 def drelu_sq(x: Float32, dout: Float32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
     """
@@ -194,6 +196,7 @@ def reglu(x: Float32, y: Float32, *, loc=None, ip=None) -> Float32:
     return cute.arch.fmax(x, Float32(0.0)) * y
 
 
+@cute.jit
 @dsl_user_op
 def dreglu(
     x: Float32, y: Float32, dout: Float32, *, loc=None, ip=None

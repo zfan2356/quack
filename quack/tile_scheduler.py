@@ -43,7 +43,7 @@ def get_raster_order_from_option(
     return raster_order
 
 
-# Grouping arguments together that's should be passed to __call__
+# Grouping arguments together that should be passed to __call__
 @dataclass
 class TileSchedulerOptions(ArgumentsBase):
     max_active_clusters: Int32

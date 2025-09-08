@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from quack.linear import linear_func, linear_act_func
-from quack.gemm_interface import gemm_act_ref
+from quack.gemm_interface import gemm_dact, gemm_dact_tuned, gemm_act_ref, gemm_dact_ref
 
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
@@ -56,3 +56,27 @@ def test_linear_act(in_features, out_features, input_dtype, activation):
     _, out_ref = gemm_act_ref(x.float(), w.float().T, activation=activation)
     _, out_pt = gemm_act_ref(x, w.T, activation=activation)
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-6
+
+
+@pytest.mark.parametrize("activation", ["relu", "relu_sq", "gelu_tanh_approx"])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("k", [736, 1024])
+@pytest.mark.parametrize("n", [1504, 2048])
+def test_gemm_dact(n, k, input_dtype, activation):
+    """Test GEMM with activation gradient computation."""
+    device = "cuda"
+    torch.random.manual_seed(0)
+    m = 960
+    dout_input = torch.randn((m, k), device=device, dtype=input_dtype)
+    weight = torch.randn((n, k), device=device, dtype=input_dtype) / math.sqrt(k)
+    preact = torch.randn((m, n), device=device, dtype=input_dtype, requires_grad=True)
+    # Disable tuning for faster test
+    dx, postact = gemm_dact_tuned.fn(
+        dout_input, weight.T, preact, activation=activation, config=None
+    )
+    dx_ref, postact_ref = gemm_dact_ref(
+        dout_input.float(), weight.float().T, preact.float(), activation=activation
+    )
+    dx_pt, postact_pt = gemm_dact_ref(dout_input, weight.T, preact, activation=activation)
+    assert (dx - dx_ref).abs().max() < 2 * (dx_pt - dx_ref).abs().max() + 1e-5
+    assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-5
