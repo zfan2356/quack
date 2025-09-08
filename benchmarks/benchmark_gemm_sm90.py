@@ -14,7 +14,8 @@ import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass import Int32, Boolean
 
-from quack.dense_gemm_sm90 import GemmSm90, TileSchedulerOptions, VarlenArguments
+from quack.dense_gemm_sm90 import GemmSm90, TileSchedulerOptions
+from quack.varlen_utils import VarlenArguments
 
 """
 To run this example:
@@ -352,8 +353,6 @@ def run(
         ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
     else:
         tensormaps_tensor = None
-
-    epilogue_args = None
 
     gemm = GemmSm90(
         acc_dtype,
