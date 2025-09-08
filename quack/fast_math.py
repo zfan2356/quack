@@ -1,12 +1,15 @@
 # Copyright (c) 2025, Tri Dao.
 
 from typing import Tuple
+from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Uint32
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
+
+from quack.cute_dsl_utils import ParamsBase
 
 
 @cute.jit
@@ -45,18 +48,15 @@ def umulhi(a: Int32, b: Int32, *, loc=None, ip=None) -> Uint32:
     )
 
 
-class FastDivmod:
-    def __init__(
-        self, divisor: Int32, multipler: Uint32, shift_right: Uint32, *, loc=None, ip=None
-    ):
-        self.divisor = divisor
-        self.multiplier = multipler
-        self.shift_right = shift_right
-        self._loc = loc
+@dataclass
+class FastDivmod(ParamsBase):
+    divisor: Int32
+    multiplier: Uint32
+    shift_right: Uint32
 
     # called by host
     @staticmethod
-    def create(divisor: Int32, *, loc=None, ip=None) -> "FastDivmod":
+    def create(divisor: Int32) -> "FastDivmod":
         """Construct the FastDivmod object, in host code.
         This precomputes some values based on the divisor and is computationally expensive.
         """
@@ -64,7 +64,7 @@ class FastDivmod:
         divisor_u32 = Uint32(divisor)
         multiplier = Uint32(((cutlass.Uint64(1) << p) + divisor_u32 - 1) // divisor_u32)
         shift_right = Uint32(p - 32)
-        return FastDivmod(divisor, multiplier, shift_right, loc=loc, ip=ip)
+        return FastDivmod(divisor, multiplier, shift_right)
 
     @cute.jit
     def div(self, dividend: Int32) -> Int32:
@@ -78,20 +78,3 @@ class FastDivmod:
         quotient = self.div(dividend)
         remainder = dividend - quotient * self.divisor
         return quotient, remainder
-
-    def __extract_mlir_values__(self):
-        values, self._values_pos = [], []
-        for obj in [self.divisor, self.multiplier, self.shift_right]:
-            obj_values = cutlass.extract_mlir_values(obj)
-            values += obj_values
-            self._values_pos.append(len(obj_values))
-        return values
-
-    def __new_from_mlir_values__(self, values):
-        obj_list = []
-        for obj, n_items in zip(
-            [self.divisor, self.multiplier, self.shift_right], self._values_pos
-        ):
-            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
-            values = values[n_items:]
-        return FastDivmod(*(tuple(obj_list)), loc=self._loc)

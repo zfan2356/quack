@@ -43,20 +43,6 @@ dact_to_pytorch_fn_map = {
 }
 
 
-def gemm_swiglu_out_ref(
-    A: Tensor, B: Tensor, out: Optional[Tensor], store_preact: bool
-) -> (Tensor, Tensor):
-    preact = torch.mm(A, B)
-    out_ = F.silu(preact[..., ::2]) * preact[..., 1::2]
-    if out is not None:
-        out.copy_(out_)
-    else:
-        out = out_
-    if not store_preact:
-        preact = None
-    return out, preact
-
-
 @autotune(
     configs=[AutotuneConfig(config=c) for c in get_all_configs()],
     key=["out_dtype", "dynamic_scheduler"],
@@ -266,13 +252,6 @@ def gemm_act_ref(
     return out.to(out_dtype) if store_preact else None, postact
 
 
-def gemm_relu_ref(A: Tensor, B: Tensor) -> Tensor:
-    # A: (M, K), B: (K, N)
-    out = torch.mm(A, B)
-    postact = torch.clamp(out, min=0.0)
-    return out, postact
-
-
 # Specifying the schema manually here since torch.library._infer_schema doesn't work when return
 # type is a tuple of Tensor
 @torch.library.custom_op(
@@ -309,14 +288,6 @@ def gemm_dact_ref(
     dout = torch.mm(A, B).to(out_dtype)
     dx, postact = dact_to_pytorch_fn_map[activation](PreAct, dout)
     return dx.to(out_dtype), postact.to(postact_dtype)
-
-
-def gemm_drelu_ref(A: Tensor, B: Tensor, preact: Tensor) -> (Tensor, Tensor):
-    # A: (M, K), B: (K, N), preact: (M, N)
-    dout = torch.mm(A, B)
-    dx = torch.where(preact > 0, dout, torch.zeros_like(dout))
-    postact = torch.clamp(preact, min=0.0)
-    return dx, postact
 
 
 def gemm_dswiglu_ref(A: Tensor, B: Tensor, preact: Tensor) -> (Tensor, Tensor):
