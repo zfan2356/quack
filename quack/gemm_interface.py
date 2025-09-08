@@ -128,7 +128,7 @@ def gemm_act_tuned(
         config.cluster_n,
         config.pingpong,
     )
-    return D.squeeze(0), PostAct.squeeze(0)
+    return D.squeeze(0) if D is not None else None, PostAct.squeeze(0)
 
 
 @autotune(
@@ -144,7 +144,7 @@ def gemm_dact_tuned(
     postact_dtype: Optional[torch.dtype] = None,
     dynamic_scheduler: bool = True,
     config: Optional[GemmConfig] = None,
-) -> (Tensor, Optional[Tensor]):
+) -> (Tensor, Tensor):
     if config is None:
         config = GemmConfig(tile_m=128, tile_n=192, cluster_m=2, cluster_n=1, pingpong=True)
     A, B = A.unsqueeze(0), B.mT.unsqueeze(0)  # (1, M, K), (1, N, K)

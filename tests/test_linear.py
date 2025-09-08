@@ -35,13 +35,14 @@ def test_linear(in_features, out_features, input_dtype):
     assert (dw - dw_ref).abs().max() < 2 * (dw_pt - dw_ref).abs().max() + 1e-6
 
 
+@pytest.mark.parametrize("store_preact", [False, True])
 @pytest.mark.parametrize("activation", ["relu", "relu_sq", "gelu_tanh_approx"])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("out_features", [1504, 2048])
 @pytest.mark.parametrize("in_features", [736, 4096])
 # @pytest.mark.parametrize("out_features", [2048])
 # @pytest.mark.parametrize("in_features", [4096])
-def test_linear_act(in_features, out_features, input_dtype, activation):
+def test_linear_act(in_features, out_features, input_dtype, activation, store_preact):
     device = "cuda"
     torch.random.manual_seed(0)
     m = 1920
@@ -51,11 +52,17 @@ def test_linear_act(in_features, out_features, input_dtype, activation):
         torch.randn((out_features, in_features), device=device, dtype=input_dtype)
         / math.sqrt(in_features)
     ).requires_grad_()
-    _, out = linear_act_func(x, w, activation, tuned=False)  # Disable tuning for faster test
-    # Use gemm_act_ref to compute reference output
-    _, out_ref = gemm_act_ref(x.float(), w.float().T, activation=activation)
-    _, out_pt = gemm_act_ref(x, w.T, activation=activation)
-    assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-6
+    preact, postact = linear_act_func(
+        x, w, activation, store_preact=store_preact, tuned=False
+    )  # Disable tuning for faster test
+    preact_ref, postact_ref = gemm_act_ref(
+        x.float(), w.float().T, activation=activation, store_preact=store_preact
+    )
+    preact_pt, postact_pt = gemm_act_ref(x, w.T, activation=activation, store_preact=store_preact)
+    assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-6
+    if store_preact:
+        assert preact is not None and preact_ref is not None
+        assert (preact - preact_ref).abs().max() < 2 * (preact_pt - preact_ref).abs().max() + 1e-6
 
 
 @pytest.mark.parametrize("activation", ["relu", "relu_sq", "gelu_tanh_approx"])
