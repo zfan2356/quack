@@ -184,3 +184,61 @@ def dswiglu_oai(
     swiglu_out = silu_x * y + silu_x  # FFMA, instead of multiply by y + 1
     # Overall it's 1 MUFU.TANH, 3 FMUL, 5 FFMA
     return dx, dy, swiglu_out
+
+
+@dsl_user_op
+def reglu(x: Float32, y: Float32, *, loc=None, ip=None) -> Float32:
+    """ReGLU: ReLU Gated Linear Unit
+    reglu(x, y) = relu(x) * y = max(x, 0) * y
+    """
+    return cute.arch.fmax(x, Float32(0.0)) * y
+
+
+@dsl_user_op
+def dreglu(
+    x: Float32, y: Float32, dout: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32, Float32]:
+    """
+    ReGLU backward pass: computes gradients w.r.t. x (gate) and y (up projection)
+    Given: reglu_out = relu(x) * y, and dout = grad w.r.t. reglu_out
+    Returns: (dx, dy, reglu_out) where:
+    - dx = dout * y if x > 0, else 0
+    - dy = dout * relu(x)
+    - reglu_out = relu(x) * y
+    """
+    x_pos = cutlass.Boolean(x > 0)
+    relu_x = cute.arch.fmax(x, Float32(0.0))
+    dx = (dout * y) if x_pos else Float32(0.0)
+    dy = dout * relu_x
+    reglu_out = relu_x * y
+    return dx, dy, reglu_out
+
+
+@dsl_user_op
+def geglu(x: Float32, y: Float32, *, loc=None, ip=None) -> Float32:
+    """GeGLU: GELU Gated Linear Unit
+    geglu(x, y) = gelu(x) * y
+    Uses the tanh approximation of GELU
+    """
+    return gelu_tanh_approx(x) * y
+
+
+@dsl_user_op
+def dgeglu(
+    x: Float32, y: Float32, dout: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32, Float32]:
+    """
+    GeGLU backward pass: computes gradients w.r.t. x (gate) and y (up projection)
+    Given: geglu_out = gelu(x) * y, and dout = grad w.r.t. geglu_out
+    Returns: (dx, dy, geglu_out) where:
+    - dx = dout * y * d_gelu(x)
+    - dy = dout * gelu(x)
+    - geglu_out = gelu(x) * y
+    """
+    # Reuse dgelu_tanh_approx to compute d_gelu(x) * dout and gelu(x)
+    dgelu_x_dout, gelu_x = dgelu_tanh_approx(x, dout)
+    # Compute gradients for geglu
+    dx = dgelu_x_dout * y
+    dy = gelu_x * dout
+    geglu_out = gelu_x * y
+    return dx, dy, geglu_out
