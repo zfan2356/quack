@@ -71,7 +71,7 @@ def gemm_tuned(
         config.cluster_n,
         config.pingpong,
     )
-    return D
+    return D.squeeze(0)
 
 
 @autotune(
@@ -113,7 +113,7 @@ def gemm_act_tuned(
         config.cluster_n,
         config.pingpong,
     )
-    return D, PostAct
+    return D.squeeze(0), PostAct.squeeze(0)
 
 
 @autotune(
@@ -155,7 +155,7 @@ def gemm_dact_tuned(
         config.cluster_n,
         config.pingpong,
     )
-    return D, PostAct
+    return D.squeeze(0), PostAct.squeeze(0)
 
 
 @torch.library.custom_op("quack::gemm", mutates_args=(), device_types="cuda")
@@ -246,6 +246,13 @@ def gemm_act_ref(
     return out.to(out_dtype) if store_preact else None, postact
 
 
+def gemm_relu_ref(A: Tensor, B: Tensor) -> Tensor:
+    # A: (M, K), B: (K, N)
+    out = torch.mm(A, B)
+    postact = torch.clamp(out, min=0.0)
+    return out, postact
+
+
 # Specifying the schema manually here since torch.library._infer_schema doesn't work when return
 # type is a tuple of Tensor
 @torch.library.custom_op(
@@ -264,6 +271,14 @@ def gemm_dact(
     dynamic_scheduler: bool = True,
 ) -> Tuple[Tensor, Tensor]:
     return gemm_dact_tuned(A, B, PreAct, activation, out_dtype, postact_dtype, dynamic_scheduler)
+
+
+def gemm_drelu_ref(A: Tensor, B: Tensor, preact: Tensor) -> (Tensor, Tensor):
+    # A: (M, K), B: (K, N), preact: (M, N)
+    dout = torch.mm(A, B)
+    dx = torch.where(preact > 0, dout, torch.zeros_like(dout))
+    postact = torch.clamp(preact, min=0.0)
+    return dx, postact
 
 
 def gemm_dswiglu_ref(A: Tensor, B: Tensor, preact: Tensor) -> (Tensor, Tensor):
