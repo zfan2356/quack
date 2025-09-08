@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Tri Dao
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Literal
+from functools import partial
 
 import torch
 import torch.nn.functional as F
@@ -11,6 +12,15 @@ from quack.autotuner import autotune, AutotuneConfig
 from quack.dense_gemm_sm90 import gemm_sm90
 from quack.gemm_act_sm90 import gemm_act_sm90
 from quack.gemm_dact_sm90 import gemm_dact_sm90
+
+
+# Dictionary mapping activation names to PyTorch functions
+act_to_pytorch_fn_map = {
+    None: lambda x: x,
+    "relu": F.relu,
+    "relu_sq": lambda x: F.relu(x).square(),
+    "gelu_tanh_approx": partial(F.gelu, approximate="tanh"),
+}
 
 
 def gemm_swiglu_out_ref(
@@ -72,7 +82,7 @@ def gemm_act_tuned(
     A: Tensor,  # (M, K)
     B: Tensor,  # (K, N)
     C: Optional[Tensor] = None,  # (M, N)
-    activation: Optional[str] = None,  # None, "relu", "relu_sq", "gelu_tanh_approx"
+    activation: Literal[None, "relu", "relu_sq", "gelu_tanh_approx"] = None,
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
     store_preact: bool = True,
@@ -114,7 +124,7 @@ def gemm_dact_tuned(
     A: Tensor,  # (M, K)
     B: Tensor,  # (K, N)
     PreAct: Tensor,  # (M, N)
-    activation: Optional[str] = None,  # None, "relu", "relu_sq", "gelu_tanh_approx"
+    activation: Literal[None, "relu", "relu_sq", "gelu_tanh_approx"] = None,
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
     dynamic_scheduler: bool = True,
@@ -208,7 +218,7 @@ def gemm_act(
     A: Tensor,
     B: Tensor,
     C: Optional[Tensor] = None,
-    activation: Optional[str] = None,
+    activation: Literal[None, "relu", "relu_sq", "gelu_tanh_approx"] = None,
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
     store_preact: bool = True,
@@ -221,18 +231,19 @@ def gemm_act_ref(
     A: Tensor,
     B: Tensor,
     C: Optional[Tensor] = None,
-    activation: Optional[str] = None,
+    activation: Literal[None, "relu", "relu_sq", "gelu_tanh_approx"] = None,
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
+    store_preact: bool = True,
 ) -> Tuple[Tensor, Tensor]:
     out_dtype = A.dtype if out_dtype is None else out_dtype
     postact_dtype = A.dtype if postact_dtype is None else postact_dtype
     if C is None:
-        out = torch.mm(A, B).to(out_dtype)
+        out = torch.mm(A, B)
     else:
-        out = (C + torch.mm(A, B)).to(out_dtype)
-    postact = out.to(postact_dtype)
-    return out, postact
+        out = C + torch.mm(A, B)
+    postact = act_to_pytorch_fn_map[activation](out).to(postact_dtype)
+    return out.to(out_dtype) if store_preact else None, postact
 
 
 # Specifying the schema manually here since torch.library._infer_schema doesn't work when return
@@ -247,7 +258,7 @@ def gemm_dact(
     A: Tensor,
     B: Tensor,
     PreAct: Tensor,
-    activation: Optional[str] = None,
+    activation: Literal[None, "relu", "relu_sq", "gelu_tanh_approx"] = None,
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
     dynamic_scheduler: bool = True,

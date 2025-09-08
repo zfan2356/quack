@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from quack.linear import linear_func, linear_act_func
+from quack.gemm_interface import gemm_act_ref
 
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
@@ -34,12 +35,13 @@ def test_linear(in_features, out_features, input_dtype):
     assert (dw - dw_ref).abs().max() < 2 * (dw_pt - dw_ref).abs().max() + 1e-6
 
 
+@pytest.mark.parametrize("activation", ["relu", "relu_sq", "gelu_tanh_approx"])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("out_features", [1504, 2048])
 @pytest.mark.parametrize("in_features", [736, 4096])
 # @pytest.mark.parametrize("out_features", [2048])
 # @pytest.mark.parametrize("in_features", [4096])
-def test_linear_act(in_features, out_features, input_dtype):
+def test_linear_act(in_features, out_features, input_dtype, activation):
     device = "cuda"
     torch.random.manual_seed(0)
     m = 1920
@@ -49,9 +51,8 @@ def test_linear_act(in_features, out_features, input_dtype):
         torch.randn((out_features, in_features), device=device, dtype=input_dtype)
         / math.sqrt(in_features)
     ).requires_grad_()
-    _, out = linear_act_func(
-        x, w, "gelu_tanh_approx", tuned=False
-    )  # Disable tuning for faster test
-    out_ref = F.gelu(F.linear(x.float(), w.float()), approximate="tanh")
-    out_pt = F.gelu(F.linear(x, w), approximate="tanh")
+    _, out = linear_act_func(x, w, activation, tuned=False)  # Disable tuning for faster test
+    # Use gemm_act_ref to compute reference output
+    _, out_ref = gemm_act_ref(x.float(), w.float().T, activation=activation)
+    _, out_pt = gemm_act_ref(x, w.T, activation=activation)
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-6
