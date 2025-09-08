@@ -46,7 +46,7 @@ dact_to_pytorch_fn_map = {
 # Each function takes (gate, up) and returns postact
 gated_to_pytorch_fn_map = {
     "swiglu": lambda gate, up: F.silu(gate) * up,
-    "swiglu_oai": lambda gate, up: gate * torch.sigmoid(1.072 * gate) * (up + 1),
+    "swiglu_oai": lambda gate, up: gate * torch.sigmoid(1.702 * gate) * (up + 1),
     "reglu": lambda gate, up: F.relu(gate) * up,
     "geglu": lambda gate, up: F.gelu(gate, approximate="tanh") * up,
 }

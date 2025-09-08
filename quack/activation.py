@@ -153,7 +153,7 @@ def dswiglu(
 
 
 @dsl_user_op
-def swiglu_oai(x: Float32, y: Float32, alpha: float = 1.072, *, loc=None, ip=None) -> Float32:
+def swiglu_oai(x: Float32, y: Float32, alpha: float = 1.702, *, loc=None, ip=None) -> Float32:
     """The swiglu variant used in gpt-oss, which has a scaling factor on x and bias of 1 to y.
     https://github.com/openai/gpt-oss/blob/7be9334950053a888e24887a57dac797a17d6e00/gpt_oss/torch/model.py#L249
     x * sigmoid(alpha * x) * (y + 1)
@@ -167,7 +167,7 @@ def swiglu_oai(x: Float32, y: Float32, alpha: float = 1.072, *, loc=None, ip=Non
 
 @dsl_user_op
 def dswiglu_oai(
-    x: Float32, y: Float32, dout: Float32, alpha: float = 1.072, *, loc=None, ip=None
+    x: Float32, y: Float32, dout: Float32, alpha: float = 1.702, *, loc=None, ip=None
 ) -> Tuple[Float32, Float32, Float32]:
     """
     Swiglu OAI backward pass: computes gradients w.r.t. x and y
