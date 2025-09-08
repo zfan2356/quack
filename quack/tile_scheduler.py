@@ -808,6 +808,12 @@ class VarlenMTileScheduler(TileScheduler):
         return cid_m, cid_n
 
     @cute.jit
+    def debug(self):
+        warp_idx = cute.arch.warp_idx()
+        bidx, bidy, bidz = cute.arch.block_idx()
+        return warp_idx == 8 and bidx + bidy + bidz == 0
+
+    @cute.jit
     def get_current_work(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:
         params = self.params
         lane_idx = cute.arch.lane_idx()
@@ -817,6 +823,14 @@ class VarlenMTileScheduler(TileScheduler):
         num_clusters_m = self._get_num_m_blocks(
             lane_idx, bidb_start=batch_idx, block_size=block_size
         )
+        # if self.debug():
+        #     cute.printf(
+        #         "lane_idx: %d, num_batch: %d, num_clusters_m: %d, self.current_batch_id: %d",
+        #         lane_idx,
+        #         num_batch,
+        #         num_clusters_m,
+        #         self._current_batch_idx,
+        #     )
         num_clusters = num_clusters_m * params.problem_shape_ncluster_mnl[1]
         num_clusters_cumulative = utils.warp_prefix_sum(num_clusters, lane_idx)
         # Total number of blocks for the next 31 problems, same for all lanes
@@ -827,6 +841,7 @@ class VarlenMTileScheduler(TileScheduler):
         # if cute.arch.thread_idx()[0] == 128 + 31: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, problems_end_tile = %d, num_clusters_m=%d, num_clusters_cumulative = %d, problems_end_tile = %d", self._tile_idx, problems_end_tile, num_clusters_m, num_clusters_cumulative, problems_end_tile)
         cid_m, cid_n = Int32(0), Int32(0)
         next_tile_idx = self._current_work_linear_idx
+
         while problems_end_tile <= next_tile_idx:
             batch_idx += cute.arch.WARP_SIZE - 1
             if batch_idx >= num_batch:
@@ -869,6 +884,14 @@ class VarlenMTileScheduler(TileScheduler):
             # cid_m = cluster_id_in_problem - cid_n * num_clusters_m
             # if cute.arch.thread_idx()[0] == 128: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, batch_idx=%d, cid_n=%d, cid_m=%d, is_valid = %d", self._tile_idx, batch_idx, cid_n, cid_m, is_valid)
             cid_m, cid_n = self._swizzle_cta(cluster_id_in_problem, num_clusters_m, loc=loc, ip=ip)
+        if self.debug():
+            cute.printf(
+                "lane_idx: %d, cid_m: %d, cid_n: %d, batch_idx: %d",
+                lane_idx,
+                cid_m,
+                cid_n,
+                batch_idx,
+            )
         self._current_batch_idx = batch_idx
         self._num_work_idx_before_cur_batch = num_work_idx_before_cur_batch
 

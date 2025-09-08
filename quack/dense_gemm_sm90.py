@@ -382,9 +382,9 @@ class GemmSm90:
 
         self._setup_attributes(epilogue_args)
 
-        cute.printf("a smem layout: {}", self.a_smem_layout_staged)
-        cute.printf("b smem layout: {}", self.b_smem_layout_staged)
-        cute.printf("epi smem layout: {}", self.epi_smem_layout_staged)
+        # cute.printf("a shape is {}", mA.shape)
+        # cute.printf("b shape is {}", mB.shape)
+        # cute.printf("d shape is {}", mD.shape)
 
         tiled_mma = sm90_utils.make_trivial_tiled_mma(
             self.a_dtype,
@@ -530,6 +530,7 @@ class GemmSm90:
             ]
 
         self.shared_storage = SharedStorage
+        cute.printf("grid = {}", grid)
 
         # Launch the kernel synchronously
         self.kernel(
@@ -748,11 +749,10 @@ class GemmSm90:
                     tile_coord_mnkl = work_tile.tile_idx
                     batch_idx = tile_coord_mnkl[3]
 
-                    if is_scheduler_warp:
-                        lane_id = cute.arch.lane_idx()
-                        if lane_id == 0:
-                            cute.printf("tile_coord_mnkl: {}", tile_coord_mnkl)
-
+                    # if is_scheduler_warp:
+                    #     lane_id = cute.arch.lane_idx()
+                    #     if lane_id == 0:
+                    #         cute.printf("tile_coord_mnkl: {}", tile_coord_mnkl)
                     # ///////////////////////////////////////////////////////////////////////////
                     #  Local_tile partition global tensors
                     # ///////////////////////////////////////////////////////////////////////////
@@ -2114,7 +2114,7 @@ def gemm_sm90(
     )
 
     cache = gemm_sm90.compile_cache
-    if compile_key not in cache:
+    if True:
         gemm = GemmSm90(
             acc_dtype,
             a_dtype,

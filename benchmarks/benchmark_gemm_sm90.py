@@ -354,8 +354,6 @@ def run(
     else:
         tensormaps_tensor = None
 
-    epilogue_args = None
-
     gemm = GemmSm90(
         acc_dtype,
         a_dtype,
@@ -458,7 +456,7 @@ def run(
         # breakpoint()
         torch.testing.assert_close(d_torch.cpu(), ref_d, atol=tolerance, rtol=1e-03)
 
-    # return
+    return
 
     from triton.testing import do_bench
 

@@ -11,6 +11,7 @@ from quack.autotuner import autotune, AutotuneConfig
 from quack.dense_gemm_sm90 import gemm_sm90
 from quack.gemm_act_sm90 import gemm_act_sm90
 from quack.gemm_dact_sm90 import gemm_dact_sm90
+from quack.dense_gemm_sm90 import GemmSm90
 
 
 def gemm_swiglu_out_ref(
@@ -290,19 +291,32 @@ def grouped_gemm(
 ) -> (Tensor, Optional[Tensor]):
     if config is None:
         config = GemmConfig(tile_m=128, tile_n=192, cluster_m=2, cluster_n=1, pingpong=True)
-    A, B = A.unsqueeze(0), B.mT.unsqueeze(0)  # (1, M, K), (1, N, K)
-    if C is not None:
-        C = C.unsqueeze(0)  # (1, M, N)
+    B = B.permute(0, 2, 1)  # (L, N, K)
     out_dtype = A.dtype if out_dtype is None else out_dtype
-    D = torch.empty((1, A.shape[1], B.shape[1]), dtype=out_dtype, device=A.device)
+    D = torch.empty((A.shape[0], B.shape[1]), dtype=out_dtype, device=A.device)
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
     )
-    gemm_sm90(
-        A if not config.swap_ab else B,
-        B if not config.swap_ab else A,
-        D if not config.swap_ab else D.mT,
-        (C if not config.swap_ab else C.mT) if C is not None else None,
+    from cutlass import cute
+
+    grouped_gemm = GemmSm90(
+        acc_dtype=torch.float32,
+        tile_shape_mnk=(config.tile_m, config.tile_n, 64),
+        cluster_shape_mnk=(config.cluster_m, config.cluster_n, 1),
+        pingpong=config.pingpong,
+        persistent=True,
+    )
+    compiled_grouped_gemm = cute.compile(
+        grouped_gemm,
+        A,
+        B,
+        D,
+        tile_count_semaphore,
+    )
+    grouped_gemm(
+        A,
+        B,
+        D,
         tile_count_semaphore,
         config.tile_m,
         config.tile_n,
@@ -310,4 +324,5 @@ def grouped_gemm(
         config.cluster_n,
         config.pingpong,
     )
-    return D.squeeze(0)
+
+    return D
