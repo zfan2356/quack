@@ -42,6 +42,15 @@ dact_to_pytorch_fn_map = {
     ),
 }
 
+# Dictionary mapping gated activation names to their forward functions
+# Each function takes (gate, up) and returns postact
+gated_to_pytorch_fn_map = {
+    "swiglu": lambda gate, up: F.silu(gate) * up,
+    "swiglu_oai": lambda gate, up: gate * torch.sigmoid(1.072 * gate) * (up + 1),
+    "reglu": lambda gate, up: F.relu(gate) * up,
+    "geglu": lambda gate, up: F.gelu(gate, approximate="tanh") * up,
+}
+
 
 @autotune(
     configs=[AutotuneConfig(config=c) for c in get_all_configs()],
@@ -244,10 +253,7 @@ def gemm_act_ref(
 ) -> Tuple[Tensor, Tensor]:
     out_dtype = A.dtype if out_dtype is None else out_dtype
     postact_dtype = A.dtype if postact_dtype is None else postact_dtype
-    if C is None:
-        out = torch.mm(A, B)
-    else:
-        out = C + torch.mm(A, B)
+    out = torch.mm(A, B) if C is None else C + torch.mm(A, B)
     postact = act_to_pytorch_fn_map[activation](out).to(postact_dtype)
     return out.to(out_dtype) if store_preact else None, postact
 
@@ -287,6 +293,78 @@ def gemm_dact_ref(
     postact_dtype = PreAct.dtype if postact_dtype is None else postact_dtype
     dout = torch.mm(A, B).to(out_dtype)
     dx, postact = dact_to_pytorch_fn_map[activation](PreAct, dout)
+    return dx.to(out_dtype), postact.to(postact_dtype)
+
+
+def gemm_gated_ref(
+    A: Tensor,
+    B: Tensor,
+    C: Optional[Tensor] = None,
+    activation: Literal["swiglu", "swiglu_oai", "reglu", "geglu"] = "swiglu",
+    out_dtype: Optional[torch.dtype] = None,
+    postact_dtype: Optional[torch.dtype] = None,
+    store_preact: bool = True,
+) -> Tuple[Optional[Tensor], Tensor]:
+    """Reference implementation for GEMM with gated activation forward.
+
+    Args:
+        A: (M, K) - input tensor
+        B: (K, 2*N) - weight tensor with gate and up projections
+        C: (M, 2*N) - optional bias tensor
+        activation: Type of gated activation
+        out_dtype: Output dtype for preact
+        postact_dtype: Output dtype for postact
+        store_preact: Whether to return the pre-activation
+
+    Returns:
+        (preact, postact) where:
+        - preact: (M, 2*N) pre-activation (if store_preact=True, else None)
+        - postact: (M, N) post-activation output
+    """
+    out_dtype = A.dtype if out_dtype is None else out_dtype
+    postact_dtype = A.dtype if postact_dtype is None else postact_dtype
+    preact = torch.mm(A, B) if C is None else C + torch.mm(A, B)
+    # Split preact into gate and up projections
+    gate = preact[..., ::2]  # (M, N)
+    up = preact[..., 1::2]  # (M, N)
+    postact = gated_to_pytorch_fn_map[activation](gate, up)
+    return preact.to(out_dtype) if store_preact else None, postact.to(postact_dtype)
+
+
+def gemm_dgated_ref(
+    A: Tensor,
+    B: Tensor,
+    PreAct: Tensor,
+    activation: Literal["swiglu", "swiglu_oai", "reglu", "geglu"],
+    out_dtype: Optional[torch.dtype] = None,
+    postact_dtype: Optional[torch.dtype] = None,
+) -> Tuple[Tensor, Tensor]:
+    """Reference implementation for GEMM with gated activation gradient.
+
+    Args:
+        A: (M, K) - dout input tensor
+        B: (K, N) - weight tensor
+        PreAct: (M, 2*N) - pre-activation tensor with gate and up projections interleaved
+        activation: Type of gated activation
+        out_dtype: Output dtype for dx
+        postact_dtype: Output dtype for postact
+
+    Returns:
+        (dx, postact) where:
+        - dx: (M, 2*N) gradient w.r.t. PreAct
+        - postact: (M, N) post-activation output
+    """
+    out_dtype = A.dtype if out_dtype is None else out_dtype
+    postact_dtype = PreAct.dtype if postact_dtype is None else postact_dtype
+    dout = torch.mm(A, B).to(out_dtype)
+    # Split PreAct into gate and up projections
+    gate = PreAct[..., ::2]  # (M, N)
+    up = PreAct[..., 1::2]  # (M, N)
+    postact = gated_to_pytorch_fn_map[activation](gate, up)
+    # Use autograd to compute gradients w.r.t. gate and up
+    dgate, dup = torch.autograd.grad(postact, [gate, up], dout, create_graph=False)
+    # Interleave gradients back
+    dx = torch.stack([dgate, dup], dim=-1).reshape(PreAct.shape)
     return dx.to(out_dtype), postact.to(postact_dtype)
 
 
