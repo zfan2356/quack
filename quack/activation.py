@@ -171,20 +171,23 @@ def dswiglu_oai(
 ) -> Tuple[Float32, Float32, Float32]:
     """
     Swiglu OAI backward pass: computes gradients w.r.t. x and y
-    Given: silu_oai_out = x * sigmoid(alpha * x) * (y + 1), and dout = grad w.r.t. silu_oai_out
-    Returns: (dx, dy, silu_oai_out)
-    It's the same as dswiglu, dy formula stays the same, for dx we just replace y by y + 1
+    Given: swiglu_oai_out = x * sigmoid(alpha * x) * (y + 1), and dout = grad w.r.t. swiglu_oai_out
+    Returns: (dx, dy, swiglu_oai_out)
+
+    Derivative of x * sigmoid(alpha * x) w.r.t. x:
+    d/dx[x * sigmoid(alpha * x)] = sigmoid(alpha * x) + alpha * x * sigmoid(alpha * x) * (1 - sigmoid(alpha * x))
     """
     # Compute sigmoid(alpha * x) using tanh: sigmoid(z) = 0.5 * (1 + tanh(z/2))
     alpha_x_half = (0.5 * alpha) * x  # FMUL
     sigmoid_alpha_x = 0.5 + 0.5 * tanh(alpha_x_half)  # MUFU.TANH, then FFMA
     silu_x = x * sigmoid_alpha_x  # FMUL
     silu_x_dout = silu_x * dout  # FMUL
-    d_silu_x_dout = (sigmoid_alpha_x - silu_x * sigmoid_alpha_x) * dout + silu_x_dout  # FFMA, FFMA
+    # FFMA, FFMA, FMUL
+    d_silu_x_dout = (sigmoid_alpha_x + alpha * (silu_x - silu_x * sigmoid_alpha_x)) * dout
     dx = d_silu_x_dout * y + d_silu_x_dout  # FFMA, instead of multiply by y + 1
     dy = silu_x_dout
     swiglu_out = silu_x * y + silu_x  # FFMA, instead of multiply by y + 1
-    # Overall it's 1 MUFU.TANH, 3 FMUL, 5 FFMA
+    # Overall it's 1 MUFU.TANH, 4 FMUL, 5 FFMA
     return dx, dy, swiglu_out
 
 
