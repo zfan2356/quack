@@ -18,13 +18,14 @@ class GemmConfig:
 
 def get_all_configs(
     epilogue: Optional[str] = None,
+    tune_coop: bool = True,
     # tune_raster_order=True,
 ) -> List[GemmConfig]:
     tile_n_vals = [128, 144, 160, 176, 192, 208]
     tile_mn_coop_vals = [(256, tile_n) for tile_n in tile_n_vals] + [
         (128, 224),
         (128, 256),
-        (192, 256),
+        # (192, 256),  # Getting IOT instruction (core dumped) in the bwd
     ]
     tile_mn_pingpong_vals = [(128, tile_n) for tile_n in tile_n_vals] + [(192, 128)]
     if epilogue in ["gated"]:
@@ -32,11 +33,12 @@ def get_all_configs(
         tile_mn_pingpong_vals = [(m, n) for m, n in tile_mn_pingpong_vals if n % 32 == 0]
     elif epilogue in ["lse"]:
         tile_mn_coop_vals = [(m, n) for m, n in tile_mn_coop_vals if m != 192]
-    tile_mn_vals = [(m, n, False) for m, n in tile_mn_coop_vals] + [
-        (m, n, True) for m, n in tile_mn_pingpong_vals
-    ]
-    # cluster = [(1, 2), (2, 1)]
-    cluster = [(1, 1), (1, 2), (2, 1)]
+    tile_mn_vals = []
+    if tune_coop:
+        tile_mn_vals += [(m, n, False) for m, n in tile_mn_coop_vals]
+    tile_mn_vals += [(m, n, True) for m, n in tile_mn_pingpong_vals]
+    cluster = [(1, 2), (2, 1)]
+    # cluster = [(1, 1), (1, 2), (2, 1)]
     if epilogue in ["lse"]:
         cluster = [(1, 2), (2, 1)]
     swap_ab_vals = [False, True]
