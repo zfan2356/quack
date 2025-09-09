@@ -192,6 +192,44 @@ def dswiglu_oai(
 
 
 @dsl_user_op
+def glu(x: Float32, y: Float32, *, loc=None, ip=None) -> Float32:
+    """GLU: Gated Linear Unit
+    glu(x, y) = sigmoid(x) * y
+    Using tanh to compute sigmoid: sigmoid(x) = 0.5 * (1 + tanh(x/2))
+    """
+    x_half = 0.5 * x  # FMUL
+    sigmoid_x = 0.5 + 0.5 * tanh(x_half)  # MUFU.TANH, then FFMA
+    return sigmoid_x * y  # FMUL
+
+
+@dsl_user_op
+def dglu(
+    x: Float32, y: Float32, dout: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32, Float32]:
+    """
+    GLU backward pass: computes gradients w.r.t. x (gate) and y (up projection)
+    Given: glu_out = sigmoid(x) * y, and dout = grad w.r.t. glu_out
+    Returns: (dx, dy, glu_out) where:
+    - dx = dout * y * sigmoid(x) * (1 - sigmoid(x))
+    - dy = dout * sigmoid(x)
+    - glu_out = sigmoid(x) * y
+    """
+    # Compute sigmoid(x) using tanh: sigmoid(x) = 0.5 * (1 + tanh(x/2))
+    x_half = 0.5 * x  # FMUL
+    sigmoid_x = 0.5 + 0.5 * tanh(x_half)  # MUFU.TANH, then FFMA
+    sigmoid_x_dout = sigmoid_x * dout  # FMUL
+    glu_out = sigmoid_x * y  # FMUL
+    # dx = y * sigmoid(x) * (1 - sigmoid(x)) * dout
+    #    = y * (1 - sigmoid(x)) * sigmoid_x_dout
+    #    = (y - y * sigmoid(x)) * sigmoid_x_dout
+    #    = (y - glu_out) * sigmoid_x_dout
+    dx = (y - glu_out) * sigmoid_x_dout  # FADD, FMUL
+    dy = sigmoid_x_dout
+    # Total: 1 MUFU.TANH, 4 FMUL, 1 FADD, 1 FFMA
+    return dx, dy, glu_out
+
+
+@dsl_user_op
 def reglu(x: Float32, y: Float32, *, loc=None, ip=None) -> Float32:
     """ReGLU: ReLU Gated Linear Unit
     reglu(x, y) = relu(x) * y = max(x, 0) * y

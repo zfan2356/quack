@@ -49,6 +49,7 @@ gated_to_pytorch_fn_map = {
     "swiglu_oai": lambda gate, up: gate * torch.sigmoid(1.702 * gate) * (up + 1),
     "reglu": lambda gate, up: F.relu(gate) * up,
     "geglu": lambda gate, up: F.gelu(gate, approximate="tanh") * up,
+    "glu": lambda gate, up: torch.sigmoid(gate) * up,
 }
 
 
@@ -300,7 +301,7 @@ def gemm_gated_ref(
     A: Tensor,
     B: Tensor,
     C: Optional[Tensor] = None,
-    activation: Literal["swiglu", "swiglu_oai", "reglu", "geglu"] = "swiglu",
+    activation: Literal["glu", "swiglu", "swiglu_oai", "reglu", "geglu"] = "swiglu",
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
     store_preact: bool = True,
@@ -335,7 +336,7 @@ def gemm_dgated_ref(
     A: Tensor,
     B: Tensor,
     PreAct: Tensor,
-    activation: Literal["swiglu", "swiglu_oai", "reglu", "geglu"],
+    activation: Literal["glu", "swiglu", "swiglu_oai", "reglu", "geglu"],
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[Tensor, Tensor]:
