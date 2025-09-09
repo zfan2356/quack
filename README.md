@@ -20,9 +20,8 @@ pip install quack-kernels
 - 🦆 Softmax forward + backward
 - 🦆 Cross entropy forward + backward
 - 🦆 Layernorm forward
-
-Upcoming:
-- 🦆 Rotary forward + backward
+- 🦆 Hopper gemm + epilogue
+- 🦆 Blackwell gemm + epilogue
 
 ## Usage
 
