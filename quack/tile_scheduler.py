@@ -675,7 +675,9 @@ class VarlenMTileScheduler(TileScheduler):
         self._ip = ip
 
     @staticmethod
-    def to_underlying_arguments(args: TileSchedulerArguments, *, loc=None, ip=None) -> Params:
+    def to_underlying_arguments(
+        args: VarlenMTileSchedulerArguments, *, loc=None, ip=None
+    ) -> Params:
         return VarlenMTileScheduler.Params.create(args, loc=loc, ip=ip)
 
     @staticmethod

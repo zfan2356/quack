@@ -4,8 +4,14 @@ from typing import Optional
 from dataclasses import dataclass
 
 import cutlass.cute as cute
-
+import cutlass
 from quack.cute_dsl_utils import ArgumentsBase
+
+
+@dataclass
+class CuSeqlensMCPU(ArgumentsBase):
+    # array: List[cutlass.Int32]
+    length: cutlass.Int32
 
 
 # Grouping arguments together that should be passed to __call__

@@ -459,16 +459,39 @@ class GemmSm90:
             )
         else:
             assert mD is not None or not self.gather_A
+
             problem_shape_ntile_mnl = (
                 None,
                 cute.ceil_div(mB.shape[0], self.tile_shape_mnk[1]),
-                varlen_args.mCuSeqlensM.shape[0] - 1,
+                None,
             )
+            cu_seqlens_m = None
+            if isinstance(varlen_args.mCuSeqlensM, cute.Tensor):
+                cute.printf("tensor")
+                cu_seqlens_m = varlen_args.mCuSeqlensM
+                problem_shape_ntile_mnl = (
+                    None,
+                    cute.ceil_div(mB.shape[0], self.tile_shape_mnk[1]),
+                    cu_seqlens_m.shape[0] - 1,
+                )
+            else:
+                cute.printf("cpu")
+                cu_seqlens = cute.make_fragment(len(varlen_args.mCuSeqlensM), dtype=cutlass.Int32)
+                for i, x in enumerate(varlen_args.mCuSeqlensM):
+                    cu_seqlens[i] = x
+                cu_seqlens_m = cu_seqlens.load()
+                problem_shape_ntile_mnl = (
+                    None,
+                    cute.ceil_div(mB.shape[0], self.tile_shape_mnk[1]),
+                    cu_seqlens.shape[0] - 1,
+                )
+            return
+
             TileSchedulerCls = VarlenMTileScheduler
             tile_sched_args = VarlenMTileSchedulerArguments(
                 problem_shape_ntile_mnl=problem_shape_ntile_mnl,
                 total_m=mD.shape[0] if mD is not None else mAIdx.shape[0],
-                cu_seqlens_m=varlen_args.mCuSeqlensM,
+                cu_seqlens_m=cu_seqlens_m,
                 raster_order=scheduler_args.raster_order,
                 group_size=scheduler_args.max_swizzle_size,
                 tile_shape_mnk=self.tile_shape_mnk,
@@ -539,7 +562,7 @@ class GemmSm90:
             tma_tensor_c,
             epilogue_params,
             mAIdx,
-            varlen_args.mCuSeqlensM,
+            cu_seqlens_m,
             varlen_args.mTensormaps,
             tiled_mma,
             self.cluster_layout_mnk,
@@ -573,7 +596,7 @@ class GemmSm90:
         mC_mnl: Optional[cute.Tensor],
         epilogue_params: EpilogueParams,
         mAIdx: Optional[cute.Tensor],
-        cu_seqlens_m: Optional[cute.Tensor],
+        cu_seqlens_m: Optional[cute.Tensor | cute.TensorSSA],
         tensormaps: Optional[cute.Tensor],
         tiled_mma: cute.TiledMma,
         cluster_layout_mnk: cute.Layout,
