@@ -1299,7 +1299,7 @@ class GemmSm90:
         if const_expr(not self.fp8_slow_accum):
             # fp8_slow_accum would already called wait_group(0) inside the loop
             warpgroup.wait_group(0)
-        for k_tile in cutlass.range(k_pipe_mmas, unroll=1):
+        for k_tile in cutlass.range(num_prologue_mma, unroll=1):
             ab_pipeline.consumer_release(ab_release_state)
             ab_release_state.advance()
         if const_expr(self.fp8_slow_accum):
