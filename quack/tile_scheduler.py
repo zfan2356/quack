@@ -563,7 +563,7 @@ class TriangularTileScheduler(TileScheduler):
 class VarlenMTileSchedulerArguments(ParamsBase):
     problem_shape_ntile_mnl: cute.Shape
     total_m: Int32
-    cu_seqlens_m: cute.Tensor
+    cu_seqlens_m: cute.Tensor | cute.TensorSSA
     raster_order: cutlass.Constexpr[RasterOrderOption]
     group_size: Int32
     tile_shape_mnk: cutlass.Constexpr[cute.Shape]
@@ -577,7 +577,7 @@ class VarlenMTileScheduler(TileScheduler):
     class Params(ParamsBase):
         problem_shape_ncluster_mnl: cute.Shape
         total_m: Int32
-        cu_seqlens_m: cute.Tensor
+        cu_seqlens_m: cute.Tensor | cute.TensorSSA
         raster_order: cutlass.Constexpr[RasterOrder]
         group_size: Int32
         group_size_divmod: Optional[FastDivmod]
@@ -591,7 +591,7 @@ class VarlenMTileScheduler(TileScheduler):
         @staticmethod
         @cute.jit
         def create(
-            args: TileSchedulerArguments, *, loc=None, ip=None
+            args: VarlenMTileSchedulerArguments, *, loc=None, ip=None
         ) -> "VarlenMTileScheduler.Params":
             assert args.cluster_shape_mnk[2] == 1
             cluster_shape_mn = const_expr(cute.select(args.cluster_shape_mnk, mode=[0, 1]))
@@ -675,7 +675,9 @@ class VarlenMTileScheduler(TileScheduler):
         self._ip = ip
 
     @staticmethod
-    def to_underlying_arguments(args: TileSchedulerArguments, *, loc=None, ip=None) -> Params:
+    def to_underlying_arguments(
+        args: VarlenMTileSchedulerArguments, *, loc=None, ip=None
+    ) -> Params:
         return VarlenMTileScheduler.Params.create(args, loc=loc, ip=ip)
 
     @staticmethod

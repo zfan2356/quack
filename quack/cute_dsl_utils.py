@@ -87,13 +87,25 @@ class ArgumentsBase(JitArgument):
         non_constexpr_fields = {
             n: f for n, f in all_fields.items() if not isinstance(f, StaticTypes)
         }
-        # for (name, field), n_items in zip(non_constexpr_fields.items(), self._values_pos):
+
         for name, field in non_constexpr_fields.items():
-            # non_constexpr_fields[name] = cutlass.new_from_mlir_values(field, values[:n_items])
-            # values = values[n_items:]
-            n_items = 1
-            non_constexpr_fields[name] = cutlass.new_from_mlir_values(field, values[:n_items])
-            values = values[n_items:]
+            # Handle None fields - they should remain None and not consume any values
+            if field is None:
+                non_constexpr_fields[name] = None
+            else:
+                # For non-None fields, try to extract values and use them
+                try:
+                    obj_values = cutlass.extract_mlir_values(field)
+                    n_items = len(obj_values)
+                    non_constexpr_fields[name] = cutlass.new_from_mlir_values(
+                        field, values[:n_items]
+                    )
+                    values = values[n_items:]
+                except Exception:
+                    # If extraction fails, assume 1 item as fallback
+                    non_constexpr_fields[name] = cutlass.new_from_mlir_values(field, values[:1])
+                    values = values[1:]
+
         return self.__class__(**non_constexpr_fields, **constexpr_fields)
 
 

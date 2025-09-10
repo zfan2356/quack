@@ -442,7 +442,11 @@ class GemmSm90:
 
         if const_expr(varlen_args is None):
             varlen_args = VarlenArguments()
-        if const_expr(varlen_args.mCuSeqlensM is None):
+
+        has_varlen = (
+            varlen_args.mCuSeqlensMTensor is not None or varlen_args.mCuSeqlensMList is not None
+        )
+        if const_expr(not has_varlen):
             problem_shape_ntile_mnl = (
                 cute.ceil_div(mA.shape[0], self.tile_shape_mnk[0]),
                 cute.ceil_div(mB.shape[0], self.tile_shape_mnk[1]),
@@ -459,16 +463,39 @@ class GemmSm90:
             )
         else:
             assert mD is not None or not self.gather_A
-            problem_shape_ntile_mnl = (
-                None,
-                cute.ceil_div(mB.shape[0], self.tile_shape_mnk[1]),
-                varlen_args.mCuSeqlensM.shape[0] - 1,
-            )
+
+            if const_expr(varlen_args.mCuSeqlensMTensor is not None):
+                cu_seqlens_m = varlen_args.mCuSeqlensMTensor
+                problem_shape_ntile_mnl = (
+                    None,
+                    cute.ceil_div(mB.shape[0], self.tile_shape_mnk[1]),
+                    cu_seqlens_m.shape[0] - 1,
+                )
+            elif const_expr(varlen_args.mCuSeqlensMList is not None):
+                cute.printf("cpu")
+                seqlens_list = varlen_args.mCuSeqlensMList
+                length = varlen_args.mCuSeqlen
+                cu_seqlens = cute.make_fragment(length, dtype=cutlass.Int32)
+                for i, x in enumerate(seqlens_list):
+                    cu_seqlens[i] = x
+                cu_seqlens_m = cu_seqlens.load()
+                problem_shape_ntile_mnl = (
+                    None,
+                    cute.ceil_div(mB.shape[0], self.tile_shape_mnk[1]),
+                    cu_seqlens.shape[0] - 1,
+                )
+            else:
+                # Both mCuSeqlensMTensor and mCuSeqlensMList are None
+                # This shouldn't happen if has_varlen is True, but handle it gracefully
+                raise ValueError(
+                    "Both mCuSeqlensMTensor and mCuSeqlensMList are None, but has_varlen is True"
+                )
+
             TileSchedulerCls = VarlenMTileScheduler
             tile_sched_args = VarlenMTileSchedulerArguments(
                 problem_shape_ntile_mnl=problem_shape_ntile_mnl,
                 total_m=mD.shape[0] if mD is not None else mAIdx.shape[0],
-                cu_seqlens_m=varlen_args.mCuSeqlensM,
+                cu_seqlens_m=cu_seqlens_m,
                 raster_order=scheduler_args.raster_order,
                 group_size=scheduler_args.max_swizzle_size,
                 tile_shape_mnk=self.tile_shape_mnk,
@@ -488,7 +515,7 @@ class GemmSm90:
 
         size_tensormap_in_i64 = (
             0
-            if varlen_args.mCuSeqlensM is None
+            if not has_varlen
             or self.tensormap_update_mode == cutlass.utils.TensorMapUpdateMode.GMEM
             else GemmSm90.num_tensormaps * GemmSm90.bytes_per_tensormap // 8
         ) * (1 if not self.pingpong else 2)
@@ -539,7 +566,7 @@ class GemmSm90:
             tma_tensor_c,
             epilogue_params,
             mAIdx,
-            varlen_args.mCuSeqlensM,
+            cu_seqlens_m,
             varlen_args.mTensormaps,
             tiled_mma,
             self.cluster_layout_mnk,
@@ -573,7 +600,7 @@ class GemmSm90:
         mC_mnl: Optional[cute.Tensor],
         epilogue_params: EpilogueParams,
         mAIdx: Optional[cute.Tensor],
-        cu_seqlens_m: Optional[cute.Tensor],
+        cu_seqlens_m: Optional[cute.Tensor | cute.TensorSSA],
         tensormaps: Optional[cute.Tensor],
         tiled_mma: cute.TiledMma,
         cluster_layout_mnk: cute.Layout,

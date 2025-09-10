@@ -136,6 +136,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--gather_A", action="store_true", help="Gather A")
     parser.add_argument("--fp8_fast_accum", action="store_true", help="FP8 fast accum")
     parser.add_argument("--skip_ref_check", action="store_true", help="Skip reference checking")
+    parser.add_argument("--use_cpu_varlen_m", action="store_true", help="Use CPU varlen M")
 
     args = parser.parse_args()
 
@@ -172,6 +173,7 @@ def run(
     varlen_m: bool,
     gather_A: bool,
     fp8_fast_accum: bool,
+    use_cpu_varlen_m: bool,
     **kwargs,
 ):
     """
@@ -201,6 +203,8 @@ def run(
     :type iterations: int, optional
     :param skip_ref_check: Whether to skip reference result validation, defaults to False
     :type skip_ref_check: bool, optional
+    :param use_cpu_varlen_m: Whether to use CPU varlen M, defaults to False
+    :type use_cpu_varlen_m: bool, optional
     """
 
     if dynamic_persistent:
@@ -326,13 +330,20 @@ def run(
         mA = from_dlpack(a_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
         mD = from_dlpack(d_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
         # TODO: generate random cu_seqlens_m
-        cu_seqlens_m = torch.arange(0, l + 1, dtype=torch.int32, device="cuda") * m
-        mCuSeqlensM = from_dlpack(cu_seqlens_m, assumed_align=64).mark_layout_dynamic(leading_dim=0)
+        if use_cpu_varlen_m:
+            mCuSeqlensMList = [cutlass.Int32(x) for x in range(0, (l + 1) * m, m)]
+            mCuSeqlen = cutlass.const_expr(l + 1)
+            mCuSeqlensMTensor = None
+        else:
+            cu_seqlens_m = torch.arange(0, l + 1, dtype=torch.int32, device="cuda") * m
+            mCuSeqlensMTensor = from_dlpack(cu_seqlens_m, assumed_align=64).mark_layout_dynamic(leading_dim=0)
+            mCuSeqlen, mCuSeqlensMList = cutlass.const_expr(l + 1), None
         if gather_A:
             a_idx_reshaped = rearrange(a_idx_reshaped, "m l -> (l m)")
             mAIdx = from_dlpack(a_idx_reshaped, assumed_align=4).mark_layout_dynamic(leading_dim=0)
     else:
-        cu_seqlens_m, mCuSeqlensM = None, None
+        cu_seqlens_m, mCuSeqlensMTensor = None, None
+        mCuSeqlensMList, mCuSeqlen = None, cutlass.const_expr(0)
 
     if varlen_m:  # Need to allocate space in gmem to store tensormaps
         if not persistent:
@@ -386,7 +397,7 @@ def run(
     )
 
     epi_args = gemm.EpilogueArguments()
-    varlen_args = VarlenArguments(mCuSeqlensM, tensormaps_tensor)
+    varlen_args = VarlenArguments(mCuSeqlensMTensor=mCuSeqlensMTensor, mCuSeqlensMList=mCuSeqlensMList, mCuSeqlen=mCuSeqlen, mTensormaps=tensormaps_tensor)
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     # compile gemm kernel
     compiled_gemm = cute.compile(
@@ -559,5 +570,6 @@ if __name__ == "__main__":
         args.varlen_m,
         args.gather_A,
         args.fp8_fast_accum,
+        args.use_cpu_varlen_m,
     )
     print("PASS")
