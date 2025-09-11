@@ -446,7 +446,7 @@ class GemmSm90:
             problem_shape_ntile_mnl = (
                 cute.ceil_div(mA.shape[0], self.tile_shape_mnk[0]),
                 cute.ceil_div(mB.shape[0], self.tile_shape_mnk[1]),
-                mB.shape[2],
+                mD.shape[2],
             )
             TileSchedulerCls = TileScheduler
             tile_sched_args = TileSchedulerArguments(
@@ -540,6 +540,7 @@ class GemmSm90:
             epilogue_params,
             mAIdx,
             varlen_args.mCuSeqlensM,
+            varlen_args.mCuSeqlensK,
             varlen_args.mTensormaps,
             tiled_mma,
             self.cluster_layout_mnk,
@@ -574,6 +575,7 @@ class GemmSm90:
         epilogue_params: EpilogueParams,
         mAIdx: Optional[cute.Tensor],
         cu_seqlens_m: Optional[cute.Tensor],
+        cu_seqlens_k: Optional[cute.Tensor],
         tensormaps: Optional[cute.Tensor],
         tiled_mma: cute.TiledMma,
         cluster_layout_mnk: cute.Layout,
@@ -611,7 +613,8 @@ class GemmSm90:
         :type epi_smem_layout: cute.ComposedLayout
         """
 
-        varlen = const_expr(cu_seqlens_m is not None)
+        varlen_m = const_expr(cu_seqlens_m is not None)
+        varlen_k = const_expr(cu_seqlens_k is not None)
         has_D = const_expr(mD_mnl is not None)
         has_C = const_expr(mC_mnl is not None)
 
@@ -672,7 +675,7 @@ class GemmSm90:
         epi_smem_tensors = self.epi_get_smem_tensors(epilogue_params, storage)
 
         # Get tensormap buffer address
-        if const_expr(varlen):
+        if const_expr(varlen_m):
             grid_dim = cute.arch.grid_dim()
             bid = cute.arch.block_idx()
             tensormap_workspace_idx = (
@@ -717,6 +720,7 @@ class GemmSm90:
                 warp_idx >= self.ab_load_warp_id
                 and warp_idx < self.ab_load_warp_id + self.num_ab_load_warps
             ):
+                # TODO: update tensormap for A & B if varlen_k for bound checking
                 # ///////////////////////////////////////////////////////////////////////////////
                 # Get mcast mask
                 # ///////////////////////////////////////////////////////////////////////////////
@@ -747,8 +751,10 @@ class GemmSm90:
                     #  Local_tile partition global tensors
                     # ///////////////////////////////////////////////////////////////////////////
                     if const_expr(not self.gather_A):
-                        if const_expr(cu_seqlens_m is not None):
+                        if const_expr(varlen_m):
                             mA_mk = cute.domain_offset((cu_seqlens_m[batch_idx], 0), mA_mkl)
+                        elif const_expr(varlen_k):
+                            mA_mk = cute.domain_offset((0, cu_seqlens_k[batch_idx]), mA_mkl)
                         else:
                             mA_mk = mA_mkl[None, None, batch_idx]
                         # (bM, bK, RestK)
@@ -759,16 +765,22 @@ class GemmSm90:
                         )
                     else:
                         mA_mk = mA_mkl
-                        if const_expr(cu_seqlens_m is not None):
+                        if const_expr(varlen_m):
                             mAIdx_mk = cute.domain_offset((cu_seqlens_m[batch_idx],), mAIdx)
+                        elif const_expr(varlen_k):
+                            mAIdx_mk = cute.domain_offset((cu_seqlens_k[batch_idx],), mAIdx)
                         else:
                             mAIdx_mk = mAIdx[None, batch_idx]
                         gAIdx = cute.local_tile(
                             mAIdx_mk, (self.tile_shape_mnk[0],), (tile_coord_mnkl[0],)
                         )
+                    if const_expr(varlen_k):
+                        mB_nk = cute.domain_offset((0, cu_seqlens_k[batch_idx]), mB_nkl)
+                    else:
+                        mB_nk = mB_nkl[None, None, batch_idx]
                     # (bN, bK, RestK)
                     gB_k = cute.local_tile(
-                        mB_nkl, self.tile_shape_mnk, tile_coord_mnkl, proj=(None, 1, 1)
+                        mB_nk, cute.select(self.tile_shape_mnk, [1, 2]), (tile_coord_mnkl[1], None)
                     )
                     # //////////////////////////////////////////////////////////////////////////
                     #  Partition shared tensor for TMA load A/B
@@ -816,6 +828,12 @@ class GemmSm90:
                         cute.group_modes(gB_k, 0, 2),
                     )
                     copy_B = partial(cute.copy, tma_atom_b, mcast_mask=b_mcast_mask)
+                    k_len = (
+                        cu_seqlens_k[batch_idx + 1] - cu_seqlens_k[batch_idx]
+                        if const_expr(varlen_k)
+                        else mA_mkl.shape[1]
+                    )
+                    k_tile_cnt = cute.ceil_div(k_len, self.tile_shape_mnk[2])
                     if const_expr(not self.gather_A):
                         ab_producer_state = self.load_AB(
                             ab_pipeline,
@@ -826,6 +844,7 @@ class GemmSm90:
                             copy_B,
                             tBgB_k,
                             tBsB,
+                            k_tile_cnt,
                         )
                     else:
                         limit_m = (
@@ -843,6 +862,7 @@ class GemmSm90:
                             copy_B,
                             tBgB_k,
                             tBsB,
+                            k_tile_cnt,
                             limit_A=(
                                 limit_m - tile_coord_mnkl[0] * self.tile_shape_mnk[0],
                                 mA_mk.shape[1],
@@ -865,7 +885,7 @@ class GemmSm90:
                 (not self.pingpong and warp_idx == 0)
                 or (self.pingpong and (warp_idx == 0 or warp_idx == 4))
             )
-            if const_expr(varlen):
+            if const_expr(varlen_m):
                 # initialize tensormap for D
                 tensormap_manager.init_tensormap_from_atom(
                     tma_atom_d,
@@ -905,7 +925,6 @@ class GemmSm90:
                     self.pingpong_barrier_arrive(warp_group_idx=0, stage="mma")
                     self.pingpong_barrier_arrive(warp_group_idx=0, stage="epi")
 
-            k_tile_cnt = cute.ceil_div(cute.size(mA_mkl.shape[1]), self.tile_shape_mnk[2])
             c_tile_cnt = cute.size(cute.ceil_div(self.tile_shape_mnk[:2], self.epi_tile))
 
             ab_read_state = make_pipeline_state(pipeline.PipelineUserType.Consumer, self.ab_stage)
@@ -917,6 +936,7 @@ class GemmSm90:
             )
             tile_scheduler = TileSchedulerCls()
             if const_expr(self.pingpong):
+                # TODO: pingpong doesn't work w varlen_k for now
                 if warp_idx >= 4:
                     # Advance 2nd Math WG to the next work tile for the startup
                     tile_scheduler.advance_to_next_work()
@@ -925,7 +945,7 @@ class GemmSm90:
                     epi_read_state.advance_iters(c_tile_cnt)
                     epi_producer_state.advance_iters(c_tile_cnt)
             work_tile = tile_scheduler.initial_work_tile_info()
-            if const_expr(varlen):
+            if const_expr(varlen_m):
                 # wait tensormap initialization complete before update
                 tensormap_manager.fence_tensormap_initialization()
             # batch index of last tile
@@ -933,7 +953,7 @@ class GemmSm90:
             while work_tile.is_valid_tile:
                 tile_coord_mnkl = work_tile.tile_idx
                 batch_idx = tile_coord_mnkl[3]
-                if const_expr(varlen):
+                if const_expr(varlen_m):
                     is_group_changed = batch_idx != last_batch_idx
                     last_batch_idx = batch_idx
                     if is_group_changed:
@@ -946,6 +966,12 @@ class GemmSm90:
                             orders=(0 if const_expr(self.d_layout.is_m_major_c()) else 1,),
                         )
 
+                k_len = (
+                    cu_seqlens_k[batch_idx + 1] - cu_seqlens_k[batch_idx]
+                    if const_expr(varlen_k)
+                    else mA_mkl.shape[1]
+                )
+                k_tile_cnt = cute.ceil_div(k_len, self.tile_shape_mnk[2])
                 ab_read_state, tiled_mma = self.mma(
                     ab_pipeline,
                     ab_read_state,
@@ -957,6 +983,9 @@ class GemmSm90:
                     k_tile_cnt,
                     warp_group_idx,
                 )
+                if const_expr(varlen_k):
+                    if k_tile_cnt == 0:
+                        acc.fill(0.0)
                 if const_expr(self.pingpong):
                     # Update starting mainloop pipeline state for the next tile
                     ab_read_state.advance_iters(k_tile_cnt)
@@ -971,7 +1000,7 @@ class GemmSm90:
                     barrier_id=int(NamedBarrierGemm.Epilogue), num_threads=self.num_epi_threads
                 )
 
-                if const_expr(varlen):
+                if const_expr(varlen_m):
                     # ensure the update to tensormap has completed before using it
                     if is_group_changed:
                         if is_tma_warp:
@@ -1087,8 +1116,8 @@ class GemmSm90:
         copy_B: Callable,
         tBgB: cute.Tensor,
         tBsB: cute.Tensor,
+        k_tile_cnt: Int32,
     ) -> cutlass.pipeline.PipelineState:
-        k_tile_cnt = cute.size(tAgA, mode=[1])
         # Peek (try_wait) AB buffer empty for k_block = prefetch_k_tile_cnt
         peek_ab_empty_status = Boolean(True)
         if 0 < k_tile_cnt:
@@ -1123,6 +1152,7 @@ class GemmSm90:
         copy_B: Callable,
         tBgB: cute.Tensor,
         tBsB: cute.Tensor,
+        k_tile_cnt: Int32,
         limit_A: Tuple[Int32, Int32],
     ) -> cutlass.pipeline.PipelineState:
         # (atom_v, CPY_M, 1, RestK)
@@ -1148,7 +1178,6 @@ class GemmSm90:
         # (m, (bK, RestK))
         mA_k = cute.logical_divide(mA, (None, self.tile_shape_mnk[2]))
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        k_tile_cnt = cute.size(tBgB, mode=[1])
         # Peek (try_wait) AB buffer empty for k_block = prefetch_k_tile_cnt
         peek_ab_empty_status = Boolean(True)
         if 0 < k_tile_cnt:

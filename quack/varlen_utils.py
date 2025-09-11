@@ -12,6 +12,7 @@ from quack.cute_dsl_utils import ArgumentsBase
 @dataclass
 class VarlenArguments(ArgumentsBase):
     mCuSeqlensM: Optional[cute.Tensor] = None
+    mCuSeqlensK: Optional[cute.Tensor] = None
     mTensormaps: Optional[cute.Tensor] = None
 
     def __post_init__(self):
