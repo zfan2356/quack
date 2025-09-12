@@ -341,10 +341,10 @@ def run(
         from einops import rearrange
         assert not gather_A
 
-        a, b = [rearrange(t, "x k l -> x (l k)") for t in (a, b)]
-        a_torch, b_torch = [rearrange(t, "x k l -> x (l k)") for t in (a_torch, b_torch)]
-        mA = from_dlpack(a_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-        mB = from_dlpack(b_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+        a, a_torch = [rearrange(t, "m k l -> m (l k)") for t in (a, a_torch)]
+        b, b_torch = [rearrange(t, "n k l -> n (l k)") for t in (b, b_torch)]
+        mA = from_dlpack(a_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1 if a_major == "k" else 0)
+        mB = from_dlpack(b_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1 if b_major == "k" else 0)
         # TODO: generate random cu_seqlens_k
         cu_seqlens_k = torch.arange(0, l + 1, dtype=torch.int32, device="cuda") * k
         mCuSeqlensK = from_dlpack(cu_seqlens_k, assumed_align=4).mark_layout_dynamic(leading_dim=0)

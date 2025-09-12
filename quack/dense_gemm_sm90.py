@@ -756,7 +756,10 @@ class GemmSm90:
                                 shapes=(cu_seqlens_k[batch_idx + 1], cu_seqlens_k[batch_idx + 1]),
                                 orders=(
                                     0 if const_expr(self.a_layout.is_k_major_a()) else 1,
-                                    1 if const_expr(self.b_layout.is_k_major_b()) else 0,
+                                    # confusingly b_layout is ROW_MAJOR when it's k-major,
+                                    # so the result of b_layout.is_k_major_b() is opposite of
+                                    # what we want.
+                                    0 if const_expr(not self.b_layout.is_k_major_b()) else 1,
                                 ),
                                 tensormap_smem_ptr=None,
                             )
