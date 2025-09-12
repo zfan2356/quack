@@ -352,7 +352,7 @@ def run(
         cu_seqlens_k, mCuSeqlensK = None, None
 
 
-    if varlen_m:  # Need to allocate space in gmem to store tensormaps
+    if varlen_m or varlen_k:  # Need to allocate space in gmem to store tensormaps
         if not persistent:
             total_m = m * l
             block_size_m = tile_shape_mnk[0] * cluster_shape_mnk[0]
@@ -362,13 +362,12 @@ def run(
             total_ctas = total_clusters_max * cluster_shape_mnk[0] * cluster_shape_mnk[1]
         else:
             total_ctas = cutlass.utils.HardwareInfo().get_device_multiprocessor_count()
-        if pingpong:
-            total_ctas *= 2
+        num_tensormaps = 2 if varlen_k else (1 if not pingpong else 2)
         # 128 bytes per tensormap
-        tensormaps_torch = torch.empty(total_ctas, 128 // 8, dtype=torch.int64, device="cuda")
+        tensormaps_torch = torch.empty(total_ctas, num_tensormaps, 128 // 8, dtype=torch.int64, device="cuda")
         tensormaps_tensor = from_dlpack(
             tensormaps_torch, assumed_align=128
-        ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
+        ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2))
     else:
         tensormaps_tensor = None
 

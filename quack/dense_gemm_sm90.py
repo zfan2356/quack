@@ -602,6 +602,7 @@ class GemmSm90:
 
         varlen_m = const_expr(cu_seqlens_m is not None)
         varlen_k = const_expr(cu_seqlens_k is not None)
+        assert not (varlen_m and varlen_k)
         has_D = const_expr(mD_mnl is not None)
         has_C = const_expr(mC_mnl is not None)
 
@@ -662,23 +663,33 @@ class GemmSm90:
         epi_smem_tensors = self.epi_get_smem_tensors(epilogue_params, storage)
 
         # Get tensormap buffer address
-        if const_expr(varlen_m):
+        tensormap_manager = None
+        tensormap_a_ptr, tensormap_b_ptr, tensormap_d_ptr = None, None, None
+        if const_expr(varlen_m or varlen_k):
+            tensormap_manager = TensorMapManagerSm90(
+                cutlass.utils.TensorMapUpdateMode.GMEM, GemmSm90.bytes_per_tensormap
+            )
             grid_dim = cute.arch.grid_dim()
             bid = cute.arch.block_idx()
             tensormap_workspace_idx = (
                 bid[2] * grid_dim[1] * grid_dim[0] + bid[1] * grid_dim[0] + bid[0]
             )
-            # TODO: this is only for D, not for A/B
-            if const_expr(self.pingpong):
-                tensormap_workspace_idx = tensormap_workspace_idx * 2 + warp_idx // 4
-            tensormap_manager = TensorMapManagerSm90(
-                cutlass.utils.TensorMapUpdateMode.GMEM, GemmSm90.bytes_per_tensormap
-            )
-            tensormap_d_ptr = tensormap_manager.get_tensormap_ptr(
-                tensormaps[tensormap_workspace_idx, None].iterator
-            )
-        else:
-            tensormap_manager, tensormap_d_ptr = None, None
+            if const_expr(varlen_m):
+                tensormap_d_ptr = tensormap_manager.get_tensormap_ptr(
+                    tensormaps[
+                        tensormap_workspace_idx,
+                        warp_idx // 4 if const_expr(self.pingpong) else 0,
+                        None,
+                    ].iterator
+                )
+            else:
+                assert varlen_k
+                tensormap_a_ptr = tensormap_manager.get_tensormap_ptr(
+                    tensormaps[tensormap_workspace_idx, 0, None].iterator
+                )
+                tensormap_b_ptr = tensormap_manager.get_tensormap_ptr(
+                    tensormaps[tensormap_workspace_idx, 1, None].iterator
+                )
 
         TileSchedulerCls = partial(
             TileSchedulerCls.create, tile_sched_params, tile_count, sched_pipeline
@@ -690,7 +701,20 @@ class GemmSm90:
                 warp_idx >= self.ab_load_warp_id
                 and warp_idx < self.ab_load_warp_id + self.num_ab_load_warps
             ):
-                # TODO: update tensormap for A & B if varlen_k for bound checking
+                is_tma_warp = self.num_ab_load_warps == 1 or warp_idx == self.ab_load_warp_id
+                if const_expr(varlen_k):
+                    # initialize tensormap for A & B
+                    tensormap_manager.init_tensormap_from_atom(
+                        tma_atom_a,
+                        tensormap_a_ptr,
+                        is_tma_warp,
+                    )
+                    tensormap_manager.init_tensormap_from_atom(
+                        tma_atom_b,
+                        tensormap_b_ptr,
+                        is_tma_warp,
+                    )
+                tensormap_init_done = Boolean(False)
                 # ///////////////////////////////////////////////////////////////////////////////
                 # Get mcast mask
                 # ///////////////////////////////////////////////////////////////////////////////
@@ -714,9 +738,30 @@ class GemmSm90:
                 ab_producer_state = make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.ab_stage
                 )
+                # batch index of last tile
+                last_batch_idx = cutlass.Int32(-1)
                 while work_tile.is_valid_tile:
                     tile_coord_mnkl = work_tile.tile_idx
                     batch_idx = tile_coord_mnkl[3]
+                    if const_expr(varlen_k):
+                        is_group_changed = batch_idx != last_batch_idx
+                        last_batch_idx = batch_idx
+                        if is_group_changed:
+                            # wait tensormap initialization complete before update
+                            if not tensormap_init_done:
+                                tensormap_manager.fence_tensormap_initialization()
+                                tensormap_init_done = True
+                            # construct tensor A/B based on real address, shape and stride information
+                            tensormap_manager.update_tensormap_shape(
+                                (tensormap_a_ptr, tensormap_b_ptr),
+                                is_manager_warp=is_tma_warp,
+                                shapes=(cu_seqlens_k[batch_idx + 1],),
+                                orders=(
+                                    0 if const_expr(self.a_layout.is_k_major_a()) else 1,
+                                    0 if const_expr(self.b_layout.is_k_major_b()) else 1,
+                                ),
+                                tensormap_smem_ptr=None,
+                            )
                     # ///////////////////////////////////////////////////////////////////////////
                     #  Local_tile partition global tensors
                     # ///////////////////////////////////////////////////////////////////////////
@@ -755,6 +800,19 @@ class GemmSm90:
                     # //////////////////////////////////////////////////////////////////////////
                     #  Partition shared tensor for TMA load A/B
                     # //////////////////////////////////////////////////////////////////////////
+                    if const_expr(varlen_k):
+                        # ensure the update to tensormap has completed before using it
+                        if is_group_changed and is_tma_warp:
+                            tensormap_manager.fence_tensormap_update(tensormap_a_ptr)
+                            tensormap_manager.fence_tensormap_update(tensormap_b_ptr)
+                        tma_desc_a_ptr = tensormap_manager.get_tensormap_ptr(
+                            tensormap_a_ptr, cute.AddressSpace.generic
+                        )
+                        tma_desc_b_ptr = tensormap_manager.get_tensormap_ptr(
+                            tensormap_b_ptr, cute.AddressSpace.generic
+                        )
+                    else:
+                        tma_desc_a_ptr, tma_desc_b_ptr = None, None
                     #  TMA load A partition_S/D
                     a_cta_layout = cute.make_layout(
                         cute.slice_(cluster_layout_mnk, (0, None, 0)).shape
@@ -769,7 +827,12 @@ class GemmSm90:
                             cute.group_modes(sA, 0, 2),
                             cute.group_modes(gA_k, 0, 2),
                         )
-                        copy_A = partial(cute.copy, tma_atom_a, mcast_mask=a_mcast_mask)
+                        copy_A = partial(
+                            cute.copy,
+                            tma_atom_a,
+                            mcast_mask=a_mcast_mask,
+                            tma_desc_ptr=tma_desc_a_ptr,
+                        )
                     else:
                         tiled_copy_A = self._make_gmem_tiled_copy_A(
                             mA_mkl.element_type, self.a_layout, self.num_ab_load_threads
@@ -797,7 +860,9 @@ class GemmSm90:
                         cute.group_modes(sB, 0, 2),
                         cute.group_modes(gB_k, 0, 2),
                     )
-                    copy_B = partial(cute.copy, tma_atom_b, mcast_mask=b_mcast_mask)
+                    copy_B = partial(
+                        cute.copy, tma_atom_b, mcast_mask=b_mcast_mask, tma_desc_ptr=tma_desc_b_ptr
+                    )
                     k_len = (
                         cu_seqlens_k[batch_idx + 1] - cu_seqlens_k[batch_idx]
                         if const_expr(varlen_k)
@@ -930,7 +995,7 @@ class GemmSm90:
                     if is_group_changed:
                         # construct tensor D based on real address, shape and stride information
                         tensormap_manager.update_tensormap_shape(
-                            ((tensormap_d_ptr),),
+                            (tensormap_d_ptr,),
                             is_manager_warp=is_tma_warp,
                             shapes=(cu_seqlens_m[batch_idx + 1],),
                             orders=(0 if const_expr(self.d_layout.is_m_major_c()) else 1,),
@@ -975,11 +1040,11 @@ class GemmSm90:
                     # ensure the update to tensormap has completed before using it
                     if is_group_changed and is_tma_warp:
                         tensormap_manager.fence_tensormap_update(tensormap_d_ptr)
-                    tma_desc_ptr = tensormap_manager.get_tensormap_ptr(
+                    tma_desc_d_ptr = tensormap_manager.get_tensormap_ptr(
                         tensormap_d_ptr, cute.AddressSpace.generic
                     )
                 else:
-                    tma_desc_ptr = None
+                    tma_desc_d_ptr = None
 
                 if const_expr(has_D):
                     bSG_sD, bSG_gD = self.epilog_gmem_copy_and_partition(
@@ -991,7 +1056,7 @@ class GemmSm90:
                         tile_coord_mnkl,
                         cu_seqlens_m,
                     )
-                    copy_D = partial(cute.copy, tma_atom_d, tma_desc_ptr=tma_desc_ptr)
+                    copy_D = partial(cute.copy, tma_atom_d, tma_desc_ptr=tma_desc_d_ptr)
                 else:
                     bSG_sD, bSG_gD, copy_D = None, None, None
                 if const_expr(has_C):

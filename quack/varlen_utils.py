@@ -16,6 +16,7 @@ class VarlenArguments(ArgumentsBase):
     mTensormaps: Optional[cute.Tensor] = None
 
     def __post_init__(self):
-        assert all(x is None for x in [self.mCuSeqlensM, self.mTensormaps]) or all(
-            x is not None for x in [self.mCuSeqlensM, self.mTensormaps]
-        ), "All two fields (mCuSeqlensM, mTensormaps) must be either all None or all not None"
+        if self.mCuSeqlensM is not None or self.mCuSeqlensK is not None:
+            assert (
+                self.mTensormaps is not None
+            ), "mTensormaps must be provided if mCuSeqlensM or mCuSeqlensK is provided"
