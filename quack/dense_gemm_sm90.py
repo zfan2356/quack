@@ -162,7 +162,6 @@ class GemmSm90:
         self.gather_A = gather_A
         if gather_A:
             assert cluster_shape_mnk[1] == 1, "Cluster shape N must be 1 for gather A "
-        self.tensormap_update_mode = cutlass.utils.TensorMapUpdateMode.GMEM
 
         self.cluster_shape_mnk = cluster_shape_mnk
         self.tile_shape_mnk = tuple(tile_shape_mnk)
@@ -486,19 +485,8 @@ class GemmSm90:
         )
         epi_c_smem_size = cute.cosize(self.epi_c_smem_layout_staged) if mC is not None else 0
 
-        size_tensormap_in_i64 = (
-            0
-            if varlen_args.mCuSeqlensM is None
-            or self.tensormap_update_mode == cutlass.utils.TensorMapUpdateMode.GMEM
-            else GemmSm90.num_tensormaps * GemmSm90.bytes_per_tensormap // 8
-        ) * (1 if not self.pingpong else 2)
-
         @cute.struct
         class SharedStorage:
-            tensormap_buffer: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Int64, size_tensormap_in_i64],
-                64,
-            ]
             ab_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             epi_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.epi_c_stage * 2]
             sched_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.sched_stage * 2]
@@ -685,30 +673,13 @@ class GemmSm90:
             if const_expr(self.pingpong):
                 tensormap_workspace_idx = tensormap_workspace_idx * 2 + warp_idx // 4
             tensormap_manager = TensorMapManagerSm90(
-                self.tensormap_update_mode, GemmSm90.bytes_per_tensormap
+                cutlass.utils.TensorMapUpdateMode.GMEM, GemmSm90.bytes_per_tensormap
             )
             tensormap_d_ptr = tensormap_manager.get_tensormap_ptr(
                 tensormaps[tensormap_workspace_idx, None].iterator
             )
-            if const_expr(self.tensormap_update_mode == cutlass.utils.TensorMapUpdateMode.SMEM):
-                tensormap_smem_ptr = storage.tensormap_buffer.data_ptr()
-                tensormap_d_smem_ptr = tensormap_smem_ptr + (warp_idx // 4) * (
-                    GemmSm90.bytes_per_tensormap // 8
-                )
-                # Need this, otherwise "expected tma descriptor pointer to have alignment at least 64, but got 8"
-                tensormap_d_smem_ptr = cute.make_ptr(
-                    cutlass.Int64,
-                    tensormap_d_smem_ptr.toint(),
-                    cute.AddressSpace.smem,
-                    assumed_align=64,
-                )
-                tensormap_d_init_ptr = tensormap_d_smem_ptr
-            else:
-                tensormap_d_smem_ptr = None
-                tensormap_d_init_ptr = tensormap_d_ptr
         else:
-            tensormap_d_smem_ptr = None
-            tensormap_manager, tensormap_d_ptr, tensormap_d_init_ptr = None, None, None
+            tensormap_manager, tensormap_d_ptr = None, None
 
         TileSchedulerCls = partial(
             TileSchedulerCls.create, tile_sched_params, tile_count, sched_pipeline
@@ -889,7 +860,7 @@ class GemmSm90:
                 # initialize tensormap for D
                 tensormap_manager.init_tensormap_from_atom(
                     tma_atom_d,
-                    tensormap_d_init_ptr,
+                    tensormap_d_ptr,
                     is_manager_warp=is_tma_warp,
                 )
             # //////////////////////////////////////////////////////////////////////////////
@@ -961,9 +932,9 @@ class GemmSm90:
                         tensormap_manager.update_tensormap_shape(
                             ((tensormap_d_ptr),),
                             is_manager_warp=is_tma_warp,
-                            tensormap_smem_ptr=(tensormap_d_smem_ptr,),
                             shapes=(cu_seqlens_m[batch_idx + 1],),
                             orders=(0 if const_expr(self.d_layout.is_m_major_c()) else 1,),
+                            tensormap_smem_ptr=None,
                         )
 
                 k_len = (
@@ -1002,9 +973,8 @@ class GemmSm90:
 
                 if const_expr(varlen_m):
                     # ensure the update to tensormap has completed before using it
-                    if is_group_changed:
-                        if is_tma_warp:
-                            tensormap_manager.fence_tensormap_update(tensormap_d_ptr)
+                    if is_group_changed and is_tma_warp:
+                        tensormap_manager.fence_tensormap_update(tensormap_d_ptr)
                     tma_desc_ptr = tensormap_manager.get_tensormap_ptr(
                         tensormap_d_ptr, cute.AddressSpace.generic
                     )
