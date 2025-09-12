@@ -123,7 +123,6 @@ class GemmSm90:
     """
 
     bytes_per_tensormap = 128
-    num_tensormaps = 1  # For D only
 
     EpilogueArguments = ArgumentsBase
     EpilogueParams = ParamsBase
@@ -896,6 +895,7 @@ class GemmSm90:
                     self.pingpong_barrier_arrive(warp_group_idx=0, stage="mma")
                     self.pingpong_barrier_arrive(warp_group_idx=0, stage="epi")
 
+            k_tile_cnt_static = cute.ceil_div(mA_mkl.shape[1], self.tile_shape_mnk[2])
             c_tile_cnt = cute.size(cute.ceil_div(self.tile_shape_mnk[:2], self.epi_tile))
 
             ab_read_state = make_pipeline_state(pipeline.PipelineUserType.Consumer, self.ab_stage)
@@ -912,7 +912,7 @@ class GemmSm90:
                     # Advance 2nd Math WG to the next work tile for the startup
                     tile_scheduler.advance_to_next_work()
                     # Advance 2nd Math WG pipeline states to the end of 1st Math WG
-                    ab_read_state.advance_iters(k_tile_cnt)
+                    ab_read_state.advance_iters(k_tile_cnt_static)
                     epi_read_state.advance_iters(c_tile_cnt)
                     epi_producer_state.advance_iters(c_tile_cnt)
             work_tile = tile_scheduler.initial_work_tile_info()
@@ -959,7 +959,7 @@ class GemmSm90:
                         acc.fill(0.0)
                 if const_expr(self.pingpong):
                     # Update starting mainloop pipeline state for the next tile
-                    ab_read_state.advance_iters(k_tile_cnt)
+                    ab_read_state.advance_iters(k_tile_cnt_static)
 
                 # /////////////////////////////////////////////////////////////////////////////
                 #  EPILOGUE
