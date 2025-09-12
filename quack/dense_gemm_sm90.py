@@ -603,6 +603,7 @@ class GemmSm90:
         varlen_m = const_expr(cu_seqlens_m is not None)
         varlen_k = const_expr(cu_seqlens_k is not None)
         assert not (varlen_m and varlen_k)
+        assert not (varlen_k and self.pingpong), "Varlen K with pingpong is not supported"
         has_D = const_expr(mD_mnl is not None)
         has_C = const_expr(mC_mnl is not None)
 
@@ -669,11 +670,8 @@ class GemmSm90:
             tensormap_manager = TensorMapManagerSm90(
                 cutlass.utils.TensorMapUpdateMode.GMEM, GemmSm90.bytes_per_tensormap
             )
-            grid_dim = cute.arch.grid_dim()
-            bid = cute.arch.block_idx()
-            tensormap_workspace_idx = (
-                bid[2] * grid_dim[1] * grid_dim[0] + bid[1] * grid_dim[0] + bid[0]
-            )
+            # equivalent to bidx + bidy * gridDim.x + bidxz * gridDim.x * gridDim.y
+            tensormap_workspace_idx = cute.make_layout(cute.arch.grid_dim())(cute.arch.block_idx())
             if const_expr(varlen_m):
                 tensormap_d_ptr = tensormap_manager.get_tensormap_ptr(
                     tensormaps[
@@ -755,10 +753,10 @@ class GemmSm90:
                             tensormap_manager.update_tensormap_shape(
                                 (tensormap_a_ptr, tensormap_b_ptr),
                                 is_manager_warp=is_tma_warp,
-                                shapes=(cu_seqlens_k[batch_idx + 1],),
+                                shapes=(cu_seqlens_k[batch_idx + 1], cu_seqlens_k[batch_idx + 1]),
                                 orders=(
                                     0 if const_expr(self.a_layout.is_k_major_a()) else 1,
-                                    0 if const_expr(self.b_layout.is_k_major_b()) else 1,
+                                    1 if const_expr(self.b_layout.is_k_major_b()) else 0,
                                 ),
                                 tensormap_smem_ptr=None,
                             )
