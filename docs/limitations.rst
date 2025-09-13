@@ -219,19 +219,3 @@ For reliable and predictable results:
                  #  or `float(1)`
     beta = 2.0   # Explicitly defined as float
     result = max(alpha, beta)  # Will correctly perform float comparison
-
-**Debugging Capabilities**
-    Debugging tools and facilities for the Python DSL are currently more limited in comparison to the C++
-    API. For instance, we don't support single-stepping through the JIT-compiled code. And lack of exception
-    handling in JIT-compiled code makes it hard to debug in some cases.
-
-**Integration with Frameworks**
-    Integration with certain deep learning frameworks is in early development stages and may have
-    limitations. For instance, converting frameworking tensor to cute.Tensor is known to have overhead
-    with 2us~3us per tensor as we convert from general DLPack protocol which offers comptibility with
-    all frameworks.
-
-**Hashing DSL APIs and Objects**
-    DSL APIs and Objects are sensitive to MLIR context, region or other contextual information which has no meaning cross
-    different context. Any stateful design rely on ``__hash__`` likely misbehave with unexpected results. An example is
-    ``functools.lru_cache``, which combined with ``@cute.jit``, it may cache MLIR object from one context and use in another one.
