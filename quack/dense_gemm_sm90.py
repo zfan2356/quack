@@ -462,6 +462,7 @@ class GemmSm90:
                 group_size=scheduler_args.max_swizzle_size,
                 cluster_shape_mnk=self.cluster_shape_mnk,
                 tile_count_semaphore=scheduler_args.tile_count_semaphore,
+                batch_idx_permute=scheduler_args.batch_idx_permute,
                 is_persistent=self.is_persistent,
             )
         else:

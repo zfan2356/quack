@@ -134,6 +134,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--pingpong", action="store_true", help="Pingpong kernel")
     parser.add_argument("--varlen_m", action="store_true", help="Variable length M dimension")
     parser.add_argument("--varlen_k", action="store_true", help="Variable length K dimension")
+    parser.add_argument("--permute_batch", action="store_true", help="Permute batch in varlen_k")
     parser.add_argument("--gather_A", action="store_true", help="Gather A")
     parser.add_argument("--fp8_fast_accum", action="store_true", help="FP8 fast accum")
     parser.add_argument("--skip_ref_check", action="store_true", help="Skip reference checking")
@@ -172,6 +173,7 @@ def run(
     pingpong: bool,
     varlen_m: bool,
     varlen_k: bool,
+    permute_batch: bool,
     gather_A: bool,
     fp8_fast_accum: bool,
     **kwargs,
@@ -394,11 +396,17 @@ def run(
     else:
         max_active_clusters = 0
         tile_count_semaphore = None
+    if permute_batch:
+        batch_idx_permute = torch.randperm(l, dtype=torch.int32, device="cuda")
+        batch_idx_permute_tensor = from_dlpack(batch_idx_permute, assumed_align=4).mark_layout_dynamic(leading_dim=0)
+    else:
+        batch_idx_permute_tensor = None
     scheduler_args = TileSchedulerOptions(
         Int32(max_active_clusters),
         tile_count_semaphore=make_ptr(
             Int32, tile_count_semaphore.data_ptr(), cute.AddressSpace.gmem, assumed_align=4
         ) if tile_count_semaphore is not None else None,
+        batch_idx_permute=batch_idx_permute_tensor
     )
 
     epi_args = gemm.EpilogueArguments()
@@ -584,6 +592,7 @@ if __name__ == "__main__":
         args.pingpong,
         args.varlen_m,
         args.varlen_k,
+        args.permute_batch,
         args.gather_A,
         args.fp8_fast_accum,
     )
