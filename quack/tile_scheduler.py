@@ -286,7 +286,8 @@ class TileScheduler:
             if const_expr(params.tile_count_semaphore is None):  # Static persistent
                 self._current_work_linear_idx += advance_count * Int32(num_persistent_clusters)
             else:  # Dynamic persistent
-                self._pipeline_state.advance_iters(advance_count - 1)
+                if const_expr(advance_count > 1):
+                    self._pipeline_state.advance_iters(advance_count - 1)
                 current_work_linear_idx = self._current_work_linear_idx
                 if is_scheduler_warp:
                     self._scheduler_pipeline.producer_acquire(self._pipeline_state)

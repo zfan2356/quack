@@ -603,7 +603,6 @@ class GemmSm90:
         varlen_m = const_expr(cu_seqlens_m is not None)
         varlen_k = const_expr(cu_seqlens_k is not None)
         assert not (varlen_m and varlen_k)
-        assert not (varlen_k and self.pingpong), "Varlen K with pingpong is not supported"
         has_D = const_expr(mD_mnl is not None)
         has_C = const_expr(mC_mnl is not None)
 
@@ -643,6 +642,7 @@ class GemmSm90:
             sched_pipeline = self.make_sched_pipeline(
                 cluster_layout_mnk,
                 sched_pipeline_mbar_ptr=storage.sched_pipeline_array_ptr.data_ptr(),
+                varlen_k=varlen_k,
             )
             tile_count = storage.tile_count.get_tensor((self.sched_stage,))
 
@@ -673,12 +673,9 @@ class GemmSm90:
             # equivalent to bidx + bidy * gridDim.x + bidxz * gridDim.x * gridDim.y
             tensormap_workspace_idx = cute.make_layout(cute.arch.grid_dim())(cute.arch.block_idx())
             if const_expr(varlen_m):
+                tensormap_d_idx = warp_idx // 4 if const_expr(self.pingpong) else 0
                 tensormap_d_ptr = tensormap_manager.get_tensormap_ptr(
-                    tensormaps[
-                        tensormap_workspace_idx,
-                        warp_idx // 4 if const_expr(self.pingpong) else 0,
-                        None,
-                    ].iterator
+                    tensormaps[tensormap_workspace_idx, tensormap_d_idx, None].iterator
                 )
             else:
                 assert varlen_k
@@ -712,7 +709,6 @@ class GemmSm90:
                         tensormap_b_ptr,
                         is_tma_warp,
                     )
-                tensormap_init_done = Boolean(False)
                 # ///////////////////////////////////////////////////////////////////////////////
                 # Get mcast mask
                 # ///////////////////////////////////////////////////////////////////////////////
@@ -736,6 +732,9 @@ class GemmSm90:
                 ab_producer_state = make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.ab_stage
                 )
+                if const_expr(varlen_k):
+                    # wait tensormap initialization complete before update
+                    tensormap_manager.fence_tensormap_initialization()
                 # batch index of last tile
                 last_batch_idx = cutlass.Int32(-1)
                 while work_tile.is_valid_tile:
@@ -745,10 +744,6 @@ class GemmSm90:
                         is_group_changed = batch_idx != last_batch_idx
                         last_batch_idx = batch_idx
                         if is_group_changed:
-                            # wait tensormap initialization complete before update
-                            if not tensormap_init_done:
-                                tensormap_manager.fence_tensormap_initialization()
-                                tensormap_init_done = True
                             # construct tensor A/B based on real address, shape and stride information
                             tensormap_manager.update_tensormap_shape(
                                 (tensormap_a_ptr, tensormap_b_ptr),
@@ -757,7 +752,7 @@ class GemmSm90:
                                 orders=(
                                     0 if const_expr(self.a_layout.is_k_major_a()) else 1,
                                     # confusingly b_layout is ROW_MAJOR when it's k-major,
-                                    # so the result of b_layout.is_k_major_b() is opposite of
+                                    # so the result of b_layout.is_k_major_b() is the opposite of
                                     # what we want.
                                     0 if const_expr(not self.b_layout.is_k_major_b()) else 1,
                                 ),
@@ -908,7 +903,7 @@ class GemmSm90:
                     tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
                     work_tile = tile_scheduler.get_current_work()
                     # End of persistent scheduler loop
-                if const_expr(self.pingpong):
+                if const_expr(self.pingpong and not varlen_k):
                     # Need to write the tile_idx to smem for the next WG in the pingpong mode
                     tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
                 ab_pipeline.producer_tail(ab_producer_state)
@@ -972,16 +967,28 @@ class GemmSm90:
                 pipeline.PipelineUserType.Producer, self.epi_c_stage
             )
             tile_scheduler = TileSchedulerCls()
+            work_tile = None
             if const_expr(self.pingpong):
-                # TODO: pingpong doesn't work w varlen_k for now
+                if const_expr(varlen_k):
+                    work_tile = tile_scheduler.initial_work_tile_info()
                 if warp_idx >= 4:
-                    # Advance 2nd Math WG to the next work tile for the startup
-                    tile_scheduler.advance_to_next_work()
                     # Advance 2nd Math WG pipeline states to the end of 1st Math WG
-                    ab_read_state.advance_iters(k_tile_cnt_static)
                     epi_read_state.advance_iters(c_tile_cnt)
                     epi_producer_state.advance_iters(c_tile_cnt)
-            work_tile = tile_scheduler.initial_work_tile_info()
+                    if const_expr(not varlen_k):
+                        ab_read_state.advance_iters(k_tile_cnt_static)
+                    else:
+                        batch_idx = work_tile.tile_idx[3]
+                        k_len = cu_seqlens_k[batch_idx + 1] - cu_seqlens_k[batch_idx]
+                        k_tile_cnt = cute.ceil_div(k_len, self.tile_shape_mnk[2])
+                        ab_read_state.advance_iters(k_tile_cnt)
+                    tile_scheduler.advance_to_next_work()
+                    if const_expr(varlen_k):
+                        work_tile = tile_scheduler.get_current_work()
+                if const_expr(not varlen_k):
+                    work_tile = tile_scheduler.initial_work_tile_info()
+            else:
+                work_tile = tile_scheduler.initial_work_tile_info()
             if const_expr(varlen_m):
                 # wait tensormap initialization complete before update
                 tensormap_manager.fence_tensormap_initialization()
@@ -1023,9 +1030,6 @@ class GemmSm90:
                 if const_expr(varlen_k):
                     if k_tile_cnt == 0:
                         acc.fill(0.0)
-                if const_expr(self.pingpong):
-                    # Update starting mainloop pipeline state for the next tile
-                    ab_read_state.advance_iters(k_tile_cnt_static)
 
                 # /////////////////////////////////////////////////////////////////////////////
                 #  EPILOGUE
@@ -1121,9 +1125,6 @@ class GemmSm90:
                 )
 
                 if const_expr(self.pingpong):
-                    # Update starting load/store pipeline states for the next tile
-                    epi_read_state.advance_iters(c_tile_cnt)
-                    epi_producer_state.advance_iters(c_tile_cnt)
                     # With pingpong, 2 WGs write two different output tiles to the same smem,
                     # so we have to make sure the smem content is done reading before signaling
                     # the next WG's epilogue.
@@ -1131,10 +1132,28 @@ class GemmSm90:
                         cute.arch.cp_async_bulk_wait_group(0, read=True)
                     self.pingpong_barrier_arrive(1 - warp_group_idx, stage="epi")
 
-                tile_scheduler.advance_to_next_work(
-                    advance_count=1 if not self.pingpong else self.mma_warp_groups
-                )
-                work_tile = tile_scheduler.get_current_work()
+                if const_expr(not self.pingpong):
+                    tile_scheduler.advance_to_next_work()
+                    work_tile = tile_scheduler.get_current_work()
+                else:  # Skip a tile for pingpong
+                    # Update starting load/store pipeline states for the next tile
+                    epi_read_state.advance_iters(c_tile_cnt)
+                    epi_producer_state.advance_iters(c_tile_cnt)
+                    # Update starting mainloop pipeline state for the next tile
+                    if const_expr(not varlen_k):
+                        ab_read_state.advance_iters(k_tile_cnt_static)
+                        tile_scheduler.advance_to_next_work(advance_count=self.mma_warp_groups)
+                        work_tile = tile_scheduler.get_current_work()
+                    else:
+                        tile_scheduler.advance_to_next_work()
+                        work_tile = tile_scheduler.get_current_work()
+                        if work_tile.is_valid_tile:
+                            batch_idx = work_tile.tile_idx[3]
+                            k_len = cu_seqlens_k[batch_idx + 1] - cu_seqlens_k[batch_idx]
+                            k_tile_cnt = cute.ceil_div(k_len, self.tile_shape_mnk[2])
+                            ab_read_state.advance_iters(k_tile_cnt)
+                            tile_scheduler.advance_to_next_work()
+                            work_tile = tile_scheduler.get_current_work()
                 # End of persistent scheduler loop
 
             if const_expr(not self.pingpong):
@@ -1313,7 +1332,6 @@ class GemmSm90:
             peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_read_state)
         tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
         num_k_blocks = cute.size(tCrA, mode=[2])
-        # TODO: this is probably not correct if k_tile_cnt == 0
         for k_tile in cutlass.range(num_prologue_mma):
             # Wait for A/B buffer to be ready
             ab_pipeline.consumer_wait(ab_read_state, peek_ab_full_status)
@@ -1327,6 +1345,8 @@ class GemmSm90:
             peek_ab_full_status = Boolean(True)
             if k_tile + 1 < k_tile_cnt:
                 peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_read_state)
+        # If k_tile_cnt == 0, this is not correct. But we will set acc to 0 in the mainloop
+        # in that case.
         if const_expr(self.fp8_slow_accum):
             warpgroup.wait_group(0)
             acc_slow.store(acc.load())
@@ -1676,14 +1696,17 @@ class GemmSm90:
         )
 
     def make_sched_pipeline(
-        self, cluster_layout_mnk: cute.Layout, sched_pipeline_mbar_ptr: cute.Pointer
+        self, cluster_layout_mnk: cute.Layout, sched_pipeline_mbar_ptr: cute.Pointer, varlen_k: bool
     ):
         # Threads/warps participating in this pipeline
         sched_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         cluster_size = cute.size(cluster_layout_mnk)
         # Each warp that are not the scheduler warp will contribute 1 to the arrive count
+        # If pingpong and varlen_k, then all 8 mma warps will participate in the scheduler barrier
+        # at each round. If pingpong and not varlen_k, then only 4 mma warp will participate.
         consumer_arrive_cnt = (
-            (self.mma_warp_groups if not self.pingpong else 1) * 4 + self.num_ab_load_warps
+            (self.mma_warp_groups if not (self.pingpong and not varlen_k) else 1) * 4
+            + self.num_ab_load_warps
         ) * cluster_size - 1
         sched_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt

@@ -337,7 +337,6 @@ def run(
         cu_seqlens_m, mCuSeqlensM = None, None
 
     if varlen_k:
-        assert not pingpong
         from einops import rearrange
         assert not gather_A
 
