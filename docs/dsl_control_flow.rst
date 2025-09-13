@@ -19,9 +19,6 @@ while the compiler decides—statement by statement—whether to
 
 Passing |IR| values to a native Python control flow will result in an error.
 
-For a high-level discussion of the overall pipeline, see
-:doc:`the code-generation overview <dsl_code_generation>`.
-
 
 For Loops
 ---------
