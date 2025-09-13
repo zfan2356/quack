@@ -10,6 +10,11 @@ import cutlass.torch as cutlass_torch
 
 from quack.topk import topk
 
+try:
+    import rtopk
+except ImportError:
+    rtopk = None
+
 
 def run_topk(
     M,
@@ -58,9 +63,20 @@ def run_topk(
     speedup = avg_time_ref / avg_time
     print(f"Speedup: {speedup:.2f}x")
 
+    if rtopk is not None:
+        fn_rtopk = lambda: rtopk.ops.rtopk(x, k, max_iter=512)
+        for _ in range(5): fn_rtopk()  # warm up
+        time.sleep(0.5)
+        avg_time_ref = do_bench(fn_rtopk, warmup=warmup_iterations, rep=iterations)
+        mem_bw_ref = round(mem_accessed / (avg_time_ref / 1000) / 1e9, 2)
+        print(f"RTopK kernel execution time: {avg_time_ref:.4f} ms")
+        print(f"RTopK mem throughput: {mem_bw_ref:.2f} GB/s")
+
     # do_bench doesn't seem very accurate for very fast kernels, so we use pytorch_profiler
     from flash_attn.utils.benchmark import pytorch_profiler
     pytorch_profiler(fn)
+    if rtopk is not None:
+        pytorch_profiler(fn_rtopk)
 
     return mem_bw, mem_bw_ref, speedup
 
