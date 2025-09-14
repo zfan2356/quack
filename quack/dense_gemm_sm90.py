@@ -1523,11 +1523,11 @@ class GemmSm90:
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
         # Apply alpha scaling to accumulator if alpha is provided (not None)
-        if const_expr(params.alpha is not None):
+        if const_expr(hasattr(params, "alpha") and params.alpha is not None):
             tRS_rD.store(tRS_rD.load() * params.alpha)
         # Apply C with beta scaling
         if const_expr(tRS_rC is not None):
-            if const_expr(params.beta is None):
+            if const_expr(not hasattr(params, "beta") or params.beta is None):
                 # beta is None, default behavior: add C (beta=1.0)
                 tRS_rD.store(tRS_rD.load() + tRS_rC.load().to(tRS_rD.element_type))
             else:

@@ -97,7 +97,7 @@ class LinearFunc(torch.autograd.Function):
 
 
 class LinearUntunedFunc(LinearFunc):
-    # Passing in config=None to disable tuning at runtime
+    # Passing in tuned=False to disable tuning at runtime
     matmul_fwd_fn = partial(gemm, tuned=False)
     matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False)
     matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
@@ -140,7 +140,7 @@ class LinearActFunc(LinearFunc):
 
 
 class LinearActUntunedFunc(LinearActFunc):
-    # Passing in config=None to disable tuning at runtime
+    # Passing in tuned=False to disable tuning at runtime
     matmul_fwd_fn = partial(gemm_act, tuned=False)
     matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False)
     matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
@@ -203,7 +203,7 @@ class DActLinearFunc(LinearFunc):
 
 
 class DActLinearUntunedFunc(DActLinearFunc):
-    # Passing in config=None to disable tuning at runtime
+    # Passing in tuned=False to disable tuning at runtime
     matmul_fwd_fn = partial(gemm, tuned=False)
     matmul_bwd_dx = partial(gemm_dact, dynamic_scheduler=True, tuned=False)
     matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
