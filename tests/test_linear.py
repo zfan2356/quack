@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from quack.linear import linear_func, linear_act_func
-from quack.gemm_interface import gemm_dact, gemm_act_ref, gemm_dact_ref
+from quack.gemm_interface import gemm_dact, gemm_act_ref, gemm_dact_ref, gemm_add_inplace
 
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
@@ -84,3 +84,22 @@ def test_gemm_dact(n, k, input_dtype, activation):
     dx_pt, postact_pt = gemm_dact_ref(dout_input, weight.T, preact, activation=activation)
     assert (dx - dx_ref).abs().max() < 2 * (dx_pt - dx_ref).abs().max() + 1e-5
     assert (postact - postact_ref).abs().max() < 2 * (postact_pt - postact_ref).abs().max() + 1e-5
+
+
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("n", [1504, 2048])
+@pytest.mark.parametrize("k", [736, 1024])
+@pytest.mark.parametrize("m", [960, 1920])
+def test_gemm_add_inplace(m, k, n, input_dtype):
+    """Test in-place GEMM with addition: C += A @ B."""
+    device = "cuda"
+    torch.random.manual_seed(0)
+    A = torch.randn((m, k), device=device, dtype=input_dtype)
+    B = torch.randn((k, n), device=device, dtype=input_dtype)
+    C = torch.randn((m, n), device=device, dtype=input_dtype)
+    # Save original C for reference computation
+    C_og = C.clone()
+    gemm_add_inplace(A, B, C, tuned=False)
+    C_ref = C_og.float() + torch.mm(A.float(), B.float())
+    C_pt = C_og + torch.mm(A, B)
+    assert (C - C_ref).abs().max() < 2 * (C_pt - C_ref).abs().max() + 1e-5

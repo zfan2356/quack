@@ -273,8 +273,8 @@ def gemm_act_sm90(
     cluster_N: int,
     pingpong: bool = False,
     persistent: bool = True,
-    alpha: Optional[float] = None,
-    beta: Optional[float] = None,
+    alpha: float = 1.0,
+    beta: float = 1.0,
 ) -> None:
     tile_count_semaphore = None
     assert activation in act_fn_map, f"Unsupported activation {activation}"
@@ -311,8 +311,8 @@ def gemm_act_sm90(
     epi_args = GemmActSm90.EpilogueArguments(
         tensor_infos["PostAct"].cute_tensor,
         act_fn,
-        alpha=Float32(alpha) if alpha is not None else None,
-        beta=Float32(beta) if beta is not None else None,
+        alpha=Float32(alpha) if alpha != 1.0 else None,
+        beta=Float32(beta) if beta != 1.0 else None,
     )
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters, tile_count_semaphore
@@ -326,8 +326,8 @@ def gemm_act_sm90(
         pingpong,
         persistent,
         tile_count_semaphore is not None,
-        alpha is not None,
-        beta is not None,
+        alpha != 1.0,
+        beta != 1.0,
         key_tensor_names=("A", "B", "D", "PostAct", "C"),
     )
     cache = gemm_act_sm90.compile_cache

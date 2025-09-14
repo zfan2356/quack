@@ -2145,8 +2145,8 @@ def gemm_sm90(
     cluster_N: int,
     pingpong: bool = False,
     persistent: bool = True,
-    alpha: Optional[float] = None,
-    beta: Optional[float] = None,
+    alpha: float = 1.0,
+    beta: float = 1.0,
 ) -> None:
     L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(A, B, D, C)
     GemmWrapperBase.permute_tensors(tensor_infos)
@@ -2175,8 +2175,8 @@ def gemm_sm90(
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
     GemmWrapperBase.create_cute_tensors(tensor_infos, major_configs)
     epi_args = GemmSm90.EpilogueArguments(
-        alpha=Float32(alpha) if alpha is not None else None,
-        beta=Float32(beta) if beta is not None else None,
+        alpha=Float32(alpha) if alpha != 1.0 else None,
+        beta=Float32(beta) if beta != 1.0 else None,
     )
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters, tile_count_semaphore
@@ -2190,8 +2190,8 @@ def gemm_sm90(
         pingpong,
         persistent,
         tile_count_semaphore is not None,
-        alpha is not None,
-        beta is not None,
+        alpha != 1.0,
+        beta != 1.0,
         key_tensor_names=("A", "B", "D", "C"),
     )
     cache = gemm_sm90.compile_cache

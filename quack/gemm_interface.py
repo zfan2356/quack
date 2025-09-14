@@ -236,6 +236,26 @@ def gemm_add_ref(
     return torch.addmm(C, A, B, out_dtype=out_dtype, out=out)
 
 
+@torch.library.custom_op("quack::gemm_add_inplace", mutates_args=("out",), device_types="cuda")
+def gemm_add_inplace(
+    A: Tensor,
+    B: Tensor,
+    out: Tensor,
+    dynamic_scheduler: bool = False,
+    tuned: bool = True,
+) -> None:
+    """In-place GEMM with addition: out += A @ B.
+    Args:
+        A: (M, K) input tensor
+        B: (K, N) input tensor
+        out: (M, N) tensor to accumulate into (modified in-place)
+        dynamic_scheduler: Whether to use dynamic scheduler
+        tuned: Whether to use autotuned configuration
+    """
+    fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
+    fn(A, B, out, out, dynamic_scheduler)  # Use C as both input bias and output
+
+
 def gemm_act(
     A: Tensor,
     B: Tensor,
@@ -434,3 +454,14 @@ def gemm_dgated_ref(
     # Interleave gradients back
     dx = torch.stack([dgate, dup], dim=-1).reshape(PreAct.shape)
     return dx.to(out_dtype), postact.to(postact_dtype)
+
+
+# TODO: this is not quite right, do we need to register gemm_add not gemm_add_out?
+# try:
+#     from torch._inductor.fx_passes.reinplace import InplaceableOp
+#     torch._inductor.fx_passes.reinplace.inplaceable_ops.update({
+#         torch.ops.quack.gemm_add_out.default:
+#         InplaceableOp(torch.ops.quack.gemm_add_inplace.default, mutated_arg=2)
+#     })
+# except ImportError:
+#     pass
