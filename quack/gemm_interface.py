@@ -55,30 +55,33 @@ gated_to_pytorch_fn_map = {
 
 @autotune(
     configs=[AutotuneConfig(config=c) for c in get_all_configs()],
-    key=["out_dtype", "dynamic_scheduler"],
+    key=["dynamic_scheduler"],
 )
 def gemm_tuned(
     A: Tensor,  # (M, K)
     B: Tensor,  # (K, N)
+    out: Tensor,  # (M, N) - required output tensor
     C: Optional[Tensor] = None,  # (M, N)
-    out_dtype: Optional[torch.dtype] = None,
     dynamic_scheduler: bool = False,
     config: Optional[GemmConfig] = None,
-) -> (Tensor, Optional[Tensor]):
+) -> None:
     if config is None:
         config = GemmConfig(tile_m=128, tile_n=192, cluster_m=2, cluster_n=1, pingpong=True)
     A, B = A.unsqueeze(0), B.mT.unsqueeze(0)  # (1, M, K), (1, N, K)
     if C is not None:
         C = C.unsqueeze(0)  # (1, M, N)
-    out_dtype = A.dtype if out_dtype is None else out_dtype
-    D = torch.empty((1, A.shape[1], B.shape[1]), dtype=out_dtype, device=A.device)
+    assert out.shape == (
+        A.shape[1],
+        B.shape[1],
+    ), f"out shape mismatch: {out.shape} vs {(A.shape[1], B.shape[1])}"
+    out = out.unsqueeze(0)
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
     )
     gemm_sm90(
         A if not config.swap_ab else B,
         B if not config.swap_ab else A,
-        D if not config.swap_ab else D.mT,
+        out if not config.swap_ab else out.mT,
         (C if not config.swap_ab else C.mT) if C is not None else None,
         tile_count_semaphore,
         config.tile_m,
@@ -87,35 +90,33 @@ def gemm_tuned(
         config.cluster_n,
         config.pingpong,
     )
-    return D.squeeze(0)
 
 
 @autotune(
     configs=[AutotuneConfig(config=c) for c in get_all_configs()],
-    key=["activation", "out_dtype", "postact_dtype", "store_preact"],
+    key=["activation"],
 )
 def gemm_act_tuned(
     A: Tensor,  # (M, K)
     B: Tensor,  # (K, N)
+    preact_out: Optional[Tensor],  # (M, N) - None if not storing preact
+    postact_out: Tensor,  # (M, N)
     C: Optional[Tensor] = None,  # (M, N)
     activation: Literal[None, "relu", "relu_sq", "gelu_tanh_approx"] = None,
-    out_dtype: Optional[torch.dtype] = None,
-    postact_dtype: Optional[torch.dtype] = None,
-    store_preact: bool = True,
     config: Optional[GemmConfig] = None,
-) -> (Tensor, Optional[Tensor]):
+) -> None:
     if config is None:
         config = GemmConfig(tile_m=128, tile_n=192, cluster_m=2, cluster_n=1, pingpong=True)
     A, B = A.unsqueeze(0), B.mT.unsqueeze(0)  # (1, M, K), (1, N, K)
     if C is not None:
         C = C.unsqueeze(0)  # (1, M, N)
-    out_dtype = A.dtype if out_dtype is None else out_dtype
-    postact_dtype = A.dtype if postact_dtype is None else postact_dtype
-    if store_preact:
-        D = torch.empty((1, A.shape[1], B.shape[1]), dtype=out_dtype, device=A.device)
+    if preact_out is not None:
+        assert preact_out.shape == (A.shape[1], B.shape[1])
+        D = preact_out.unsqueeze(0)
     else:
         D = None
-    PostAct = torch.empty((1, A.shape[1], B.shape[1]), dtype=postact_dtype, device=A.device)
+    assert postact_out.shape == (A.shape[1], B.shape[1])
+    PostAct = postact_out.unsqueeze(0)
     gemm_act_sm90(
         A if not config.swap_ab else B,
         B if not config.swap_ab else A,
@@ -129,31 +130,30 @@ def gemm_act_tuned(
         config.cluster_n,
         config.pingpong,
     )
-    return D.squeeze(0) if D is not None else None, PostAct.squeeze(0)
 
 
 @autotune(
     configs=[AutotuneConfig(config=c) for c in get_all_configs()],
-    key=["activation", "out_dtype", "postact_dtype", "dynamic_scheduler"],
+    key=["activation", "dynamic_scheduler"],
 )
 def gemm_dact_tuned(
     A: Tensor,  # (M, K)
     B: Tensor,  # (K, N)
     PreAct: Tensor,  # (M, N)
+    dx_out: Tensor,  # (M, N)
+    postact_out: Tensor,  # (M, N)
     activation: Literal[None, "relu", "relu_sq", "gelu_tanh_approx"] = None,
-    out_dtype: Optional[torch.dtype] = None,
-    postact_dtype: Optional[torch.dtype] = None,
     dynamic_scheduler: bool = True,
     config: Optional[GemmConfig] = None,
-) -> (Tensor, Tensor):
+) -> None:
     if config is None:
         config = GemmConfig(tile_m=128, tile_n=192, cluster_m=2, cluster_n=1, pingpong=True)
     A, B = A.unsqueeze(0), B.mT.unsqueeze(0)  # (1, M, K), (1, N, K)
     PreAct = PreAct.unsqueeze(0)  # (1, M, N)
-    out_dtype = A.dtype if out_dtype is None else out_dtype
-    postact_dtype = A.dtype if postact_dtype is None else postact_dtype
-    D = torch.empty((1, A.shape[1], B.shape[1]), dtype=out_dtype, device=A.device)
-    PostAct = torch.empty((1, A.shape[1], B.shape[1]), dtype=postact_dtype, device=A.device)
+    assert dx_out.shape == (A.shape[1], B.shape[1])
+    D = dx_out.unsqueeze(0)
+    assert postact_out.shape == (A.shape[1], B.shape[1])
+    PostAct = postact_out.unsqueeze(0)
     tile_count_semaphore = (
         torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
     )
@@ -171,78 +171,133 @@ def gemm_dact_tuned(
         config.cluster_n,
         config.pingpong,
     )
-    return D.squeeze(0), PostAct.squeeze(0)
 
 
-@torch.library.custom_op("quack::gemm", mutates_args=(), device_types="cuda")
 def gemm(
-    A: Tensor, B: Tensor, out_dtype: Optional[torch.dtype] = None, dynamic_scheduler: bool = False
+    A: Tensor,
+    B: Tensor,
+    out: Optional[Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    dynamic_scheduler: bool = False,
+    tuned: bool = True,
 ) -> Tensor:
-    return gemm_tuned(A, B, None, out_dtype, dynamic_scheduler)
+    """GEMM with optional output tensor and tuning control."""
+    if out is None:
+        out_dtype = A.dtype if out_dtype is None else out_dtype
+        out = torch.empty((A.shape[0], B.shape[1]), dtype=out_dtype, device=A.device)
+    gemm_out(A, B, out, dynamic_scheduler, tuned)
+    return out
 
 
-@torch.library.register_fake("quack::gemm")
+@torch.library.custom_op("quack::gemm_out", mutates_args=("out",), device_types="cuda")
+def gemm_out(
+    A: Tensor,
+    B: Tensor,
+    out: Tensor,
+    dynamic_scheduler: bool = False,
+    tuned: bool = True,
+) -> None:
+    """GEMM with pre-allocated output tensor."""
+    fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
+    fn(A, B, out, None, dynamic_scheduler)
+
+
 def gemm_ref(
-    A: Tensor, B: Tensor, out_dtype: Optional[torch.dtype] = None, dynamic_scheduler: bool = False
+    A: Tensor,
+    B: Tensor,
+    out: Optional[Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
 ) -> Tensor:
-    out_dtype = A.dtype if out_dtype is None else out_dtype
-    return torch.mm(A, B).to(out_dtype)
+    """Reference implementation for GEMM with pre-allocated output."""
+    # The out_dtype argument requires torch >= 2.8
+    return torch.mm(A, B, out_dtype=out_dtype, out=out)
 
 
-@torch.library.custom_op("quack::gemm_add", mutates_args=(), device_types="cuda")
 def gemm_add(
     A: Tensor,
     B: Tensor,
     C: Tensor,
+    out: Optional[Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     dynamic_scheduler: bool = False,
+    tuned: bool = True,
 ) -> Tensor:
-    return gemm_tuned(A, B, C, out_dtype, dynamic_scheduler)
+    """GEMM with addition and optional output tensor."""
+    if out is None:
+        out_dtype = A.dtype if out_dtype is None else out_dtype
+        out = torch.empty((A.shape[0], B.shape[1]), dtype=out_dtype, device=A.device)
+    gemm_add_out(A, B, C, out, dynamic_scheduler, tuned)
+    return out
 
 
-@torch.library.register_fake("quack::gemm_add")
+@torch.library.custom_op("quack::gemm_add_out", mutates_args=("out",), device_types="cuda")
+def gemm_add_out(
+    A: Tensor,
+    B: Tensor,
+    C: Tensor,
+    out: Tensor,
+    dynamic_scheduler: bool = False,
+    tuned: bool = True,
+) -> None:
+    """GEMM with addition and pre-allocated output tensor."""
+    fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
+    fn(A, B, out, C, dynamic_scheduler)
+
+
 def gemm_add_ref(
     A: Tensor,
     B: Tensor,
     C: Tensor,
+    out: Optional[Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
-    dynamic_scheduler: bool = False,
 ) -> Tensor:
-    out_dtype = A.dtype if out_dtype is None else out_dtype
-    return (C + torch.mm(A, B)).to(out_dtype)
+    """Reference implementation for GEMM with addition and pre-allocated output."""
+    return torch.addmm(C, A, B, out_dtype=out_dtype, out=out)
 
 
-@torch.library.custom_op("quack::gemm_add_t", mutates_args=(), device_types="cuda")
-def gemm_t_add(A: Tensor, B: Tensor, C: Tensor) -> Tensor:
-    return gemm_tuned(A, B.T, C)
-
-
-@torch.library.register_fake("quack::gemm_add_t")
-def gemm_t_add_ref(A: Tensor, B: Tensor, C: Tensor) -> Tensor:
-    return gemm_add_ref(A, B.T, C)
-
-
-# Specifying the schema manually here since torch.library._infer_schema doesn't work when return
-# type is a tuple of Tensor
-@torch.library.custom_op(
-    "quack::gemm_act",
-    mutates_args=(),
-    device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor? C=None, str? activation=None, ScalarType? out_dtype=None, ScalarType? postact_dtype=None, bool store_preact=True) -> (Tensor?, Tensor)",
-)
 def gemm_act(
     A: Tensor,
     B: Tensor,
     C: Optional[Tensor] = None,
     activation: Literal[None, "relu", "relu_sq", "gelu_tanh_approx"] = None,
+    preact_out: Optional[Tensor] = None,
+    postact_out: Optional[Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
     store_preact: bool = True,
-) -> Tuple[Tensor, Tensor]:
-    return gemm_act_tuned(A, B, C, activation, out_dtype, postact_dtype, store_preact)
+    tuned: bool = True,
+) -> Tuple[Optional[Tensor], Tensor]:
+    """GEMM with activation and optional output tensors."""
+    out_dtype = A.dtype if out_dtype is None else out_dtype
+    postact_dtype = A.dtype if postact_dtype is None else postact_dtype
+    if preact_out is None and store_preact:
+        preact_out = torch.empty((A.shape[0], B.shape[1]), dtype=out_dtype, device=A.device)
+    if postact_out is None:
+        postact_out = torch.empty((A.shape[0], B.shape[1]), dtype=postact_dtype, device=A.device)
+    gemm_act_out(A, B, preact_out, postact_out, C, activation, tuned)
+    return preact_out, postact_out
 
 
-@torch.library.register_fake("quack::gemm_act")
+@torch.library.custom_op(
+    "quack::gemm_act_out",
+    mutates_args=("preact_out", "postact_out"),
+    device_types="cuda",
+    schema="(Tensor A, Tensor B, Tensor(a!)? preact_out, Tensor(a!) postact_out, Tensor? C=None, str? activation=None, bool tuned=True) -> ()",
+)
+def gemm_act_out(
+    A: Tensor,
+    B: Tensor,
+    preact_out: Optional[Tensor],
+    postact_out: Tensor,
+    C: Optional[Tensor] = None,
+    activation: Literal[None, "relu", "relu_sq", "gelu_tanh_approx"] = None,
+    tuned: bool = True,
+) -> None:
+    """GEMM with activation and pre-allocated output tensors."""
+    fn = gemm_act_tuned if tuned else partial(gemm_act_tuned.fn, config=None)
+    fn(A, B, preact_out, postact_out, C, activation)
+
+
 def gemm_act_ref(
     A: Tensor,
     B: Tensor,
@@ -251,7 +306,7 @@ def gemm_act_ref(
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
     store_preact: bool = True,
-) -> Tuple[Tensor, Tensor]:
+) -> Tuple[Optional[Tensor], Tensor]:
     out_dtype = A.dtype if out_dtype is None else out_dtype
     postact_dtype = A.dtype if postact_dtype is None else postact_dtype
     out = torch.mm(A, B) if C is None else C + torch.mm(A, B)
@@ -259,27 +314,50 @@ def gemm_act_ref(
     return out.to(out_dtype) if store_preact else None, postact
 
 
-# Specifying the schema manually here since torch.library._infer_schema doesn't work when return
-# type is a tuple of Tensor
-@torch.library.custom_op(
-    "quack::gemm_dact",
-    mutates_args=(),
-    device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor PreAct, str? activation=None, ScalarType? out_dtype=None, ScalarType? postact_dtype=None, bool dynamic_scheduler=True) -> (Tensor, Tensor)",
-)
 def gemm_dact(
     A: Tensor,
     B: Tensor,
     PreAct: Tensor,
     activation: Literal[None, "relu", "relu_sq", "gelu_tanh_approx"] = None,
+    dx_out: Optional[Tensor] = None,
+    postact_out: Optional[Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
     dynamic_scheduler: bool = True,
+    tuned: bool = True,
 ) -> Tuple[Tensor, Tensor]:
-    return gemm_dact_tuned(A, B, PreAct, activation, out_dtype, postact_dtype, dynamic_scheduler)
+    """GEMM with activation gradient and optional output tensors."""
+    out_dtype = A.dtype if out_dtype is None else out_dtype
+    postact_dtype = PreAct.dtype if postact_dtype is None else postact_dtype
+    if dx_out is None:
+        dx_out = torch.empty((A.shape[0], B.shape[1]), dtype=out_dtype, device=A.device)
+    if postact_out is None:
+        postact_out = torch.empty((A.shape[0], B.shape[1]), dtype=postact_dtype, device=A.device)
+    gemm_dact_out(A, B, PreAct, dx_out, postact_out, activation, dynamic_scheduler, tuned)
+    return dx_out, postact_out
 
 
-@torch.library.register_fake("quack::gemm_dact")
+@torch.library.custom_op(
+    "quack::gemm_dact_out",
+    mutates_args=("dx_out", "postact_out"),
+    device_types="cuda",
+    schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a!) dx_out, Tensor(a!) postact_out, str? activation=None, bool dynamic_scheduler=True, bool tuned=True) -> ()",
+)
+def gemm_dact_out(
+    A: Tensor,
+    B: Tensor,
+    PreAct: Tensor,
+    dx_out: Tensor,
+    postact_out: Tensor,
+    activation: Literal[None, "relu", "relu_sq", "gelu_tanh_approx"] = None,
+    dynamic_scheduler: bool = True,
+    tuned: bool = True,
+) -> None:
+    """GEMM with activation gradient and pre-allocated output tensors."""
+    fn = gemm_dact_tuned if tuned else partial(gemm_dact_tuned.fn, config=None)
+    fn(A, B, PreAct, dx_out, postact_out, activation, dynamic_scheduler)
+
+
 def gemm_dact_ref(
     A: Tensor,
     B: Tensor,
@@ -287,7 +365,6 @@ def gemm_dact_ref(
     activation: Literal[None, "relu", "relu_sq", "gelu_tanh_approx"] = None,
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
-    dynamic_scheduler: bool = True,
 ) -> Tuple[Tensor, Tensor]:
     """Reference implementation for GEMM with activation gradient."""
     out_dtype = A.dtype if out_dtype is None else out_dtype

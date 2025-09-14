@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from quack.linear import linear_func, linear_act_func
-from quack.gemm_interface import gemm_dact, gemm_dact_tuned, gemm_act_ref, gemm_dact_ref
+from quack.gemm_interface import gemm_dact, gemm_act_ref, gemm_dact_ref
 
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
@@ -52,9 +52,8 @@ def test_linear_act(in_features, out_features, input_dtype, activation, store_pr
         torch.randn((out_features, in_features), device=device, dtype=input_dtype)
         / math.sqrt(in_features)
     ).requires_grad_()
-    preact, postact = linear_act_func(
-        x, w, activation, store_preact=store_preact, tuned=False
-    )  # Disable tuning for faster test
+    # Disable tuning for faster test
+    preact, postact = linear_act_func(x, w, activation, store_preact=store_preact, tuned=False)
     preact_ref, postact_ref = gemm_act_ref(
         x.float(), w.float().T, activation=activation, store_preact=store_preact
     )
@@ -78,9 +77,7 @@ def test_gemm_dact(n, k, input_dtype, activation):
     weight = torch.randn((n, k), device=device, dtype=input_dtype) / math.sqrt(k)
     preact = torch.randn((m, n), device=device, dtype=input_dtype, requires_grad=True)
     # Disable tuning for faster test
-    dx, postact = gemm_dact_tuned.fn(
-        dout_input, weight.T, preact, activation=activation, config=None
-    )
+    dx, postact = gemm_dact(dout_input, weight.T, preact, activation=activation, tuned=False)
     dx_ref, postact_ref = gemm_dact_ref(
         dout_input.float(), weight.float().T, preact.float(), activation=activation
     )

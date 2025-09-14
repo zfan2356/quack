@@ -11,14 +11,7 @@ from torch.amp import custom_fwd, custom_bwd
 # from gemm_cublas import gemm as gemm_cb, gemm_add_ as gemm_add_cb_
 # from gemm_cublas.interface import gemm_tuned as gemm_cb, gemm_add_tuned_ as gemm_add_cb_
 
-from quack.gemm_interface import (
-    gemm,
-    gemm_tuned,
-    gemm_act,
-    gemm_act_tuned,
-    gemm_dact,
-    gemm_dact_tuned,
-)
+from quack.gemm_interface import gemm, gemm_act, gemm_dact
 
 
 def linear_fwd_convert_type(*tensors):
@@ -107,16 +100,14 @@ class LinearFunc(torch.autograd.Function):
 
 class LinearUntunedFunc(LinearFunc):
     # Passing in config=None to disable tuning at runtime
-    matmul_fwd_fn = partial(gemm_tuned.fn, config=None)
-    matmul_bwd_dx = partial(gemm_tuned.fn, dynamic_scheduler=True, config=None)
-    matmul_bwd_dw = partial(gemm_tuned.fn, dynamic_scheduler=True, config=None)
+    matmul_fwd_fn = partial(gemm, tuned=False)
+    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False)
+    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
 
 
 def linear_func(x, weight, fuse_grad_accum=False, tuned=True):
-    if tuned:
-        return LinearFunc.apply(x, weight, fuse_grad_accum)
-    else:
-        return LinearUntunedFunc.apply(x, weight, fuse_grad_accum)
+    fn_cls = LinearFunc if tuned else LinearUntunedFunc
+    return fn_cls.apply(x, weight, fuse_grad_accum)
 
 
 class LinearActFunc(LinearFunc):
@@ -151,16 +142,14 @@ class LinearActFunc(LinearFunc):
 
 class LinearActUntunedFunc(LinearActFunc):
     # Passing in config=None to disable tuning at runtime
-    matmul_fwd_fn = partial(gemm_act_tuned.fn, config=None)
-    matmul_bwd_dx = partial(gemm_tuned.fn, dynamic_scheduler=True, config=None)
-    matmul_bwd_dw = partial(gemm_tuned.fn, dynamic_scheduler=True, config=None)
+    matmul_fwd_fn = partial(gemm_act, tuned=False)
+    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False)
+    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
 
 
 def linear_act_func(x, weight, activation, store_preact=True, fuse_grad_accum=False, tuned=True):
-    if tuned:
-        return LinearActFunc.apply(x, weight, activation, store_preact, fuse_grad_accum)
-    else:
-        return LinearActUntunedFunc.apply(x, weight, activation, store_preact, fuse_grad_accum)
+    fn_cls = LinearActFunc if tuned else LinearActUntunedFunc
+    return fn_cls.apply(x, weight, activation, store_preact, fuse_grad_accum)
 
 
 class DActLinearFunc(LinearFunc):
@@ -213,16 +202,14 @@ class DActLinearFunc(LinearFunc):
 
 class DActLinearUntunedFunc(DActLinearFunc):
     # Passing in config=None to disable tuning at runtime
-    matmul_fwd_fn = partial(gemm_tuned.fn, config=None)
-    matmul_bwd_dx = partial(gemm_dact_tuned.fn, dynamic_scheduler=True, config=None)
-    matmul_bwd_dw = partial(gemm_tuned.fn, dynamic_scheduler=True, config=None)
+    matmul_fwd_fn = partial(gemm, tuned=False)
+    matmul_bwd_dx = partial(gemm_dact, dynamic_scheduler=True, tuned=False)
+    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
 
 
 def act_linear_func(preact, weight, x, activation, fuse_grad_accum=False, tuned=True):
-    if tuned:
-        return DActLinearFunc.apply(preact, weight, x, activation, fuse_grad_accum)
-    else:
-        return DActLinearUntunedFunc.apply(preact, weight, x, activation, fuse_grad_accum)
+    fn_cls = DActLinearFunc if tuned else DActLinearUntunedFunc
+    return fn_cls.apply(preact, weight, x, activation, fuse_grad_accum)
 
 
 class Linear(nn.Linear):
@@ -239,7 +226,12 @@ class Linear(nn.Linear):
         self.fuse_grad_accum = fuse_grad_accum
 
     def forward(self, input: Tensor) -> Tensor:
-        if self.bias is None and input.is_cuda:
+        if (
+            self.bias is None
+            and input.is_cuda
+            and self.in_features % 8 == 0
+            and self.out_features % 8 == 0
+        ):
             return linear_func(input, self.weight, fuse_grad_accum=self.fuse_grad_accum)
         else:
             return F.linear(input, self.weight, self.bias)
