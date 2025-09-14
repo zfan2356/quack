@@ -22,25 +22,6 @@ act_to_pytorch_fn_map = {
     "gelu_tanh_approx": partial(F.gelu, approximate="tanh"),
 }
 
-# Dictionary mapping activation names to their gradient functions
-# Each function takes (preact, dout) and returns (dx, postact)
-dact_to_pytorch_fn_map = {
-    None: lambda preact, dout: (dout, preact),
-    "relu": lambda preact, dout: (
-        torch.where(preact > 0, dout, torch.zeros_like(dout)),
-        F.relu(preact),
-    ),
-    "relu_sq": lambda preact, dout: (
-        torch.where(preact > 0, 2 * preact * dout, torch.zeros_like(dout)),
-        F.relu(preact).square(),
-    ),
-    "gelu_tanh_approx": lambda preact, dout: (
-        torch.autograd.grad(F.gelu(preact, approximate="tanh"), preact, dout, create_graph=False)[
-            0
-        ],
-        F.gelu(preact, approximate="tanh"),
-    ),
-}
 
 # Dictionary mapping gated activation names to their forward functions
 # Each function takes (gate, up) and returns postact
@@ -370,7 +351,16 @@ def gemm_dact_ref(
     out_dtype = A.dtype if out_dtype is None else out_dtype
     postact_dtype = PreAct.dtype if postact_dtype is None else postact_dtype
     dout = torch.mm(A, B).to(out_dtype)
-    dx, postact = dact_to_pytorch_fn_map[activation](PreAct, dout)
+    postact = act_to_pytorch_fn_map[activation](PreAct)
+    # Compute gradient using autograd
+    if activation is None:
+        dx = dout
+    else:
+        PreAct_requires_grad = PreAct.requires_grad
+        PreAct.requires_grad_(True)
+        postact_for_grad = act_to_pytorch_fn_map[activation](PreAct)
+        dx = torch.autograd.grad(postact_for_grad, PreAct, dout, create_graph=False)[0]
+        PreAct.requires_grad_(PreAct_requires_grad)
     return dx.to(out_dtype), postact.to(postact_dtype)
 
 
