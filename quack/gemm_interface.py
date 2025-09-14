@@ -367,16 +367,3 @@ def gemm_dgated_ref(
     # Interleave gradients back
     dx = torch.stack([dgate, dup], dim=-1).reshape(PreAct.shape)
     return dx.to(out_dtype), postact.to(postact_dtype)
-
-
-def gemm_dswiglu_ref(A: Tensor, B: Tensor, preact: Tensor) -> (Tensor, Tensor):
-    # A: (M, K), B: (K, N), preact: (M, 2 * N)
-    dout = torch.mm(A, B)
-    p0, p1 = preact[..., ::2], preact[..., 1::2]
-    sigmoid = torch.sigmoid(p0)
-    silu = F.silu(p0)
-    postact = silu * p1
-    d0 = sigmoid * (1 + p0 * (1 - sigmoid)) * p1 * dout
-    d1 = F.silu(p0) * dout
-    out = torch.stack([d0, d1], dim=-1).reshape(d0.shape[:-1] + (2 * d0.shape[-1],))
-    return out, postact

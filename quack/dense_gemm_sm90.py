@@ -455,16 +455,8 @@ class GemmSm90:
                 cute.ceil_div(mB.shape[0], self.tile_shape_mnk[1]),
                 num_problems,
             )
-            TileSchedulerCls = TileScheduler
-            tile_sched_args = TileSchedulerArguments(
-                problem_shape_ntile_mnl=problem_shape_ntile_mnl,
-                raster_order=scheduler_args.raster_order,
-                group_size=scheduler_args.max_swizzle_size,
-                cluster_shape_mnk=self.cluster_shape_mnk,
-                tile_count_semaphore=scheduler_args.tile_count_semaphore,
-                batch_idx_permute=scheduler_args.batch_idx_permute,
-                is_persistent=self.is_persistent,
-            )
+            TileSchedulerCls = self.get_scheduler_class()
+            tile_sched_args = self.get_scheduler_arguments(problem_shape_ntile_mnl, scheduler_args)
         else:
             assert mD is not None or not self.gather_A
             problem_shape_ntile_mnl = (
@@ -1526,7 +1518,22 @@ class GemmSm90:
             tRS_rD.store(tRS_rD.load() + tRS_rC.load().to(tRS_rD.element_type))
         return None
 
-    @cute.jit
+    def get_scheduler_class(self):
+        """Return the scheduler class to use. Override in subclasses for custom schedulers."""
+        return TileScheduler
+
+    def get_scheduler_arguments(self, problem_shape_ntile_mnl, scheduler_args):
+        """Create scheduler arguments. Override in subclasses for custom schedulers."""
+        return TileSchedulerArguments(
+            problem_shape_ntile_mnl=problem_shape_ntile_mnl,
+            raster_order=scheduler_args.raster_order,
+            group_size=scheduler_args.max_swizzle_size,
+            cluster_shape_mnk=self.cluster_shape_mnk,
+            tile_count_semaphore=scheduler_args.tile_count_semaphore,
+            batch_idx_permute=scheduler_args.batch_idx_permute,
+            is_persistent=self.is_persistent,
+        )
+
     def epi_visit_acc(
         self,
         params: EpilogueParams,
