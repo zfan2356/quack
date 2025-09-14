@@ -141,6 +141,7 @@ class GemmWrapperBase:
         pingpong: bool,
         persistent: bool,
         has_semaphore: bool,
+        *args,
         key_tensor_names: Tuple[str, ...] = ("A", "B", "D", "C"),
     ) -> Tuple:
         key_parts = []
@@ -153,4 +154,5 @@ class GemmWrapperBase:
             if name in tensors:
                 key_parts.append(tensors[name].major)
         key_parts.extend([pingpong, persistent, has_semaphore])
+        key_parts.extend(args)
         return tuple(key_parts)
