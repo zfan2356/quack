@@ -8,7 +8,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import warpgroup
 import cutlass.utils.hopper_helpers as sm90_utils
-from cutlass import Int32, Boolean, const_expr
+from cutlass import Int32, Float32, Boolean, const_expr
 import cutlass.torch as cutlass_torch
 
 from quack.cute_dsl_utils import ArgumentsBase, ParamsBase
@@ -23,6 +23,8 @@ class GemmActSm90(GemmSm90):
     class EpilogueArguments(ArgumentsBase):
         mPostAct: cute.Tensor
         act_fn: cutlass.Constexpr[Optional[Callable]] = None
+        alpha: Optional[Float32] = None
+        beta: Optional[Float32] = None
 
     @dataclass
     class EpilogueParams(ParamsBase):
@@ -30,6 +32,8 @@ class GemmActSm90(GemmSm90):
         mPostAct_mnl: cute.Tensor
         epi_postact_smem_layout_staged: cute.ComposedLayout
         act_fn: cutlass.Constexpr[Optional[Callable]] = None
+        alpha: Optional[Float32] = None
+        beta: Optional[Float32] = None
 
     def epi_to_underlying_arguments(
         self, args: EpilogueArguments, *, loc=None, ip=None
@@ -62,7 +66,12 @@ class GemmActSm90(GemmSm90):
             store_or_load="store",
         )
         return GemmActSm90.EpilogueParams(
-            tma_atom_postact, tma_tensor_postact, epi_postact_smem_layout_staged, args.act_fn
+            tma_atom_postact,
+            tma_tensor_postact,
+            epi_postact_smem_layout_staged,
+            args.act_fn,
+            args.alpha,
+            args.beta,
         )
 
     @staticmethod
@@ -219,8 +228,17 @@ class GemmActSm90(GemmSm90):
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
+        # Apply alpha scaling to accumulator if alpha is provided (not None)
+        if const_expr(params.alpha is not None):
+            tRS_rD.store(tRS_rD.load() * params.alpha)
+        # Apply C with beta scaling
         if const_expr(tRS_rC is not None):
-            tRS_rD.store(tRS_rD.load() + tRS_rC.load().to(tRS_rD.element_type))
+            if const_expr(params.beta is None):
+                # beta is None, default behavior: add C (beta=1.0)
+                tRS_rD.store(tRS_rD.load() + tRS_rC.load().to(tRS_rD.element_type))
+            else:
+                tRS_rD.store(tRS_rD.load() + params.beta * tRS_rC.load().to(tRS_rD.element_type))
+        # Apply activation function if provided
         # If we don't have .shape here, the compiler generates local stores and loads
         if const_expr(params.act_fn is not None):
             tRS_rPostAct = cute.make_fragment(tRS_rD.layout.shape, self.acc_dtype)
@@ -255,6 +273,8 @@ def gemm_act_sm90(
     cluster_N: int,
     pingpong: bool = False,
     persistent: bool = True,
+    alpha: Optional[float] = None,
+    beta: Optional[float] = None,
 ) -> None:
     tile_count_semaphore = None
     assert activation in act_fn_map, f"Unsupported activation {activation}"
@@ -288,7 +308,12 @@ def gemm_act_sm90(
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
     GemmWrapperBase.create_cute_tensors(tensor_infos, major_configs)
     act_fn = act_fn_map[activation]
-    epi_args = GemmActSm90.EpilogueArguments(tensor_infos["PostAct"].cute_tensor, act_fn)
+    epi_args = GemmActSm90.EpilogueArguments(
+        tensor_infos["PostAct"].cute_tensor,
+        act_fn,
+        alpha=Float32(alpha) if alpha is not None else None,
+        beta=Float32(beta) if beta is not None else None,
+    )
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters, tile_count_semaphore
     )
@@ -301,6 +326,8 @@ def gemm_act_sm90(
         pingpong,
         persistent,
         tile_count_semaphore is not None,
+        alpha is not None,
+        beta is not None,
         key_tensor_names=("A", "B", "D", "PostAct", "C"),
     )
     cache = gemm_act_sm90.compile_cache

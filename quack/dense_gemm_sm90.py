@@ -3,6 +3,7 @@
 
 import enum
 from typing import Tuple, Type, Callable, Optional, Union
+from dataclasses import dataclass
 from functools import partial
 import math
 
@@ -15,7 +16,7 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 import cutlass.utils.hopper_helpers as sm90_utils
-from cutlass import Int32, Boolean, const_expr
+from cutlass import Int32, Float32, Boolean, const_expr
 import cutlass.torch as cutlass_torch
 
 
@@ -124,8 +125,15 @@ class GemmSm90:
 
     bytes_per_tensormap = 128
 
-    EpilogueArguments = ArgumentsBase
-    EpilogueParams = ParamsBase
+    @dataclass
+    class EpilogueArguments(ArgumentsBase):
+        alpha: Optional[Float32] = None
+        beta: Optional[Float32] = None
+
+    @dataclass
+    class EpilogueParams(ParamsBase):
+        alpha: Optional[Float32] = None
+        beta: Optional[Float32] = None
 
     def __init__(
         self,
@@ -325,7 +333,7 @@ class GemmSm90:
         mB: cute.Tensor,
         mD: Optional[cute.Tensor],
         mC: Optional[cute.Tensor],
-        epilogue_args: Optional[EpilogueArguments],
+        epilogue_args: Optional[ArgumentsBase],
         scheduler_args: TileSchedulerOptions,
         varlen_args: Optional[VarlenArguments],
         mAIdx: Optional[cute.Tensor],
@@ -561,7 +569,7 @@ class GemmSm90:
         mD_mnl: Optional[cute.Tensor],
         tma_atom_c: Optional[cute.CopyAtom],
         mC_mnl: Optional[cute.Tensor],
-        epilogue_params: EpilogueParams,
+        epilogue_params: ParamsBase,
         mAIdx: Optional[cute.Tensor],
         cu_seqlens_m: Optional[cute.Tensor],
         cu_seqlens_k: Optional[cute.Tensor],
@@ -1514,8 +1522,16 @@ class GemmSm90:
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
+        # Apply alpha scaling to accumulator if alpha is provided (not None)
+        if const_expr(params.alpha is not None):
+            tRS_rD.store(tRS_rD.load() * params.alpha)
+        # Apply C with beta scaling
         if const_expr(tRS_rC is not None):
-            tRS_rD.store(tRS_rD.load() + tRS_rC.load().to(tRS_rD.element_type))
+            if const_expr(params.beta is None):
+                # beta is None, default behavior: add C (beta=1.0)
+                tRS_rD.store(tRS_rD.load() + tRS_rC.load().to(tRS_rD.element_type))
+            else:
+                tRS_rD.store(tRS_rD.load() + params.beta * tRS_rC.load().to(tRS_rD.element_type))
         return None
 
     def get_scheduler_class(self):
@@ -1545,9 +1561,9 @@ class GemmSm90:
         pass
 
     def epi_to_underlying_arguments(
-        self, args: Optional[EpilogueArguments], *, loc=None, ip=None
+        self, args: EpilogueArguments, *, loc=None, ip=None
     ) -> EpilogueParams:
-        return GemmSm90.EpilogueParams()
+        return GemmSm90.EpilogueParams(alpha=args.alpha, beta=args.beta)
 
     @staticmethod
     def epi_smem_bytes_per_stage(
@@ -2129,6 +2145,8 @@ def gemm_sm90(
     cluster_N: int,
     pingpong: bool = False,
     persistent: bool = True,
+    alpha: Optional[float] = None,
+    beta: Optional[float] = None,
 ) -> None:
     L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(A, B, D, C)
     GemmWrapperBase.permute_tensors(tensor_infos)
@@ -2156,7 +2174,10 @@ def gemm_sm90(
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
     GemmWrapperBase.create_cute_tensors(tensor_infos, major_configs)
-    epi_args = GemmSm90.EpilogueArguments()
+    epi_args = GemmSm90.EpilogueArguments(
+        alpha=Float32(alpha) if alpha is not None else None,
+        beta=Float32(beta) if beta is not None else None,
+    )
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters, tile_count_semaphore
     )
@@ -2169,6 +2190,8 @@ def gemm_sm90(
         pingpong,
         persistent,
         tile_count_semaphore is not None,
+        alpha is not None,
+        beta is not None,
         key_tensor_names=("A", "B", "D", "C"),
     )
     cache = gemm_sm90.compile_cache
