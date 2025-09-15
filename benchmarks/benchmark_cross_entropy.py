@@ -18,6 +18,7 @@ def run_cross_entropy(
     dtype: Type[cutlass.Numeric],
     warmup_iterations=2,
     iterations=200,
+    return_dx=False,
 ):
     if not torch.cuda.is_available():
         raise RuntimeError(f"Ampere GPU is required to run this example!")
@@ -31,15 +32,15 @@ def run_cross_entropy(
     x = 0.1 * torch.randn(M, N, device=device, dtype=torch_dtype)
     target = torch.randint(0, N, (M,), device=device, dtype=torch.int64)
 
-    loss = cross_entropy_fwd(x, target)
+    loss = cross_entropy_fwd(x, target, return_dx=return_dx)
 
     compiled_func_ref = torch.compile(lambda x, target: F.cross_entropy(x, target, reduction='none'))
 
-    fn = lambda: cross_entropy_fwd(x, target)
+    fn = lambda: cross_entropy_fwd(x, target, return_dx=return_dx)
     time.sleep(0.5)
     avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
     # Memory bandwidth calculation: read x (M*N elements) + read target (M elements) + write loss (M elements)
-    mem_bytes = (M * N + M + M) * dtype.width // 8
+    mem_bytes = (M * N * (2 if return_dx else 1) + M + M) * dtype.width // 8
     mem_bw = round(mem_bytes / (avg_time / 1000) / 1e9)
     print(f"Kernel execution time: {avg_time:.4f} ms")
     print(f"Mem throughput: {mem_bw:.2f} GB/s")
@@ -48,6 +49,7 @@ def run_cross_entropy(
     for _ in range(5): fn_ref()  # warm up
     time.sleep(0.5)
     avg_time = do_bench(fn_ref, warmup=warmup_iterations, rep=iterations)
+    mem_bytes = (M * N + M + M) * dtype.width // 8
     mem_bw_ref = round(mem_bytes / (avg_time / 1000) / 1e9)
     print(f"Ref kernel execution time: {avg_time:.4f} ms")
     print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
@@ -123,6 +125,7 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_iterations", default=10, type=int)
     parser.add_argument("--iterations", default=100, type=int)
     parser.add_argument("--backward", action="store_true", help="Benchmark backward pass instead of forward pass")
+    parser.add_argument("--fwd_dx", action="store_true", help="Benchmark forward pass that also computes dx")
 
     args = parser.parse_args()
     torch.manual_seed(0)
@@ -146,6 +149,7 @@ if __name__ == "__main__":
             dtype=args.dtype,
             warmup_iterations=args.warmup_iterations,
             iterations=args.iterations,
+            return_dx=args.fwd_dx,
         )
 
 
