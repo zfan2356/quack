@@ -10,7 +10,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import const_expr
+from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.cute.runtime import from_dlpack
 
 import quack.utils as utils
@@ -26,7 +26,7 @@ class CrossEntropy(ReductionBase):
             dtype,
             N,
             stage=2 if not online_softmax else 1,
-            reduction_dtype=cutlass.Float32 if not online_softmax else cutlass.Int64,
+            reduction_dtype=Float32 if not online_softmax else cutlass.Int64,
         )
         self.online_softmax = online_softmax
         self.reload_from = None if N <= 16384 or online_softmax else "smem"
@@ -75,6 +75,7 @@ class CrossEntropy(ReductionBase):
         mTargetLogit: Optional[cute.Tensor],  # (M, K) or (M,). If None, we use mX
         mLoss: cute.Tensor,  # (M,)
         mLSE: Optional[cute.Tensor],  # (M,)
+        ignore_index: Int32,  # Index to ignore in loss computation
         stream: cuda.CUstream,
     ):
         assert mX.element_type == self.dtype
@@ -86,7 +87,9 @@ class CrossEntropy(ReductionBase):
         tiler_mn, tv_layout = self._get_tv_layout(num_copy_bits=num_copy_bits)
         num_threads = cute.size(tv_layout, mode=[0])
         num_warps = num_threads // cute.arch.WARP_SIZE
-        self.kernel(mX, mTarget, mTargetLogit, mLoss, mLSE, tv_layout, tiler_mn).launch(
+        self.kernel(
+            mX, mTarget, mTargetLogit, mLoss, mLSE, ignore_index, tv_layout, tiler_mn
+        ).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
             block=[num_threads, 1, 1],
             cluster=([1, self.cluster_n, 1] if const_expr(self.cluster_n > 1) else None),
@@ -102,6 +105,7 @@ class CrossEntropy(ReductionBase):
         mTargetLogit: cute.Tensor,  # (M, K) or (M,)
         mLoss: cute.Tensor,  # (M,)
         mLSE: Optional[cute.Tensor],  # (M,)
+        ignore_index: Int32,  # Index to ignore in loss computation
         tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
     ):
@@ -146,9 +150,9 @@ class CrossEntropy(ReductionBase):
         self._initialize_cluster(tidx, mbar_ptr, num_warps)
 
         row = tXcX[0][0]
-        target = cute.Int32.zero
+        target = Int32.zero
         if row < shape[0] and tXcX[0][1] == 0:
-            target = cute.Int32(mTarget[row])
+            target = Int32(mTarget[row])
 
         is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
         tXpX = (
@@ -164,17 +168,19 @@ class CrossEntropy(ReductionBase):
         if const_expr(not is_even_N):
             utils.fill_oob(tXsX, tXpX, -tXsX.element_type.inf)
         cute.autovec_copy(tXsX, tXrX)
-        x = tXrX.load().to(cute.Float32)
+        x = tXrX.load().to(Float32)
 
-        target_logit = cute.Float32.zero
-        if row < shape[0] and tXcX[0][1] == 0:
+        target_logit = Float32.zero
+        should_ignore = Boolean(target == ignore_index)
+        if row < shape[0] and tXcX[0][1] == 0 and not should_ignore:
+            # Only load target logit if not ignoring this index
             if const_expr(cute.rank(mTargetLogit.shape) == 2):
                 # Use Int64 for indexing to deal with large tensors
                 mTargetLogit_off = utils.domain_offset_i64((row, 0), mTargetLogit)
-                target_logit = cute.Float32(mTargetLogit_off[0, target])
+                target_logit = Float32(mTargetLogit_off[0, target])
             else:
                 assert cute.rank(mTargetLogit.shape) == 1
-                target_logit = cute.Float32(mTargetLogit[row])
+                target_logit = Float32(mTargetLogit[row])
 
         threads_per_row = tv_layout.shape[0][0]
         if const_expr(not self.online_softmax):
@@ -184,12 +190,12 @@ class CrossEntropy(ReductionBase):
                 threads_per_row,
                 reduction_buffer[None, None, 0],
                 mbar_ptr + 0 if const_expr(self.cluster_n > 1) else None,
-                init_val=-cutlass.Float32.inf,
+                init_val=-Float32.inf,
                 hook_fn=cute.arch.cluster_wait if const_expr(self.cluster_n > 1) else None,
             )
             if const_expr(self.reload_from == "smem"):
                 cute.autovec_copy(tXsX, tXrX)
-                x = tXrX.load().to(cute.Float32)
+                x = tXrX.load().to(Float32)
             log2_e = math.log2(math.e)
             # exp_x = cute.math.exp2((x - max_x) * log2_e, fastmath=True)
             # a bit faster, probably because it's calling ex2.approx.ftz instead of ex2.approx?
@@ -220,15 +226,21 @@ class CrossEntropy(ReductionBase):
         ):
             ln_2 = math.log(2.0)
             lse = max_x + utils.log2f(denom) * ln_2
-            loss_val = lse - target_logit
-            mLoss[row] = loss_val.to(mLoss.element_type)
+            # Set loss to 0 if this index should be ignored, otherwise compute normally
+            loss_val = (lse - target_logit) if not should_ignore else Float32.zero
+            mLoss[row] = mLoss.element_type(loss_val)
             if const_expr(mLSE is not None):
                 mLSE[row] = lse
 
 
 @torch.library.custom_op("quack::cross_entropy_fwd_out", mutates_args={"loss", "lse"})
 def cross_entropy_fwd_out(
-    x: Tensor, target: Tensor, target_logit: Optional[Tensor], loss: Tensor, lse: Optional[Tensor]
+    x: Tensor,
+    target: Tensor,
+    target_logit: Optional[Tensor],
+    loss: Tensor,
+    lse: Optional[Tensor],
+    ignore_index: int = -100,
 ) -> None:
     """Cross entropy forward pass.
 
@@ -294,10 +306,17 @@ def cross_entropy_fwd_out(
             target_logit_tensor,
             loss_tensor,
             lse_tensor,
+            Int32(ignore_index),
             stream,
         )
     cross_entropy_fwd_out.compile_cache[compile_key](
-        x_tensor, target_tensor, target_logit_tensor, loss_tensor, lse_tensor, stream
+        x_tensor,
+        target_tensor,
+        target_logit_tensor,
+        loss_tensor,
+        lse_tensor,
+        Int32(ignore_index),
+        stream,
     )
 
 
@@ -308,13 +327,14 @@ def cross_entropy_fwd(
     x: torch.Tensor,
     target: torch.Tensor,
     target_logit: Optional[torch.Tensor] = None,
+    ignore_index: int = -100,
     return_lse: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor]:
     M = x.size(0)
     device = x.device
     loss = torch.empty(M, device=device, dtype=torch.float32)
     lse = torch.empty(M, device=device, dtype=torch.float32) if return_lse else None
-    cross_entropy_fwd_out(x, target, target_logit, loss, lse)
+    cross_entropy_fwd_out(x, target, target_logit, loss, lse, ignore_index)
     return loss if not return_lse else (loss, lse)
 
 
@@ -362,6 +382,7 @@ class CrossEntropyBackward:
         mDLoss: cute.Tensor,
         mdX: cute.Tensor,
         mLSE: cute.Tensor,
+        ignore_index: Int32,  # Index to ignore in gradient computation
         stream: cuda.CUstream,
     ):
         assert mX.element_type == self.dtype
@@ -380,7 +401,9 @@ class CrossEntropyBackward:
         smem_size = cute.size_in_bytes(
             mX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0))
         )
-        self.kernel(mX, mTarget, mDLoss, mdX, mLSE, mX.shape, tv_layout, tiler_mn).launch(
+        self.kernel(
+            mX, mTarget, mDLoss, mdX, mLSE, ignore_index, mX.shape, tv_layout, tiler_mn
+        ).launch(
             grid=[
                 cute.ceil_div(mX.shape[0], tiler_mn[0]),
                 cute.ceil_div(mX.shape[1], tiler_mn[1]),
@@ -399,6 +422,7 @@ class CrossEntropyBackward:
         mDLoss: cute.Tensor,  # (M,)
         mdX: cute.Tensor,  # (M, N)
         mLSE: cute.Tensor,  # (M,)
+        ignore_index: Int32,  # Index to ignore in gradient computation
         shape: cute.Shape,
         tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
@@ -451,15 +475,17 @@ class CrossEntropyBackward:
         if const_expr(not is_even_N):
             utils.fill_oob(tXsX, tXpX, -tXsX.element_type.inf)
         cute.autovec_copy(tXsX, tXrX)
-        x = tXrX.load().to(cute.Float32)
+        x = tXrX.load().to(Float32)
 
-        label = cute.Int32.zero
-        dloss = cute.Float32.zero
-        lse = cute.Float32.zero
+        label = Int32.zero
+        dloss = Float32.zero
+        lse = Float32.zero
         if row < shape[0]:
-            label = cute.Int32(mTarget[row])
-            dloss = cute.Float32(mDLoss[row])
-            lse = cute.Float32(mLSE[row])
+            label = Int32(mTarget[row])
+            should_ignore = Boolean(label == ignore_index)
+            # Set dloss to 0 if this index should be ignored
+            dloss = Float32(mDLoss[row]) if not should_ignore else Float32.zero
+            lse = Float32(mLSE[row])
 
         log2_e = math.log2(math.e)
         probs = utils.exp2f((x - lse) * log2_e)
@@ -484,6 +510,7 @@ def _cross_entropy_backward(
     dloss: torch.Tensor,
     lse: torch.Tensor,
     dx: torch.Tensor,
+    ignore_index=-100,
 ) -> None:
     """Cross entropy backward pass.
     Args:
@@ -532,10 +559,11 @@ def _cross_entropy_backward(
             dloss_tensor,
             dx_tensor,
             lse_tensor,
+            Int32(ignore_index),
             stream,
         )
     _cross_entropy_backward.compile_cache[compile_key](
-        x_tensor, target_tensor, dloss_tensor, dx_tensor, lse_tensor, stream
+        x_tensor, target_tensor, dloss_tensor, dx_tensor, lse_tensor, Int32(ignore_index), stream
     )
 
 
@@ -549,8 +577,9 @@ def cross_entropy_bwd_out(
     dloss: torch.Tensor,
     lse: torch.Tensor,
     dx: torch.Tensor,
+    ignore_index: int = -100,
 ) -> None:
-    _cross_entropy_backward(x, target, dloss, lse, dx)
+    _cross_entropy_backward(x, target, dloss, lse, dx, ignore_index)
 
 
 def cross_entropy_bwd(
@@ -558,41 +587,52 @@ def cross_entropy_bwd(
     target: torch.Tensor,
     dloss: torch.Tensor,
     lse: torch.Tensor,
+    ignore_index: int = -100,
     inplace_backward: bool = False,
 ) -> None:
     if inplace_backward and not torch.compiler.is_compiling():
         dx = x
-        _cross_entropy_backward(x=x, target=target, dloss=dloss, lse=lse, dx=x)
+        _cross_entropy_backward(
+            x=x, target=target, dloss=dloss, lse=lse, dx=x, ignore_index=ignore_index
+        )
     else:
         dx = torch.empty_like(x)
-        cross_entropy_bwd_out(x=x, target=target, dloss=dloss, lse=lse, dx=dx)
+        cross_entropy_bwd_out(
+            x=x, target=target, dloss=dloss, lse=lse, dx=dx, ignore_index=ignore_index
+        )
     return dx
 
 
 class CrossEntropyFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, target, lse_partial=None, inplace_backward=False):
+    def forward(ctx, x, target, lse_partial=None, ignore_index=-100, inplace_backward=False):
         if lse_partial is None:
-            loss, lse = cross_entropy_fwd(x, target, return_lse=True)
+            loss, lse = cross_entropy_fwd(x, target, ignore_index=ignore_index, return_lse=True)
         else:
             # if we already compute partial lse, then to compute the final lse we treat
             # @lse_partial as @x and @x as @target_logit
-            loss, lse = cross_entropy_fwd(lse_partial, target, target_logit=x, return_lse=True)
+            loss, lse = cross_entropy_fwd(
+                lse_partial, target, target_logit=x, ignore_index=ignore_index, return_lse=True
+            )
         ctx.save_for_backward(x, target, lse)
+        ctx.ignore_index = ignore_index
         ctx.inplace_backward = inplace_backward
         return loss
 
     @staticmethod
     def backward(ctx, dloss):
         x, target, lse = ctx.saved_tensors
-        dx = cross_entropy_bwd(x, target, dloss, lse, inplace_backward=ctx.inplace_backward)
-        return dx, None, None, None
+        dx = cross_entropy_bwd(
+            x, target, dloss, lse, ctx.ignore_index, inplace_backward=ctx.inplace_backward
+        )
+        return dx, None, None, None, None
 
 
 def cross_entropy(
     x: torch.Tensor,
     target: torch.Tensor,
     lse_partial: Optional[torch.Tensor] = None,
+    ignore_index: int = -100,
     reduction: Literal["none", "mean", "sum"] = "mean",
     inplace_backward: bool = False,
 ) -> torch.Tensor:
@@ -601,11 +641,13 @@ def cross_entropy(
     Args:
         x: Input logits tensor of shape (M, N)
         target: Target class indices tensor of shape (M,)
-        inplace_backward: Whether to perform backward pass in-place
+        lse_partial: Optional precomputed log-sum-exp partial results
         reduction: Specifies the reduction to apply to the output:
             'none': no reduction will be applied (default)
             'mean': the sum of the output will be divided by the number of elements
             'sum': the output will be summed
+        inplace_backward: Whether to perform backward pass in-place
+        ignore_index: Index to ignore in loss computation (loss will be 0 for these indices)
 
     Returns:
         Cross entropy loss tensor:
@@ -613,9 +655,9 @@ def cross_entropy(
             - If reduction='mean': scalar tensor with mean loss
             - If reduction='sum': scalar tensor with sum of losses
     """
-    loss = CrossEntropyFunction.apply(x, target, lse_partial, inplace_backward)
+    loss = CrossEntropyFunction.apply(x, target, lse_partial, ignore_index, inplace_backward)
     if reduction == "mean":
-        return loss.mean()
+        return loss.sum() / (target != ignore_index).sum().float()
     elif reduction == "sum":
         return loss.sum()
     elif reduction == "none":

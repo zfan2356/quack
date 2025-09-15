@@ -183,3 +183,64 @@ def test_cross_entropy_edge_targets(use_compile):
     loss_last = function(x, target_last)
     loss_ref_last = F.cross_entropy(x, target_last, reduction="none")
     torch.testing.assert_close(loss_last, loss_ref_last, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("N", [192, 1024, 32768])
+@pytest.mark.parametrize("M", [1, 77, 289])
+@pytest.mark.parametrize("use_compile", [False, True])
+def test_cross_entropy_ignore_index(M, N, input_dtype, use_compile):
+    """Test Cross Entropy with ignore_index functionality."""
+    device = "cuda"
+    atol, rtol = 5e-5, 1e-5
+    torch.random.manual_seed(0)
+    x = (0.1 * torch.randn(M, N, device=device, dtype=input_dtype)).requires_grad_()
+    target = torch.randint(0, N, (M,), device=device, dtype=torch.int64)
+    ignore_index = N - 1  # Use last class as ignore index
+    ignore_mask = torch.rand(M, device=device) < 0.3  # Randomly ignore ~30% of samples
+    target[ignore_mask] = ignore_index
+    x_ref = x.detach().clone().requires_grad_()
+    target_ref = target.detach().clone()
+    function = torch.compile(cross_entropy, fullgraph=True) if use_compile else cross_entropy
+    loss = function(x, target, reduction="none", ignore_index=ignore_index)
+    loss_ref = F.cross_entropy(x_ref.float(), target_ref, reduction="none", ignore_index=ignore_index)
+    # Check that losses are zero for ignored indices
+    assert (loss[ignore_mask] == 0).all(), "Loss should be 0 for ignored indices"
+    # Check accuracy for non-ignored indices
+    if (~ignore_mask).any():
+        torch.testing.assert_close(loss[~ignore_mask], loss_ref[~ignore_mask], atol=atol, rtol=rtol)
+    # Test backward pass
+    dloss = torch.randn_like(loss)
+    torch.cuda.synchronize()
+    (dx_ref,) = torch.autograd.grad(loss_ref, x_ref, grad_outputs=dloss)
+    (dx,) = torch.autograd.grad(loss, x, grad_outputs=dloss)
+    assert dx.shape == x.shape
+    torch.testing.assert_close(dx, dx_ref.to(input_dtype), atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("use_compile", [False, True])
+def test_cross_entropy_ignore_index_edge_cases(use_compile):
+    """Test Cross Entropy ignore_index with edge cases."""
+    device = "cuda"
+    M, N = 16, 1024
+    function = torch.compile(cross_entropy_fwd, fullgraph=True) if use_compile else cross_entropy_fwd
+
+    x = 0.1 * torch.randn(M, N, device=device, dtype=torch.float32)
+    # Test with all targets being ignore_index
+    ignore_index = 0
+    target_all_ignored = torch.zeros(M, device=device, dtype=torch.int64)
+    loss_all_ignored = function(x, target_all_ignored, ignore_index=ignore_index)
+    assert (loss_all_ignored == 0).all(), "All losses should be 0 when all targets are ignored"
+    # Test with no targets being ignore_index
+    ignore_index = -1  # Use -1 as ignore index (no valid targets will have this value)
+    target_none_ignored = torch.randint(0, N, (M,), device=device, dtype=torch.int64)
+    loss_none_ignored = function(x, target_none_ignored, ignore_index=ignore_index)
+    loss_ref = F.cross_entropy(x, target_none_ignored, reduction="none")
+    torch.testing.assert_close(loss_none_ignored, loss_ref, atol=1e-4, rtol=1e-4)
+    # Test with default ignore_index (-100)
+    target_with_default = torch.randint(0, N, (M,), device=device, dtype=torch.int64)
+    target_with_default[0] = -100  # Won't actually be -100 due to randint range, just for illustration
+    # Since -100 is out of valid range [0, N), it won't match any targets
+    loss_default = function(x, target_with_default)  # Uses default ignore_index=-100
+    loss_ref_default = F.cross_entropy(x, target_with_default, reduction="none")
+    torch.testing.assert_close(loss_default, loss_ref_default, atol=1e-4, rtol=1e-4)
