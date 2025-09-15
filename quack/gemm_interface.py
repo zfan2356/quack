@@ -283,7 +283,7 @@ def gemm_act(
     "quack::gemm_act_out",
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor(a!)? preact_out, Tensor(a!) postact_out, Tensor? C=None, str? activation=None, bool tuned=True) -> ()",
+    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, str? activation=None, bool tuned=True) -> ()",
 )
 def gemm_act_out(
     A: Tensor,
@@ -342,7 +342,7 @@ def gemm_dact(
     "quack::gemm_dact_out",
     mutates_args=("dx_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a!) dx_out, Tensor(a!) postact_out, str? activation=None, bool dynamic_scheduler=True, bool tuned=True) -> ()",
+    schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a3!) dx_out, Tensor(a4!) postact_out, str? activation=None, bool dynamic_scheduler=True, bool tuned=True) -> ()",
 )
 def gemm_dact_out(
     A: Tensor,

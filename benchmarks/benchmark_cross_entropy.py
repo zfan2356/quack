@@ -9,7 +9,7 @@ from triton.testing import do_bench
 import cutlass
 import cutlass.torch as cutlass_torch
 
-from quack.cross_entropy import _cross_entropy, cross_entropy
+from quack.cross_entropy import cross_entropy_fwd, cross_entropy
 
 
 def run_cross_entropy(
@@ -31,11 +31,11 @@ def run_cross_entropy(
     x = 0.1 * torch.randn(M, N, device=device, dtype=torch_dtype)
     target = torch.randint(0, N, (M,), device=device, dtype=torch.int64)
 
-    loss = _cross_entropy(x, target)
+    loss = cross_entropy_fwd(x, target)
 
     compiled_func_ref = torch.compile(lambda x, target: F.cross_entropy(x, target, reduction='none'))
 
-    fn = lambda: _cross_entropy(x, target)
+    fn = lambda: cross_entropy_fwd(x, target)
     time.sleep(0.5)
     avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
     # Memory bandwidth calculation: read x (M*N elements) + read target (M elements) + write loss (M elements)
@@ -44,13 +44,18 @@ def run_cross_entropy(
     print(f"Kernel execution time: {avg_time:.4f} ms")
     print(f"Mem throughput: {mem_bw:.2f} GB/s")
 
-    fn = lambda: compiled_func_ref(x, target)
-    for _ in range(5): fn()  # warm up
+    fn_ref = lambda: compiled_func_ref(x, target)
+    for _ in range(5): fn_ref()  # warm up
     time.sleep(0.5)
-    avg_time = do_bench(fn, warmup=warmup_iterations, rep=iterations)
+    avg_time = do_bench(fn_ref, warmup=warmup_iterations, rep=iterations)
     mem_bw_ref = round(mem_bytes / (avg_time / 1000) / 1e9)
     print(f"Ref kernel execution time: {avg_time:.4f} ms")
     print(f"Ref mem throughput: {mem_bw_ref:.2f} GB/s")
+
+    # from flash_attn.utils.benchmark import pytorch_profiler
+    # pytorch_profiler(fn)
+    # pytorch_profiler(fn_ref)
+    # pytorch_profiler(torch.compile(torch.logsumexp), x, dim=-1)
 
     return mem_bw, mem_bw_ref
 
@@ -80,7 +85,7 @@ def run_cross_entropy_backward(
     print(f"x: {x.shape}, dtype: {x.dtype}")
     print(f"target: {target.shape}, dtype: {target.dtype}")
 
-    loss = cross_entropy(x, target)
+    loss = cross_entropy(x, target, reduction="none")
     dloss = torch.randn(M, device=device, dtype=torch.float32)
     torch.cuda.synchronize()
 
