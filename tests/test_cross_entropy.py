@@ -10,11 +10,30 @@ import cutlass
 torch._dynamo.config.cache_size_limit = 1024
 torch._dynamo.config.accumulated_cache_size_limit = 1024
 
+
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
 # @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize(
     "N",
-    [192, 256, 512, 668, 760, 1024, 1128, 2048, 4096, 8192, 16384, 32768, 65536, 128256, 131072, 256128, 262144]
+    [
+        192,
+        256,
+        512,
+        668,
+        760,
+        1024,
+        1128,
+        2048,
+        4096,
+        8192,
+        16384,
+        32768,
+        65536,
+        128256,
+        131072,
+        256128,
+        262144,
+    ],
     # [32768]
 )
 @pytest.mark.parametrize("M", [1, 77, 289])
@@ -33,7 +52,7 @@ def test_cross_entropy(M, N, input_dtype, use_compile):
     # Forward pass
     function = torch.compile(cross_entropy, fullgraph=True) if use_compile else cross_entropy
     loss = function(x, target, reduction="none")
-    loss_ref = F.cross_entropy(x_ref.float(), target_ref, reduction='none')
+    loss_ref = F.cross_entropy(x_ref.float(), target_ref, reduction="none")
     # Check output shape and dtype
     assert loss.shape == (M,)
     assert loss.dtype == torch.float32
@@ -48,10 +67,11 @@ def test_cross_entropy(M, N, input_dtype, use_compile):
     # Test backward pass
     dloss = torch.randn_like(loss)
     torch.cuda.synchronize()
-    dx_ref, = torch.autograd.grad(loss_ref, x_ref, grad_outputs=dloss)
-    dx, = torch.autograd.grad(loss, x, grad_outputs=dloss)
+    (dx_ref,) = torch.autograd.grad(loss_ref, x_ref, grad_outputs=dloss)
+    (dx,) = torch.autograd.grad(loss, x, grad_outputs=dloss)
     assert dx.shape == x.shape
     torch.testing.assert_close(dx, dx_ref.to(input_dtype), atol=atol, rtol=rtol)
+
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("N", [128256])
@@ -73,7 +93,7 @@ def test_cross_entropy_lse_partial(M, N, input_dtype, use_compile):
     # Forward pass
     function = torch.compile(cross_entropy, fullgraph=True) if use_compile else cross_entropy
     loss = function(x, target, lse_partial=lse_partial, reduction="none")
-    loss_ref = F.cross_entropy(x_ref.float(), target_ref, reduction='none')
+    loss_ref = F.cross_entropy(x_ref.float(), target_ref, reduction="none")
     # Check output shape and dtype
     assert loss.shape == (M,)
     assert loss.dtype == torch.float32
@@ -88,8 +108,8 @@ def test_cross_entropy_lse_partial(M, N, input_dtype, use_compile):
     # Test backward pass
     dloss = torch.randn_like(loss)
     torch.cuda.synchronize()
-    dx_ref, = torch.autograd.grad(loss_ref, x_ref, grad_outputs=dloss)
-    dx, = torch.autograd.grad(loss, x, grad_outputs=dloss)
+    (dx_ref,) = torch.autograd.grad(loss_ref, x_ref, grad_outputs=dloss)
+    (dx,) = torch.autograd.grad(loss, x, grad_outputs=dloss)
     assert dx.shape == x.shape
     torch.testing.assert_close(dx, dx_ref.to(input_dtype), atol=atol, rtol=rtol)
 
@@ -100,7 +120,9 @@ def test_cross_entropy_extreme_values(input_dtype, use_compile):
     """Test Cross Entropy with extreme input values."""
     device = "cuda"
     M, N = 16, 1024
-    function = torch.compile(cross_entropy_fwd, fullgraph=True) if use_compile else cross_entropy_fwd
+    function = (
+        torch.compile(cross_entropy_fwd, fullgraph=True) if use_compile else cross_entropy_fwd
+    )
     # Test with large positive values
     x_large = torch.full((M, N), 10.0, device=device, dtype=input_dtype)
     target = torch.randint(0, N, (M,), device=device, dtype=torch.int64)
@@ -128,7 +150,9 @@ def test_cross_entropy_numerical_stability(use_compile):
     """Test that cross entropy is numerically stable."""
     device = "cuda"
     M, N = 8, 512
-    function = torch.compile(cross_entropy_fwd, fullgraph=True) if use_compile else cross_entropy_fwd
+    function = (
+        torch.compile(cross_entropy_fwd, fullgraph=True) if use_compile else cross_entropy_fwd
+    )
     # Create input with a wide range of values
     x = torch.randn(M, N, device=device, dtype=torch.float32)
     target = torch.randint(0, N, (M,), device=device, dtype=torch.int64)
@@ -145,15 +169,17 @@ def test_cross_entropy_edge_targets(use_compile):
     """Test cross entropy with edge case targets."""
     device = "cuda"
     M, N = 16, 1024
-    function = torch.compile(cross_entropy_fwd, fullgraph=True) if use_compile else cross_entropy_fwd
+    function = (
+        torch.compile(cross_entropy_fwd, fullgraph=True) if use_compile else cross_entropy_fwd
+    )
     x = 0.1 * torch.randn(M, N, device=device, dtype=torch.float32)
     # Test with target = 0 (first class)
     target_first = torch.zeros(M, device=device, dtype=torch.int64)
     loss_first = function(x, target_first)
-    loss_ref_first = F.cross_entropy(x, target_first, reduction='none')
+    loss_ref_first = F.cross_entropy(x, target_first, reduction="none")
     torch.testing.assert_close(loss_first, loss_ref_first, atol=1e-4, rtol=1e-4)
     # Test with target = N-1 (last class)
-    target_last = torch.full((M,), N-1, device=device, dtype=torch.int64)
+    target_last = torch.full((M,), N - 1, device=device, dtype=torch.int64)
     loss_last = function(x, target_last)
-    loss_ref_last = F.cross_entropy(x, target_last, reduction='none')
+    loss_ref_last = F.cross_entropy(x, target_last, reduction="none")
     torch.testing.assert_close(loss_last, loss_ref_last, atol=1e-4, rtol=1e-4)

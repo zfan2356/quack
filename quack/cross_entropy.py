@@ -259,13 +259,13 @@ def cross_entropy_fwd_out(
         )
     )
     x_tensor = convert_from_dlpack(x)
-    loss_tensor = from_dlpack(loss.detach(), assumed_align=4).mark_compact_shape_dynamic(mode=0)
+    loss_tensor = from_dlpack(loss.detach(), assumed_align=4).mark_layout_dynamic()
     lse_tensor = (
-        from_dlpack(lse.detach(), assumed_align=4).mark_compact_shape_dynamic(mode=0)
+        from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic()
         if lse is not None
         else None
     )
-    target_tensor = from_dlpack(target.detach(), assumed_align=8).mark_compact_shape_dynamic(mode=0)
+    target_tensor = from_dlpack(target.detach(), assumed_align=8).mark_layout_dynamic()
     target_logit_tensor = (
         from_dlpack(target_logit.detach(), assumed_align=4).mark_layout_dynamic(
             leading_dim=target_logit.ndim - 1
@@ -275,7 +275,16 @@ def cross_entropy_fwd_out(
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    compile_key = (dtype, N, target_logit is not None, lse is not None)
+    compile_key = (
+        dtype,
+        N,
+        target_logit.dtype if target_logit is not None else None,
+        lse.dtype if lse is not None else None,
+        loss.stride(),
+        lse.stride() if lse is not None else None,
+        target.stride(),
+        target_logit.stride(-1) if target_logit is not None else None,
+    )
     if compile_key not in cross_entropy_fwd_out.compile_cache:
         cross_entropy_op = CrossEntropy(dtype, N)
         cross_entropy_fwd_out.compile_cache[compile_key] = cute.compile(
@@ -508,14 +517,12 @@ def _cross_entropy_backward(
     )
     x_tensor = convert_from_dlpack(x)
     dx_tensor = convert_from_dlpack(dx)
-    dloss_tensor = from_dlpack(dloss.detach(), assumed_align=16).mark_compact_shape_dynamic(mode=0)
-    lse_tensor = from_dlpack(lse.detach(), assumed_align=16).mark_compact_shape_dynamic(mode=0)
-    target_tensor = from_dlpack(target.detach(), assumed_align=32).mark_compact_shape_dynamic(
-        mode=0
-    )
+    dloss_tensor = from_dlpack(dloss.detach(), assumed_align=4).mark_layout_dynamic()
+    lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic()
+    target_tensor = from_dlpack(target.detach(), assumed_align=8).mark_layout_dynamic()
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    compile_key = (dtype, N)
+    compile_key = (dtype, N, target.dtype, dloss.stride(), lse.stride(), target.stride())
     if compile_key not in _cross_entropy_backward.compile_cache:
         cross_entropy_backward_op = CrossEntropyBackward(dtype, N)
         _cross_entropy_backward.compile_cache[compile_key] = cute.compile(
@@ -586,8 +593,8 @@ def cross_entropy(
     x: torch.Tensor,
     target: torch.Tensor,
     lse_partial: Optional[torch.Tensor] = None,
-    inplace_backward: bool = False,
     reduction: Literal["none", "mean", "sum"] = "mean",
+    inplace_backward: bool = False,
 ) -> torch.Tensor:
     """Cross entropy loss with automatic differentiation support.
 
