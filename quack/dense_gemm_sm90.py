@@ -18,6 +18,7 @@ from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import Int32, Float32, Boolean, const_expr
 import cutlass.torch as cutlass_torch
+from cutlass.cute.runtime import make_ptr
 
 
 from quack.cute_dsl_utils import ParamsBase, ArgumentsBase
@@ -127,13 +128,13 @@ class GemmSm90:
 
     @dataclass
     class EpilogueArguments(ArgumentsBase):
-        alpha: Optional[Float32] = None
-        beta: Optional[Float32] = None
+        alpha: Optional[Float32 | cute.Tensor] = None
+        beta: Optional[Float32 | cute.Tensor] = None
 
     @dataclass
     class EpilogueParams(ParamsBase):
-        alpha: Optional[Float32] = None
-        beta: Optional[Float32] = None
+        alpha: Optional[Float32 | cute.Tensor] = None
+        beta: Optional[Float32 | cute.Tensor] = None
 
     def __init__(
         self,
@@ -1524,14 +1525,16 @@ class GemmSm90:
     ) -> Optional[cute.Tensor]:
         # Apply alpha scaling to accumulator if alpha is provided (not None)
         if const_expr(hasattr(params, "alpha") and params.alpha is not None):
-            tRS_rD.store(tRS_rD.load() * params.alpha)
+            alpha = utils.load_scalar_or_pointer(params.alpha)
+            tRS_rD.store(tRS_rD.load() * alpha)
         # Apply C with beta scaling
         if const_expr(tRS_rC is not None):
             if const_expr(not hasattr(params, "beta") or params.beta is None):
                 # beta is None, default behavior: add C (beta=1.0)
                 tRS_rD.store(tRS_rD.load() + tRS_rC.load().to(tRS_rD.element_type))
             else:
-                tRS_rD.store(tRS_rD.load() + params.beta * tRS_rC.load().to(tRS_rD.element_type))
+                beta = utils.load_scalar_or_pointer(params.beta)
+                tRS_rD.store(tRS_rD.load() + beta * tRS_rC.load().to(tRS_rD.element_type))
         return None
 
     def get_scheduler_class(self):
@@ -2145,8 +2148,8 @@ def gemm_sm90(
     cluster_N: int,
     pingpong: bool = False,
     persistent: bool = True,
-    alpha: float = 1.0,
-    beta: float = 1.0,
+    alpha: float | Tensor = 1.0,
+    beta: float | Tensor = 1.0,
 ) -> None:
     L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(A, B, D, C)
     GemmWrapperBase.permute_tensors(tensor_infos)
@@ -2174,10 +2177,15 @@ def gemm_sm90(
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
     GemmWrapperBase.create_cute_tensors(tensor_infos, major_configs)
-    epi_args = GemmSm90.EpilogueArguments(
-        alpha=Float32(alpha) if alpha != 1.0 else None,
-        beta=Float32(beta) if beta != 1.0 else None,
-    )
+
+    def scalar_arg(scalar: float | Tensor):
+        if isinstance(scalar, float):
+            return Float32(scalar) if scalar != 1.0 else None
+        else:
+            assert isinstance(scalar, Tensor)
+            return make_ptr(Float32, scalar.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
+
+    epi_args = GemmSm90.EpilogueArguments(scalar_arg(alpha), scalar_arg(beta))
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters, tile_count_semaphore
     )
@@ -2190,8 +2198,8 @@ def gemm_sm90(
         pingpong,
         persistent,
         tile_count_semaphore is not None,
-        alpha != 1.0,
-        beta != 1.0,
+        2 if isinstance(alpha, Tensor) else (1 if alpha == 1.0 else 0),
+        2 if isinstance(beta, Tensor) else (1 if beta == 1.0 else 0),
         key_tensor_names=("A", "B", "D", "C"),
     )
     cache = gemm_sm90.compile_cache

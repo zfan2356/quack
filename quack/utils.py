@@ -27,6 +27,15 @@ def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cut
     return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
 
 
+@cute.jit
+def load_scalar_or_pointer(x: Float32 | cute.Pointer) -> Float32:
+    if cutlass.const_expr(isinstance(x, cute.Pointer)):
+        return Float32(cute.make_tensor(x, cute.make_layout(1))[0])
+    else:
+        assert isinstance(x, Float32)
+        return x
+
+
 @dsl_user_op
 def set_block_rank(
     smem_ptr: cute.Pointer, peer_cta_rank_in_cluster: cute.Int32, *, loc=None, ip=None

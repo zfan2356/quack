@@ -43,6 +43,8 @@ def gemm_tuned(
     B: Tensor,  # (K, N)
     out: Tensor,  # (M, N) - required output tensor
     C: Optional[Tensor] = None,  # (M, N)
+    alpha: float | Tensor = 1.0,  # (1,)
+    beta: float | Tensor = 1.0,  # (1,)
     dynamic_scheduler: bool = False,
     config: Optional[GemmConfig] = None,
 ) -> None:
@@ -70,6 +72,8 @@ def gemm_tuned(
         config.cluster_m,
         config.cluster_n,
         config.pingpong,
+        alpha=alpha,
+        beta=beta,
     )
 
 
@@ -158,6 +162,7 @@ def gemm(
     A: Tensor,
     B: Tensor,
     out: Optional[Tensor] = None,
+    alpha: float | Tensor = 1.0,
     out_dtype: Optional[torch.dtype] = None,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
@@ -166,32 +171,43 @@ def gemm(
     if out is None:
         out_dtype = A.dtype if out_dtype is None else out_dtype
         out = torch.empty((A.shape[0], B.shape[1]), dtype=out_dtype, device=A.device)
-    gemm_out(A, B, out, dynamic_scheduler, tuned)
+    gemm_out(A, B, out, alpha=alpha, dynamic_scheduler=dynamic_scheduler, tuned=tuned)
     return out
 
 
-@torch.library.custom_op("quack::gemm_out", mutates_args=("out",), device_types="cuda")
+@torch.library.custom_op(
+    "quack::gemm_out",
+    mutates_args=("out",),
+    device_types="cuda",
+    # Pretend alpha and beta are float to make torch.library happy
+    schema="(Tensor A, Tensor B, Tensor(a2!) out, float alpha=1.0, bool dynamic_scheduler=False, bool tuned=True) -> ()",
+)
 def gemm_out(
     A: Tensor,
     B: Tensor,
     out: Tensor,
+    alpha: float | Tensor = 1.0,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> None:
     """GEMM with pre-allocated output tensor."""
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
-    fn(A, B, out, None, dynamic_scheduler)
+    fn(A, B, out, C=None, alpha=alpha, dynamic_scheduler=dynamic_scheduler)
 
 
 def gemm_ref(
     A: Tensor,
     B: Tensor,
     out: Optional[Tensor] = None,
+    alpha: float | Tensor = 1.0,
     out_dtype: Optional[torch.dtype] = None,
 ) -> Tensor:
     """Reference implementation for GEMM with pre-allocated output."""
     # The out_dtype argument requires torch >= 2.8
-    return torch.mm(A, B, out_dtype=out_dtype, out=out)
+    out = torch.mm(A, B, out_dtype=out_dtype, out=out)
+    if not isinstance(alpha, float) or alpha != 1.0:
+        out = out * alpha
+    return out
 
 
 def gemm_add(
@@ -199,6 +215,8 @@ def gemm_add(
     B: Tensor,
     C: Tensor,
     out: Optional[Tensor] = None,
+    alpha: float | Tensor = 1.0,
+    beta: float | Tensor = 1.0,
     out_dtype: Optional[torch.dtype] = None,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
@@ -207,22 +225,30 @@ def gemm_add(
     if out is None:
         out_dtype = A.dtype if out_dtype is None else out_dtype
         out = torch.empty((A.shape[0], B.shape[1]), dtype=out_dtype, device=A.device)
-    gemm_add_out(A, B, C, out, dynamic_scheduler, tuned)
+    gemm_add_out(A, B, C, out, alpha, beta, dynamic_scheduler=dynamic_scheduler, tuned=tuned)
     return out
 
 
-@torch.library.custom_op("quack::gemm_add_out", mutates_args=("out",), device_types="cuda")
+@torch.library.custom_op(
+    "quack::gemm_add_out",
+    mutates_args=("out",),
+    device_types="cuda",
+    # Pretend alpha and beta are float to make torch.library happy
+    schema="(Tensor A, Tensor B, Tensor C, Tensor(a3!) out, float alpha=1.0, float beta=1.0, bool dynamic_scheduler=False, bool tuned=True) -> ()",
+)
 def gemm_add_out(
     A: Tensor,
     B: Tensor,
     C: Tensor,
     out: Tensor,
+    alpha: float | Tensor = 1.0,
+    beta: float | Tensor = 1.0,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> None:
     """GEMM with addition and pre-allocated output tensor."""
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
-    fn(A, B, out, C, dynamic_scheduler)
+    fn(A, B, out, C, alpha=alpha, beta=beta, dynamic_scheduler=dynamic_scheduler)
 
 
 def gemm_add_ref(
@@ -230,30 +256,51 @@ def gemm_add_ref(
     B: Tensor,
     C: Tensor,
     out: Optional[Tensor] = None,
+    alpha: float | Tensor = 1.0,
+    beta: float | Tensor = 1.0,
     out_dtype: Optional[torch.dtype] = None,
 ) -> Tensor:
     """Reference implementation for GEMM with addition and pre-allocated output."""
-    return torch.addmm(C, A, B, out_dtype=out_dtype, out=out)
+    if isinstance(alpha, float) and isinstance(beta, float):
+        return torch.addmm(C, A, B, out_dtype=out_dtype, alpha=alpha, beta=beta, out=out)
+    else:
+        out_dtype = (
+            out.dtype if out is not None else (out_dtype if out_dtype is not None else A.dtype)
+        )
+        result = (alpha * (A @ B) + beta * C).to(out_dtype)
+        if out is not None:
+            out.copy_(result)
+        return result
 
 
-@torch.library.custom_op("quack::gemm_add_inplace", mutates_args=("out",), device_types="cuda")
+@torch.library.custom_op(
+    "quack::gemm_add_inplace",
+    mutates_args=("out",),
+    device_types="cuda",
+    schema="(Tensor A, Tensor B, Tensor(a2!) out, float alpha=1.0, float beta=1.0, bool dynamic_scheduler=False, bool tuned=True) -> ()",
+)
 def gemm_add_inplace(
     A: Tensor,
     B: Tensor,
     out: Tensor,
+    alpha: float | Tensor = 1.0,
+    beta: float | Tensor = 1.0,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> None:
-    """In-place GEMM with addition: out += A @ B.
+    """In-place GEMM with addition: out = alpha * A @ B + beta * out.
     Args:
         A: (M, K) input tensor
         B: (K, N) input tensor
         out: (M, N) tensor to accumulate into (modified in-place)
+        alpha: Scalar multiplier for A @ B
+        beta: Scalar multiplier for out
         dynamic_scheduler: Whether to use dynamic scheduler
         tuned: Whether to use autotuned configuration
     """
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
-    fn(A, B, out, out, dynamic_scheduler)  # Use C as both input bias and output
+    # Use C as both input bias and output
+    fn(A, B, out, out, alpha=alpha, beta=beta, dynamic_scheduler=dynamic_scheduler)
 
 
 def gemm_act(

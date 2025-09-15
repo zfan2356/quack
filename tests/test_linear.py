@@ -103,3 +103,29 @@ def test_gemm_add_inplace(m, k, n, input_dtype):
     C_ref = C_og.float() + torch.mm(A.float(), B.float())
     C_pt = C_og + torch.mm(A, B)
     assert (C - C_ref).abs().max() < 2 * (C_pt - C_ref).abs().max() + 1e-5
+
+
+@pytest.mark.parametrize("alpha_beta_type", ["float", "tensor"])
+@pytest.mark.parametrize("alpha", [0.5, 1.0, 2.0])
+@pytest.mark.parametrize("beta", [0.0, 0.5, 1.0, 1.5])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("n", [512, 1024])
+@pytest.mark.parametrize("k", [256, 768])
+@pytest.mark.parametrize("m", [480, 960])
+def test_gemm_add_inplace_alpha_beta(m, k, n, input_dtype, alpha, beta, alpha_beta_type):
+    """Test in-place GEMM with alpha/beta scaling: C = alpha * A @ B + beta * C."""
+    device = "cuda"
+    torch.random.manual_seed(42)
+    A = torch.randn((m, k), device=device, dtype=input_dtype)
+    B = torch.randn((k, n), device=device, dtype=input_dtype)
+    C = torch.randn((m, n), device=device, dtype=input_dtype)
+    if alpha_beta_type == "tensor":
+        alpha = torch.tensor(alpha, device=device, dtype=torch.float32)
+        beta = torch.tensor(beta, device=device, dtype=torch.float32)
+    C_og = C.clone()
+    gemm_add_inplace(A, B, C, alpha=alpha, beta=beta, tuned=False)
+    alpha_val = alpha.item() if torch.is_tensor(alpha) else alpha
+    beta_val = beta.item() if torch.is_tensor(beta) else beta
+    C_ref = alpha_val * torch.mm(A.float(), B.float()) + beta_val * C_og.float()
+    C_pt = alpha_val * torch.mm(A, B) + beta_val * C_og
+    assert (C - C_ref).abs().max() < 2 * (C_pt - C_ref).abs().max() + 1e-4
