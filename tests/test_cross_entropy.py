@@ -5,7 +5,6 @@ import torch
 import torch.nn.functional as F
 
 from quack.cross_entropy import cross_entropy_fwd, cross_entropy
-import cutlass
 
 torch._dynamo.config.cache_size_limit = 1024
 torch._dynamo.config.accumulated_cache_size_limit = 1024
@@ -203,7 +202,9 @@ def test_cross_entropy_ignore_index(M, N, input_dtype, use_compile):
     target_ref = target.detach().clone()
     function = torch.compile(cross_entropy, fullgraph=True) if use_compile else cross_entropy
     loss = function(x, target, reduction="none", ignore_index=ignore_index)
-    loss_ref = F.cross_entropy(x_ref.float(), target_ref, reduction="none", ignore_index=ignore_index)
+    loss_ref = F.cross_entropy(
+        x_ref.float(), target_ref, reduction="none", ignore_index=ignore_index
+    )
     # Check that losses are zero for ignored indices
     assert (loss[ignore_mask] == 0).all(), "Loss should be 0 for ignored indices"
     # Check accuracy for non-ignored indices
@@ -223,7 +224,9 @@ def test_cross_entropy_ignore_index_edge_cases(use_compile):
     """Test Cross Entropy ignore_index with edge cases."""
     device = "cuda"
     M, N = 16, 1024
-    function = torch.compile(cross_entropy_fwd, fullgraph=True) if use_compile else cross_entropy_fwd
+    function = (
+        torch.compile(cross_entropy_fwd, fullgraph=True) if use_compile else cross_entropy_fwd
+    )
 
     x = 0.1 * torch.randn(M, N, device=device, dtype=torch.float32)
     # Test with all targets being ignore_index
@@ -239,7 +242,9 @@ def test_cross_entropy_ignore_index_edge_cases(use_compile):
     torch.testing.assert_close(loss_none_ignored, loss_ref, atol=1e-4, rtol=1e-4)
     # Test with default ignore_index (-100)
     target_with_default = torch.randint(0, N, (M,), device=device, dtype=torch.int64)
-    target_with_default[0] = -100  # Won't actually be -100 due to randint range, just for illustration
+    target_with_default[
+        0
+    ] = -100  # Won't actually be -100 due to randint range, just for illustration
     # Since -100 is out of valid range [0, N), it won't match any targets
     loss_default = function(x, target_with_default)  # Uses default ignore_index=-100
     loss_ref_default = F.cross_entropy(x, target_with_default, reduction="none")
@@ -261,10 +266,14 @@ def test_cross_entropy_fwd_with_grad(M, N, input_dtype, inplace_backward, use_co
     x_ref = x.detach().clone().requires_grad_()
     target_ref = target.detach().clone()
     # Test forward with gradient computation
-    function = torch.compile(cross_entropy_fwd, fullgraph=True) if use_compile else cross_entropy_fwd
+    function = (
+        torch.compile(cross_entropy_fwd, fullgraph=True) if use_compile else cross_entropy_fwd
+    )
     if inplace_backward:
         x_copy = x.detach().clone()
-        loss, lse, dx = function(x_copy, target, return_lse=True, return_dx=True, inplace_backward=True)
+        loss, lse, dx = function(
+            x_copy, target, return_lse=True, return_dx=True, inplace_backward=True
+        )
         # Check that dx is the same tensor as x_copy (inplace)
         assert dx is x_copy, "inplace_backward should modify x in-place"
     else:
@@ -290,23 +299,35 @@ def test_cross_entropy_fwd_with_grad(M, N, input_dtype, inplace_backward, use_co
     if inplace_backward:
         x_copy = x.detach().clone()
         loss_ig, lse_ig, dx_ig = function(
-            x_copy, target, ignore_index=ignore_index,
-            return_lse=True, return_dx=True, inplace_backward=True
+            x_copy,
+            target,
+            ignore_index=ignore_index,
+            return_lse=True,
+            return_dx=True,
+            inplace_backward=True,
         )
         assert dx_ig is x_copy
     else:
         loss_ig, lse_ig, dx_ig = function(
-            x, target, ignore_index=ignore_index,
-            return_lse=True, return_dx=True, inplace_backward=False
+            x,
+            target,
+            ignore_index=ignore_index,
+            return_lse=True,
+            return_dx=True,
+            inplace_backward=False,
         )
         assert dx_ig is not x
     # Reference with ignore_index
     x_ref2 = x.detach().clone().requires_grad_()
-    loss_ref_ig = F.cross_entropy(x_ref2.float(), target, reduction="none", ignore_index=ignore_index)
+    loss_ref_ig = F.cross_entropy(
+        x_ref2.float(), target, reduction="none", ignore_index=ignore_index
+    )
     (dx_ref_ig,) = torch.autograd.grad(loss_ref_ig, x_ref2, grad_outputs=dloss)
     # Check that losses are zero for ignored indices
     assert (loss_ig[ignore_mask] == 0).all(), "Loss should be 0 for ignored indices"
     # Check accuracy for non-ignored indices
     if (~ignore_mask).any():
-        torch.testing.assert_close(loss_ig[~ignore_mask], loss_ref_ig[~ignore_mask], atol=atol, rtol=rtol)
+        torch.testing.assert_close(
+            loss_ig[~ignore_mask], loss_ref_ig[~ignore_mask], atol=atol, rtol=rtol
+        )
     torch.testing.assert_close(dx_ig, dx_ref_ig.to(input_dtype), atol=atol, rtol=rtol)

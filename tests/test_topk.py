@@ -3,18 +3,18 @@
 import pytest
 import torch
 
-import cutlass
 
 from quack.topk import topk
 
 torch._dynamo.config.cache_size_limit = 1024
 torch._dynamo.config.accumulated_cache_size_limit = 1024
 
+
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
 # @pytest.mark.parametrize("input_dtype", [torch.float32])
 @pytest.mark.parametrize(
     "N, k",
-    [(64, 16), (128, 32), (256, 16), (512, 32), (1024, 32), (4096, 32), (4096, 64), (4096, 128)]
+    [(64, 16), (128, 32), (256, 16), (512, 32), (1024, 32), (4096, 32), (4096, 64), (4096, 128)],
     # [(256, 4)]
 )
 @pytest.mark.parametrize("M", [1, 37, 199])
@@ -55,8 +55,13 @@ def test_topk(M, N, k, input_dtype, function):
 
     # Check that x indexed at out_idx is close to out_val using gather
     indexed_vals = torch.gather(x, 1, out_idx.long())
-    torch.testing.assert_close(indexed_vals, out_val, atol=atol, rtol=rtol,
-                               msg="Values indexed from x don't match output values")
+    torch.testing.assert_close(
+        indexed_vals,
+        out_val,
+        atol=atol,
+        rtol=rtol,
+        msg="Values indexed from x don't match output values",
+    )
 
 
 # @pytest.mark.parametrize("input_dtype", [torch.float16, torch.float32])
@@ -96,5 +101,3 @@ def test_topk(M, N, k, input_dtype, function):
 #     out_neg = topk(x_neg, 8)
 #     out_ref_neg, _ = torch.topk(x_neg, 8, dim=-1, largest=True, sorted=True)
 #     torch.testing.assert_close(out_neg, out_ref_neg, atol=1e-6, rtol=1e-6)
-
-

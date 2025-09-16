@@ -4,7 +4,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-import cutlass
 
 from quack.softmax import softmax
 
@@ -17,7 +16,7 @@ torch._dynamo.config.accumulated_cache_size_limit = 1024
 # @pytest.mark.parametrize("input_dtype", [torch.float32])
 @pytest.mark.parametrize(
     "N",
-    [192, 256, 512, 760, 1024, 1128, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
+    [192, 256, 512, 760, 1024, 1128, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144],
     # [32768]
 )
 @pytest.mark.parametrize("M", [1, 37, 199])
@@ -63,9 +62,9 @@ def test_softmax(M, N, input_dtype, function):
     # Test backward pass
     dy = torch.randn_like(out)
     torch.cuda.synchronize()  # without sync, torch.autograd gets wrong results
-    dx_ref, = torch.autograd.grad(out_ref, x_ref, grad_outputs=dy)
+    (dx_ref,) = torch.autograd.grad(out_ref, x_ref, grad_outputs=dy)
     # Call our implementation later, otherwise getting CUDA_ERROR_INVALID_CONTEXT
-    dx, = torch.autograd.grad(out, x, grad_outputs=dy)
+    (dx,) = torch.autograd.grad(out, x, grad_outputs=dy)
     assert dx.shape == dy.shape
     assert dx.dtype == input_dtype
     torch.testing.assert_close(dx, dx_ref, atol=atol, rtol=rtol)
