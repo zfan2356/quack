@@ -2,7 +2,7 @@
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/hopper/dense_gemm.py
 
 import enum
-from typing import Tuple, Type, Callable, Optional, Union
+from typing import Tuple, Type, Callable, Optional, Union, List
 from dataclasses import dataclass
 from functools import partial
 import math
@@ -328,6 +328,29 @@ class GemmSm90:
         )
 
     @cute.jit
+    def _get_fragment_tensor(
+        self, seqlens: Optional[List[cutlass.Int32]], tensor: Optional[cute.Tensor]
+    ):
+        if const_expr(seqlens is not None):
+            r_cu_seqlens = cute.make_fragment(len(seqlens), dtype=cutlass.Int32)
+            for i, x in enumerate(seqlens):
+                r_cu_seqlens[i] = x
+        else:
+            r_cu_seqlens = None
+        cu_seqlens = tensor if const_expr(tensor is not None) else None
+        return r_cu_seqlens, cu_seqlens
+
+    @cute.jit
+    def _process_varlen_tensor(self, varlen_args: VarlenArguments):
+        r_cu_seqlens_m, cu_seqlens_m = self._get_fragment_tensor(
+            varlen_args.mCuSeqlensMCpu, varlen_args.mCuSeqlensM
+        )
+        r_cu_seqlens_k, cu_seqlens_k = self._get_fragment_tensor(
+            varlen_args.mCuSeqlensKCpu, varlen_args.mCuSeqlensK
+        )
+        return r_cu_seqlens_m, cu_seqlens_m, r_cu_seqlens_k, cu_seqlens_k
+
+    @cute.jit
     def __call__(
         self,
         mA: cute.Tensor,
@@ -449,15 +472,25 @@ class GemmSm90:
 
         if const_expr(varlen_args is None):
             varlen_args = VarlenArguments()
-        if const_expr(varlen_args.mCuSeqlensM is None):
+
+        varlen_m = varlen_args.mCuSeqlensM is not None or varlen_args.mCuSeqlensMCpu is not None
+        varlen_k = varlen_args.mCuSeqlensK is not None or varlen_args.mCuSeqlensKCpu is not None
+        r_cu_seqlens_m, cu_seqlens_m, r_cu_seqlens_k, cu_seqlens_k = self._process_varlen_tensor(
+            varlen_args
+        )
+        if const_expr(not varlen_m):
+            if const_expr(varlen_k):
+                seqlens_k_shape = (
+                    cu_seqlens_k.shape[0] - 1
+                    if cu_seqlens_k is not None
+                    else r_cu_seqlens_k.shape[0] - 1
+                )
+            else:
+                seqlens_k_shape = None
             num_problems = (
                 mD.shape[2]
                 if mD is not None
-                else (
-                    mB.shape[2]
-                    if varlen_args.mCuSeqlensK is None
-                    else varlen_args.mCuSeqlensK.shape[0] - 1
-                )
+                else (mB.shape[2] if not varlen_k else seqlens_k_shape)
             )
             problem_shape_ntile_mnl = (
                 cute.ceil_div(mA.shape[0], self.tile_shape_mnk[0]),
@@ -468,16 +501,19 @@ class GemmSm90:
             tile_sched_args = self.get_scheduler_arguments(problem_shape_ntile_mnl, scheduler_args)
         else:
             assert mD is not None or not self.gather_A
+
             problem_shape_ntile_mnl = (
                 None,
                 cute.ceil_div(mB.shape[0], self.tile_shape_mnk[1]),
-                varlen_args.mCuSeqlensM.shape[0] - 1,
+                cu_seqlens_m.shape[0] - 1
+                if cu_seqlens_m is not None
+                else r_cu_seqlens_m.shape[0] - 1,
             )
             TileSchedulerCls = VarlenMTileScheduler
             tile_sched_args = VarlenMTileSchedulerArguments(
                 problem_shape_ntile_mnl=problem_shape_ntile_mnl,
                 total_m=mD.shape[0] if mD is not None else mAIdx.shape[0],
-                cu_seqlens_m=varlen_args.mCuSeqlensM,
+                cu_seqlens_m=cu_seqlens_m if cu_seqlens_m is not None else r_cu_seqlens_m,
                 raster_order=scheduler_args.raster_order,
                 group_size=scheduler_args.max_swizzle_size,
                 tile_shape_mnk=self.tile_shape_mnk,
@@ -537,7 +573,7 @@ class GemmSm90:
             tma_tensor_c,
             epilogue_params,
             mAIdx,
-            varlen_args.mCuSeqlensM,
+            cu_seqlens_m if cu_seqlens_m is not None else r_cu_seqlens_m,
             varlen_args.mCuSeqlensK,
             varlen_args.mTensormaps,
             tiled_mma,

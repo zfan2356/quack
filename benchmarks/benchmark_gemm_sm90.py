@@ -138,6 +138,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--gather_A", action="store_true", help="Gather A")
     parser.add_argument("--fp8_fast_accum", action="store_true", help="FP8 fast accum")
     parser.add_argument("--skip_ref_check", action="store_true", help="Skip reference checking")
+    parser.add_argument("--use_cpu_varlen_m", action="store_true", help="Use CPU varlen M")
+    parser.add_argument("--use_cpu_varlen_k", action="store_true", help="Use CPU varlen K")
 
     args = parser.parse_args()
 
@@ -147,6 +149,10 @@ def parse_arguments() -> argparse.Namespace:
         parser.error("--tile_shape_mnk must contain exactly 3 values")
     if len(args.cluster_shape_mn) != 2:
         parser.error("--cluster_shape_mn must contain exactly 2 values")
+    if args.use_cpu_varlen_m and not args.varlen_m:
+        parser.error("--use_cpu_varlen_m requires --varlen_m")
+    if args.use_cpu_varlen_k and not args.varlen_k:
+        parser.error("--use_cpu_varlen_k requires --varlen_k")
 
     return args
 
@@ -176,6 +182,8 @@ def run(
     permute_batch: bool,
     gather_A: bool,
     fp8_fast_accum: bool,
+    use_cpu_varlen_m: bool,
+    use_cpu_varlen_k: bool,
     **kwargs,
 ):
     """
@@ -332,11 +340,15 @@ def run(
         # TODO: generate random cu_seqlens_m
         cu_seqlens_m = torch.arange(0, l + 1, dtype=torch.int32, device="cuda") * m
         mCuSeqlensM = from_dlpack(cu_seqlens_m, assumed_align=4).mark_layout_dynamic(leading_dim=0)
+        if use_cpu_varlen_m:
+            mCuSeqlensMCpu = list(range(0, l + 1)) * m
+        else:
+            mCuSeqlensMCpu = None
         if gather_A:
             a_idx_reshaped = rearrange(a_idx_reshaped, "m l -> (l m)")
             mAIdx = from_dlpack(a_idx_reshaped, assumed_align=4).mark_layout_dynamic(leading_dim=0)
     else:
-        cu_seqlens_m, mCuSeqlensM = None, None
+        cu_seqlens_m, mCuSeqlensM, mCuSeqlensMCpu = None, None, None
 
     if varlen_k:
         from einops import rearrange
@@ -349,8 +361,12 @@ def run(
         # TODO: generate random cu_seqlens_k
         cu_seqlens_k = torch.arange(0, l + 1, dtype=torch.int32, device="cuda") * k
         mCuSeqlensK = from_dlpack(cu_seqlens_k, assumed_align=4).mark_layout_dynamic(leading_dim=0)
+        if use_cpu_varlen_k:
+            mCuSeqlensKCpu = list(range(0, l + 1)) * k
+        else:
+            mCuSeqlensKCpu = None
     else:
-        cu_seqlens_k, mCuSeqlensK = None, None
+        cu_seqlens_k, mCuSeqlensK, mCuSeqlensKCpu = None, None, None
 
 
     if varlen_m or varlen_k:  # Need to allocate space in gmem to store tensormaps
@@ -410,7 +426,7 @@ def run(
     )
 
     epi_args = gemm.EpilogueArguments()
-    varlen_args = VarlenArguments(mCuSeqlensM, mCuSeqlensK, tensormaps_tensor)
+    varlen_args = VarlenArguments(mCuSeqlensM, mCuSeqlensMCpu, mCuSeqlensK, mCuSeqlensKCpu, tensormaps_tensor)
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     # compile gemm kernel
     compiled_gemm = cute.compile(
@@ -595,5 +611,7 @@ if __name__ == "__main__":
         args.permute_batch,
         args.gather_A,
         args.fp8_fast_accum,
+        args.use_cpu_varlen_m,
+        args.use_cpu_varlen_k,
     )
     print("PASS")

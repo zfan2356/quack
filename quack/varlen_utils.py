@@ -1,10 +1,10 @@
 # Copyright (c) 2025, Tri Dao.
 
-from typing import Optional
+from typing import Optional, List
 from dataclasses import dataclass
 
 import cutlass.cute as cute
-
+import cutlass
 from quack.cute_dsl_utils import ArgumentsBase
 
 
@@ -12,11 +12,18 @@ from quack.cute_dsl_utils import ArgumentsBase
 @dataclass
 class VarlenArguments(ArgumentsBase):
     mCuSeqlensM: Optional[cute.Tensor] = None
+    mCuSeqlensMCpu: Optional[List[cutlass.Int32]] = None
     mCuSeqlensK: Optional[cute.Tensor] = None
+    mCuSeqlensKCpu: Optional[List[cutlass.Int32]] = None
     mTensormaps: Optional[cute.Tensor] = None
 
     def __post_init__(self):
-        if self.mCuSeqlensM is not None or self.mCuSeqlensK is not None:
+        if (
+            self.mCuSeqlensM is not None
+            or self.mCuSeqlensK is not None
+            or self.mCuSeqlensMCpu is not None
+            or self.mCuSeqlensKCpu is not None
+        ):
             assert (
                 self.mTensormaps is not None
             ), "mTensormaps must be provided if mCuSeqlensM or mCuSeqlensK is provided"

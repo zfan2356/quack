@@ -568,7 +568,7 @@ class TriangularTileScheduler(TileScheduler):
 
 
 @dataclass
-class VarlenMTileSchedulerArguments(ParamsBase):
+class VarlenMTileSchedulerArguments(ArgumentsBase):
     problem_shape_ntile_mnl: cute.Shape
     total_m: Int32
     cu_seqlens_m: cute.Tensor
@@ -599,7 +599,7 @@ class VarlenMTileScheduler(TileScheduler):
         @staticmethod
         @cute.jit
         def create(
-            args: TileSchedulerArguments, *, loc=None, ip=None
+            args: VarlenMTileSchedulerArguments, *, loc=None, ip=None
         ) -> "VarlenMTileScheduler.Params":
             assert args.cluster_shape_mnk[2] == 1
             cluster_shape_mn = const_expr(cute.select(args.cluster_shape_mnk, mode=[0, 1]))
