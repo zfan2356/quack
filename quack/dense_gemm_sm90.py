@@ -761,6 +761,7 @@ class GemmSm90:
                                 is_manager_warp=is_tma_warp,
                                 shapes=(cu_seqlens_k[batch_idx + 1], cu_seqlens_k[batch_idx + 1]),
                                 orders=(
+                                    # TODO: is_k_major_a is no longer there in cutlass 4.2
                                     0 if const_expr(self.a_layout.is_k_major_a()) else 1,
                                     # confusingly b_layout is ROW_MAJOR when it's k-major,
                                     # so the result of b_layout.is_k_major_b() is the opposite of
@@ -1168,7 +1169,7 @@ class GemmSm90:
                 # End of persistent scheduler loop
 
             if const_expr(not self.pingpong):
-                if warp_idx == 0:
+                if is_tma_warp:
                     cute.arch.cp_async_bulk_wait_group(0, read=True)
 
     @cute.jit
@@ -1810,9 +1811,7 @@ class GemmSm90:
         )
         mbar_helpers_bytes = 1024
 
-        remaining_bytes = (
-            (smem_capacity - occupancy * 1024) // occupancy - mbar_helpers_bytes - epi_bytes
-        )
+        remaining_bytes = smem_capacity // occupancy - mbar_helpers_bytes - epi_bytes
         ab_stage = remaining_bytes // ab_bytes_per_stage
 
         # Refine epilogue stages:
