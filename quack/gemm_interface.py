@@ -171,7 +171,17 @@ def gemm(
     if out is None:
         out_dtype = A.dtype if out_dtype is None else out_dtype
         out = torch.empty((A.shape[0], B.shape[1]), dtype=out_dtype, device=A.device)
-    gemm_out(A, B, out, alpha=alpha, dynamic_scheduler=dynamic_scheduler, tuned=tuned)
+    alpha_tensor = alpha if not isinstance(alpha, float) else None
+    alpha = alpha if isinstance(alpha, float) else 1.0
+    gemm_out(
+        A,
+        B,
+        out,
+        alpha=alpha,
+        alpha_tensor=alpha_tensor,
+        dynamic_scheduler=dynamic_scheduler,
+        tuned=tuned,
+    )
     return out
 
 
@@ -179,19 +189,22 @@ def gemm(
     "quack::gemm_out",
     mutates_args=("out",),
     device_types="cuda",
-    # Pretend alpha and beta are float to make torch.library happy
-    schema="(Tensor A, Tensor B, Tensor(a2!) out, float alpha=1.0, bool dynamic_scheduler=False, bool tuned=True) -> ()",
+    # We have to split out alpha and alpha_tensor since torch.library requires
+    # each argument to have a fixed type
+    # schema="(Tensor A, Tensor B, Tensor(a2!) out, float alpha=1.0, Tensor? alpha_tensor=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
 )
 def gemm_out(
     A: Tensor,
     B: Tensor,
     out: Tensor,
-    alpha: float | Tensor = 1.0,
+    alpha: float = 1.0,
+    alpha_tensor: Optional[Tensor] = None,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> None:
     """GEMM with pre-allocated output tensor."""
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
+    alpha = alpha_tensor if alpha_tensor is not None else alpha
     fn(A, B, out, C=None, alpha=alpha, dynamic_scheduler=dynamic_scheduler)
 
 
@@ -225,7 +238,22 @@ def gemm_add(
     if out is None:
         out_dtype = A.dtype if out_dtype is None else out_dtype
         out = torch.empty((A.shape[0], B.shape[1]), dtype=out_dtype, device=A.device)
-    gemm_add_out(A, B, C, out, alpha, beta, dynamic_scheduler=dynamic_scheduler, tuned=tuned)
+    alpha_tensor = alpha if not isinstance(alpha, float) else None
+    alpha = alpha if isinstance(alpha, float) else 1.0
+    beta_tensor = beta if not isinstance(beta, float) else None
+    beta = beta if isinstance(beta, float) else 1.0
+    gemm_add_out(
+        A,
+        B,
+        C,
+        out,
+        alpha,
+        beta,
+        alpha_tensor,
+        beta_tensor,
+        dynamic_scheduler=dynamic_scheduler,
+        tuned=tuned,
+    )
     return out
 
 
@@ -233,21 +261,26 @@ def gemm_add(
     "quack::gemm_add_out",
     mutates_args=("out",),
     device_types="cuda",
-    # Pretend alpha and beta are float to make torch.library happy
-    schema="(Tensor A, Tensor B, Tensor C, Tensor(a3!) out, float alpha=1.0, float beta=1.0, bool dynamic_scheduler=False, bool tuned=True) -> ()",
+    # We have to split out alpha and alpha_tensor since torch.library requires
+    # each argument to have a fixed type
+    # schema="(Tensor A, Tensor B, Tensor C, Tensor(a3!) out, float alpha=1.0, float beta=1.0, Tensor? alpha_tensor=None, Tensor? beta_tensor=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
 )
 def gemm_add_out(
     A: Tensor,
     B: Tensor,
     C: Tensor,
     out: Tensor,
-    alpha: float | Tensor = 1.0,
-    beta: float | Tensor = 1.0,
+    alpha: float = 1.0,
+    beta: float = 1.0,
+    alpha_tensor: Optional[Tensor] = None,
+    beta_tensor: Optional[Tensor] = None,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
 ) -> None:
     """GEMM with addition and pre-allocated output tensor."""
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
+    alpha = alpha_tensor if alpha_tensor is not None else alpha
+    beta = beta_tensor if beta_tensor is not None else beta
     fn(A, B, out, C, alpha=alpha, beta=beta, dynamic_scheduler=dynamic_scheduler)
 
 
@@ -273,12 +306,6 @@ def gemm_add_ref(
         return result
 
 
-@torch.library.custom_op(
-    "quack::gemm_add_inplace",
-    mutates_args=("out",),
-    device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor(a2!) out, float alpha=1.0, float beta=1.0, bool dynamic_scheduler=False, bool tuned=True) -> ()",
-)
 def gemm_add_inplace(
     A: Tensor,
     B: Tensor,
@@ -298,7 +325,35 @@ def gemm_add_inplace(
         dynamic_scheduler: Whether to use dynamic scheduler
         tuned: Whether to use autotuned configuration
     """
+    alpha_tensor = alpha if not isinstance(alpha, float) else None
+    alpha = alpha if isinstance(alpha, float) else 1.0
+    beta_tensor = beta if not isinstance(beta, float) else None
+    beta = beta if isinstance(beta, float) else 1.0
+    gemm_add_inplace_op(A, B, out, alpha, beta, alpha_tensor, beta_tensor, dynamic_scheduler, tuned)
+
+
+@torch.library.custom_op(
+    "quack::gemm_add_inplace",
+    mutates_args=("out",),
+    device_types="cuda",
+    # We have to split out alpha and alpha_tensor since torch.library requires
+    # each argument to have a fixed type
+    # schema="(Tensor A, Tensor B, Tensor(a2!) out, float alpha=1.0, float beta=1.0, Tensor? alpha_tensor=None, Tensor? beta_tensor=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
+)
+def gemm_add_inplace_op(
+    A: Tensor,
+    B: Tensor,
+    out: Tensor,
+    alpha: float = 1.0,
+    beta: float = 1.0,
+    alpha_tensor: Optional[Tensor] = None,
+    beta_tensor: Optional[Tensor] = None,
+    dynamic_scheduler: bool = False,
+    tuned: bool = True,
+) -> None:
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
+    alpha = alpha_tensor if alpha_tensor is not None else alpha
+    beta = beta_tensor if beta_tensor is not None else beta
     # Use C as both input bias and output
     fn(A, B, out, out, alpha=alpha, beta=beta, dynamic_scheduler=dynamic_scheduler)
 

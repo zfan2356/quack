@@ -249,7 +249,7 @@ class LinearCrossEntropy(nn.Linear):
             and input.stride(-1) == 1
             and self.in_features % 8 == 0
             and self.out_features % 8 == 0
-            and input.shape[:-1].numel % 8 == 0
+            and input.shape[:-1].numel() % 8 == 0
             and self.chunk_size is not None
             and self.chunk_size % 8 == 0
             and self.reduction in ["mean", "sum"]
