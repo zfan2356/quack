@@ -1,19 +1,16 @@
 # Copyright (c) 2025, Tri Dao.
 from typing import Optional
 
-import torch
 from torch import Tensor
-
-import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, const_expr
-from cutlass.cute.runtime import from_dlpack, make_ptr
+from cutlass import const_expr
+import cutlass.torch as cutlass_torch
 
-from quack.dense_gemm_sm90 import TileSchedulerOptions
 from quack.gemm_act_sm90 import GemmActSm90
-from quack.cute_dsl_utils import torch2cute_dtype_map, get_max_active_clusters
+from quack.cute_dsl_utils import get_max_active_clusters
+from quack.gemm_wrapper_utils import GemmWrapperBase
 import quack.activation
 
 
@@ -69,98 +66,57 @@ def gemm_dact_sm90(
     pingpong: bool = True,
     persistent: bool = True,
 ) -> None:
-    assert A.dim() == 3 and A.is_cuda, "A must be A 3D CUDA tensor"
-    L, M, K = A.shape
-    assert A.dtype in torch2cute_dtype_map, "Unsupported dtype for A"
-    assert B.dim() == 3 and B.is_cuda, "B must be A 3D CUDA tensor"
-    _, N, _ = B.shape
-    assert B.dtype == A.dtype
-    assert B.shape == (L, N, K), f"B must have shape {(L, N, K)}, got {B.shape}"
-    assert Out.dim() == 3 and Out.is_cuda, "Out must be A 3D CUDA tensor"
-    assert Out.dtype in torch2cute_dtype_map, "Unsupported dtype for Out"
-    assert Out.shape == (L, M, N), f"Out must have shape {(L, M, N)}, got {Out.shape}"
-    assert PostAct.dim() == 3 and PostAct.is_cuda, "PostAct must be A 3D CUDA tensor"
-    assert PostAct.dtype in torch2cute_dtype_map, "Unsupported dtype for PostAct"
-    assert PostAct.shape == (L, M, N), f"PostAct must have shape {(L, M, N)}, got {PostAct.shape}"
-    assert PreAct.dim() == 3 and PreAct.is_cuda, "PreAct must be A 3D CUDA tensor"
-    assert PreAct.shape == (L, M, N), f"PreAct must have shape {(L, M, N)}, got {PreAct.shape}"
-    assert PreAct.dtype in torch2cute_dtype_map, "Unsupported dtype for PreAct"
     assert activation in dact_fn_map, f"Unsupported activation {activation}"
-    A, B, Out, PreAct, PostAct = [
-        x.permute(1, 2, 0) if x is not None else None for x in (A, B, Out, PreAct, PostAct)
-    ]  # (m, k, l), (n, k, l), (m, n, l)
+    L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
+        A, B, Out, PreAct, additional_tensors={"PostAct": PostAct}
+    )
+    GemmWrapperBase.permute_tensors(tensor_infos)
+    GemmWrapperBase.extract_dtypes(tensor_infos)
+    major_configs = {
+        "A": ("m", "k", "l"),
+        "B": ("n", "k", "l"),
+        "D": ("m", "n", "l"),
+        "C": ("m", "n", "l"),
+        "PostAct": ("m", "n", "l"),
+    }
+    GemmWrapperBase.determine_major_orders(tensor_infos, major_configs)
 
-    a_dtype = torch2cute_dtype_map[A.dtype]
-    b_dtype = a_dtype
-    d_dtype = torch2cute_dtype_map[Out.dtype] if Out is not None else None
-    postact_dtype = torch2cute_dtype_map[PostAct.dtype]
-    c_dtype = torch2cute_dtype_map[PreAct.dtype] if PreAct is not None else None
     acc_dtype = cutlass.Float32
     tile_shape_mnk = (tile_M, tile_N, 64)  # TODO: adjust for fp8
     cluster_shape_mnk = (cluster_M, cluster_N, 1)
-    a_major = "k" if A.stride(1) == 1 else "m"
-    b_major = "k" if B.stride(1) == 1 else "n"
-    d_major = "n" if Out is not None and Out.stride(1) == 1 else "m"
-    postact_major = "n" if PostAct.stride(1) == 1 else "m"
-    c_major = "n" if PreAct is not None and PreAct.stride(1) == 1 else "m"
-    if not GemmDActSm90.is_valid_dtypes(a_dtype, b_dtype, acc_dtype, d_dtype, a_major, b_major):
-        raise TypeError(
-            f"Skipping due to unsupported combination of types and majors: {a_dtype}, {b_dtype}, {acc_dtype}, {d_dtype}, {a_major=}, {b_major=}"
-        )
-    if persistent:
-        max_active_clusters = get_max_active_clusters(cluster_M * cluster_N)
-    else:
-        max_active_clusters = 0
-    mA = from_dlpack(A.detach(), assumed_align=16).mark_layout_dynamic(
-        leading_dim=1 if a_major == "k" else 0
-    )
-    mB = from_dlpack(B.detach(), assumed_align=16).mark_layout_dynamic(
-        leading_dim=1 if b_major == "k" else 0
-    )
-    mOut = from_dlpack(Out.detach(), assumed_align=16).mark_layout_dynamic(
-        leading_dim=1 if d_major == "n" else 0
-    )
-    mPostAct = from_dlpack(PostAct.detach(), assumed_align=16).mark_layout_dynamic(
-        leading_dim=1 if postact_major == "n" else 0
-    )
-    mPreAct = from_dlpack(PreAct.detach(), assumed_align=16).mark_layout_dynamic(
-        leading_dim=1 if c_major == "n" else 0
-    )
+    if not GemmDActSm90.is_valid_dtypes(
+        tensor_infos["A"].dtype,
+        tensor_infos["B"].dtype,
+        acc_dtype,
+        tensor_infos["D"].dtype,
+        tensor_infos["A"].major,
+        tensor_infos["B"].major,
+    ):
+        raise TypeError("Skipping due to unsupported combination of types and majors")
 
+    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
+    GemmWrapperBase.create_cute_tensors(tensor_infos, major_configs)
     act_fn = dact_fn_map[activation]
-    epi_args = GemmDActSm90.EpilogueArguments(mPostAct, act_fn)
-    scheduler_args = TileSchedulerOptions(
-        Int32(max_active_clusters),
-        tile_count_semaphore=make_ptr(
-            Int32, tile_count_semaphore.data_ptr(), cute.AddressSpace.gmem, assumed_align=4
-        )
-        if tile_count_semaphore is not None
-        else None,
+    epi_args = GemmDActSm90.EpilogueArguments(tensor_infos["PostAct"].cute_tensor, act_fn)
+    scheduler_args = GemmWrapperBase.create_scheduler_args(
+        max_active_clusters, tile_count_semaphore
     )
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
-    compile_key = (
-        a_dtype,
-        d_dtype,
-        postact_dtype,
-        c_dtype,
+    current_stream = cutlass_torch.current_stream()
+    compile_key = GemmWrapperBase.get_compile_key(
+        tensor_infos,
         activation,
         tile_shape_mnk,
         cluster_shape_mnk,
-        a_major,
-        b_major,
-        d_major,
-        c_major,
         pingpong,
         persistent,
         tile_count_semaphore is not None,
+        key_tensor_names=("A", "B", "D", "PostAct", "C"),
     )
-
     cache = gemm_dact_sm90.compile_cache
     if compile_key not in cache:
         gemm = GemmDActSm90(
             acc_dtype,
-            a_dtype,
+            tensor_infos["A"].dtype,
             tile_shape_mnk,
             cluster_shape_mnk,
             pingpong=pingpong,
@@ -168,17 +124,27 @@ def gemm_dact_sm90(
         )
         cache[compile_key] = cute.compile(
             gemm,
-            mA,
-            mB,
-            mOut,
-            mPreAct,
+            tensor_infos["A"].cute_tensor,
+            tensor_infos["B"].cute_tensor,
+            tensor_infos["D"].cute_tensor,
+            tensor_infos["C"].cute_tensor,
             epi_args,
             scheduler_args,
             None,  # varlen_args
             None,  # mAIdx
             current_stream,
         )
-    cache[compile_key](mA, mB, mOut, mPreAct, epi_args, scheduler_args, None, None, current_stream)
+    cache[compile_key](
+        tensor_infos["A"].cute_tensor,
+        tensor_infos["B"].cute_tensor,
+        tensor_infos["D"].cute_tensor,
+        tensor_infos["C"].cute_tensor,
+        epi_args,
+        scheduler_args,
+        None,
+        None,
+        current_stream,
+    )
 
 
 gemm_dact_sm90.compile_cache = {}

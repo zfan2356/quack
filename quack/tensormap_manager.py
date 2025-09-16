@@ -99,6 +99,7 @@ class TensorMapManagerSm90(TensorMapManager):
                 for gmem_ptr, smem_ptr in zip(tensormap_gmem_ptr, tensormap_smem_ptr):
                     cute.nvgpu.cpasync.cp_fence_tma_desc_release(gmem_ptr, smem_ptr)
             else:
+                assert len(shapes) == len(orders) == len(tensormap_gmem_ptr)
                 for gmem_ptr, shape, order in zip(tensormap_gmem_ptr, shapes, orders):
                     gmem_ptr_i64 = gmem_ptr.toint().ir_value()
                     llvm.inline_asm(

@@ -50,6 +50,7 @@ class TileSchedulerOptions(ArgumentsBase):
     raster_order: cutlass.Constexpr[RasterOrderOption] = RasterOrderOption.Heuristic
     max_swizzle_size: Int32 = Int32(8)
     tile_count_semaphore: Optional[cute.Pointer] = None
+    batch_idx_permute: Optional[cute.Tensor] = None
 
 
 @dataclass
@@ -59,6 +60,7 @@ class TileSchedulerArguments(ArgumentsBase):
     group_size: Int32
     cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
     tile_count_semaphore: Optional[cute.Pointer] = None
+    batch_idx_permute: Optional[cute.Tensor] = None
     is_persistent: cutlass.Constexpr[bool] = False
 
 
@@ -73,6 +75,7 @@ class TileScheduler:
         group_size_tail_divmod: FastDivmod
         num_clusters_in_group_divmod: FastDivmod
         tile_count_semaphore: Optional[cute.Pointer]
+        batch_idx_permute: Optional[cute.Tensor]
         cluster_shape_mn: cutlass.Constexpr[cute.Shape]
         is_persistent: cutlass.Constexpr[bool]
 
@@ -114,6 +117,7 @@ class TileScheduler:
                 FastDivmod.create(group_size_tail if group_size_tail > 0 else 1),
                 FastDivmod.create(num_clusters_in_group),
                 args.tile_count_semaphore if const_expr(args.is_persistent) else None,
+                args.batch_idx_permute,
                 cluster_shape_mn,
                 args.is_persistent,
             )
@@ -242,7 +246,10 @@ class TileScheduler:
         bidx_in_cluster = cute.arch.block_in_cluster_idx()
         pid_m = cid_m * params.cluster_shape_mn[0] + bidx_in_cluster[0]
         pid_n = cid_n * params.cluster_shape_mn[1] + bidx_in_cluster[1]
-        tile_coord_mnkl = (pid_m, pid_n, None, bidz)
+        batch_idx = (
+            bidz if const_expr(params.batch_idx_permute is None) else params.batch_idx_permute[bidz]
+        )
+        tile_coord_mnkl = (pid_m, pid_n, None, batch_idx)
         if const_expr(not params.is_persistent):
             is_valid = self._num_tiles_executed == 0
         else:
@@ -286,7 +293,8 @@ class TileScheduler:
             if const_expr(params.tile_count_semaphore is None):  # Static persistent
                 self._current_work_linear_idx += advance_count * Int32(num_persistent_clusters)
             else:  # Dynamic persistent
-                self._pipeline_state.advance_iters(advance_count - 1)
+                if const_expr(advance_count > 1):
+                    self._pipeline_state.advance_iters(advance_count - 1)
                 current_work_linear_idx = self._current_work_linear_idx
                 if is_scheduler_warp:
                     self._scheduler_pipeline.producer_acquire(self._pipeline_state)

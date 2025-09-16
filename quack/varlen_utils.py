@@ -12,12 +12,13 @@ from quack.cute_dsl_utils import ArgumentsBase
 @dataclass
 class VarlenArguments(ArgumentsBase):
     mCuSeqlensMTensor: Optional[cute.Tensor] = None
+    mCuSeqlensK: Optional[cute.Tensor] = None
     mCuSeqlensMList: Optional[List[cutlass.Int32]] = None
     mCuSeqlen: cutlass.Constexpr[cutlass.Int32] = cutlass.const_expr(0)
     mTensormaps: Optional[cute.Tensor] = None
 
-    # def __post_init__(self):
-    #     varlen_m = (self.mCuSeqlensMTensor is not None) or (self.mCuSeqlensMList is not None)
-    #     assert all(x is None for x in [varlen_m, self.mTensormaps]) or all(
-    #         x is not None for x in [varlen_m, self.mTensormaps]
-    #     ), "All two fields (mCuSeqlensM, mTensormaps) must be either all None or all not None"
+    def __post_init__(self):
+        if self.mCuSeqlensM is not None or self.mCuSeqlensK is not None:
+            assert (
+                self.mTensormaps is not None
+            ), "mTensormaps must be provided if mCuSeqlensM or mCuSeqlensK is provided"

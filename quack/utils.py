@@ -27,6 +27,15 @@ def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cut
     return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
 
 
+@cute.jit
+def load_scalar_or_pointer(x: Float32 | cute.Pointer) -> Float32:
+    if cutlass.const_expr(isinstance(x, cute.Pointer)):
+        return Float32(cute.make_tensor(x, cute.make_layout(1))[0])
+    else:
+        assert isinstance(x, Float32)
+        return x
+
+
 @dsl_user_op
 def set_block_rank(
     smem_ptr: cute.Pointer, peer_cta_rank_in_cluster: cute.Int32, *, loc=None, ip=None
@@ -246,7 +255,7 @@ def fill_oob(tXsX: cute.Tensor, tXpX: Optional[cute.Tensor], fill_value: cute.Nu
         tXpX: Predicate tensor indicating valid elements
         fill_value: Value to fill OOB locations with
     """
-    tXrX_fill = cute.make_fragment_like(tXsX[(None, 0), 0, 0])
+    tXrX_fill = cute.make_fragment_like(tXsX[(None, 0), None, 0])
     tXrX_fill.fill(fill_value)
     for rest_v in cutlass.range_constexpr(tXsX.shape[0][1]):
         for rest_k in cutlass.range_constexpr(tXsX.shape[2]):
@@ -286,9 +295,9 @@ def i64_to_f32x2(c: cutlass.Int64, *, loc=None, ip=None) -> Tuple[Float32, Float
 def domain_offset_i64(coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
     flat_coord_i64 = tuple(cutlass.Int64(c) for c in cute.flatten(coord))
     flat_stride = cute.flatten_to_tuple(tensor.stride)
-    assert len(flat_coord_i64) == len(flat_stride), (
-        "Coordinate and stride must have the same length"
-    )
+    assert len(flat_coord_i64) == len(
+        flat_stride
+    ), "Coordinate and stride must have the same length"
     offset = sum(c * s for c, s in zip(flat_coord_i64, flat_stride))
     assert isinstance(tensor.iterator, cute.Pointer)
     # HACK: we assume that applying the offset does not change the pointer alignment
@@ -410,5 +419,3 @@ def atomic_inc_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None)
     return nvvm.atomicrmw(
         res=T.i32(), op=nvvm.AtomicOpKind.INC, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
     )
-
-

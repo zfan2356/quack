@@ -18,7 +18,7 @@ from cutlass.base_dsl.typing import JitArgument
 from cutlass.cutlass_dsl import NumericMeta
 
 
-StaticTypes = (cutlass.Constexpr, NumericMeta, int, bool, str, float)
+StaticTypes = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(None))
 
 
 load_cubin_module_data_og = cutlass.base_dsl.runtime.cuda.load_cubin_module_data

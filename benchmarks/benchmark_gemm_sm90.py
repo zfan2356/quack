@@ -133,6 +133,8 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--pingpong", action="store_true", help="Pingpong kernel")
     parser.add_argument("--varlen_m", action="store_true", help="Variable length M dimension")
+    parser.add_argument("--varlen_k", action="store_true", help="Variable length K dimension")
+    parser.add_argument("--permute_batch", action="store_true", help="Permute batch in varlen_k")
     parser.add_argument("--gather_A", action="store_true", help="Gather A")
     parser.add_argument("--fp8_fast_accum", action="store_true", help="FP8 fast accum")
     parser.add_argument("--skip_ref_check", action="store_true", help="Skip reference checking")
@@ -171,6 +173,8 @@ def run(
     dynamic_persistent: bool,
     pingpong: bool,
     varlen_m: bool,
+    varlen_k: bool,
+    permute_batch: bool,
     gather_A: bool,
     fp8_fast_accum: bool,
     use_cpu_varlen_m: bool,
@@ -336,7 +340,7 @@ def run(
             mCuSeqlensMTensor = None
         else:
             cu_seqlens_m = torch.arange(0, l + 1, dtype=torch.int32, device="cuda") * m
-            mCuSeqlensMTensor = from_dlpack(cu_seqlens_m, assumed_align=64).mark_layout_dynamic(leading_dim=0)
+            mCuSeqlensMTensor = from_dlpack(cu_seqlens_m, assumed_align=4).mark_layout_dynamic(leading_dim=0)
             mCuSeqlen, mCuSeqlensMList = cutlass.const_expr(l + 1), None
         if gather_A:
             a_idx_reshaped = rearrange(a_idx_reshaped, "m l -> (l m)")
@@ -345,7 +349,22 @@ def run(
         cu_seqlens_m, mCuSeqlensMTensor = None, None
         mCuSeqlensMList, mCuSeqlen = None, cutlass.const_expr(0)
 
-    if varlen_m:  # Need to allocate space in gmem to store tensormaps
+    if varlen_k:
+        from einops import rearrange
+        assert not gather_A
+
+        a, a_torch = [rearrange(t, "m k l -> m (l k)") for t in (a, a_torch)]
+        b, b_torch = [rearrange(t, "n k l -> n (l k)") for t in (b, b_torch)]
+        mA = from_dlpack(a_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1 if a_major == "k" else 0)
+        mB = from_dlpack(b_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1 if b_major == "k" else 0)
+        # TODO: generate random cu_seqlens_k
+        cu_seqlens_k = torch.arange(0, l + 1, dtype=torch.int32, device="cuda") * k
+        mCuSeqlensK = from_dlpack(cu_seqlens_k, assumed_align=4).mark_layout_dynamic(leading_dim=0)
+    else:
+        cu_seqlens_k, mCuSeqlensK = None, None
+
+
+    if varlen_m or varlen_k:  # Need to allocate space in gmem to store tensormaps
         if not persistent:
             total_m = m * l
             block_size_m = tile_shape_mnk[0] * cluster_shape_mnk[0]
@@ -355,13 +374,12 @@ def run(
             total_ctas = total_clusters_max * cluster_shape_mnk[0] * cluster_shape_mnk[1]
         else:
             total_ctas = cutlass.utils.HardwareInfo().get_device_multiprocessor_count()
-        if pingpong:
-            total_ctas *= 2
+        num_tensormaps = 2 if varlen_k else (1 if not pingpong else 2)
         # 128 bytes per tensormap
-        tensormaps_torch = torch.empty(total_ctas, 128 // 8, dtype=torch.int64, device="cuda")
+        tensormaps_torch = torch.empty(total_ctas, num_tensormaps, 128 // 8, dtype=torch.int64, device="cuda")
         tensormaps_tensor = from_dlpack(
             tensormaps_torch, assumed_align=128
-        ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
+        ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2))
     else:
         tensormaps_tensor = None
 
@@ -389,15 +407,27 @@ def run(
     else:
         max_active_clusters = 0
         tile_count_semaphore = None
+    if permute_batch:
+        batch_idx_permute = torch.randperm(l, dtype=torch.int32, device="cuda")
+        batch_idx_permute_tensor = from_dlpack(batch_idx_permute, assumed_align=4).mark_layout_dynamic(leading_dim=0)
+    else:
+        batch_idx_permute_tensor = None
     scheduler_args = TileSchedulerOptions(
         Int32(max_active_clusters),
         tile_count_semaphore=make_ptr(
             Int32, tile_count_semaphore.data_ptr(), cute.AddressSpace.gmem, assumed_align=4
         ) if tile_count_semaphore is not None else None,
+        batch_idx_permute=batch_idx_permute_tensor
     )
 
     epi_args = gemm.EpilogueArguments()
-    varlen_args = VarlenArguments(mCuSeqlensMTensor=mCuSeqlensMTensor, mCuSeqlensMList=mCuSeqlensMList, mCuSeqlen=mCuSeqlen, mTensormaps=tensormaps_tensor)
+    varlen_args = VarlenArguments(
+        mCuSeqlensMTensor=mCuSeqlensMTensor, 
+        mCuSeqlensK=mCuSeqlensK, 
+        mCuSeqlensMList=mCuSeqlensMList, 
+        mCuSeqlen=mCuSeqlen, 
+        mTensormaps=tensormaps_tensor
+    )
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     # compile gemm kernel
     compiled_gemm = cute.compile(
@@ -422,15 +452,24 @@ def run(
         torch.cuda.synchronize()
 
         # Ref check
-        if not varlen_m:
+        if not varlen_m and not varlen_k:
             ref = torch.einsum("mkl,nkl->mnl", a, b)
-        else:
+        elif varlen_m:
             ref = torch.cat(
                 [
                     torch.einsum("mk,nk->mn", a[cu_seqlens_m[i] : cu_seqlens_m[i + 1]], b[:, :, i])
                     for i in range(l)
                 ],
                 dim=0,
+            )
+        else:
+            assert varlen_k
+            ref = torch.stack(
+                [
+                    torch.einsum("mk,nk->mn", a[:, cu_seqlens_k[i] : cu_seqlens_k[i + 1]], b[:, cu_seqlens_k[i] : cu_seqlens_k[i + 1]])
+                    for i in range(l)
+                ],
+                dim=-1,
             )
         if c is not None:
             ref = ref + c
@@ -484,7 +523,7 @@ def run(
 
     import time
 
-    if not varlen_m and not gather_A:
+    if not (varlen_m or varlen_k) and not gather_A:
         time.sleep(0.5)
         if a_dtype.width == 8:
             assert l == 1
@@ -529,7 +568,7 @@ def run(
     print(f"Cute-DSL Average time: {timing:.3f} ms, TFLOPS: {tflops:.1f}, GB/s: {gbps:.0f}")
     fn()
 
-    if not varlen_m:
+    if not (varlen_m or varlen_k) and not gather_A:
         time.sleep(0.5)
         timing_cublas = do_bench(fn_cublas, warmup=warmup, rep=repeats)
         tflops_cublas = flops / (timing_cublas * 1e9)  # Convert to TFlops
@@ -538,6 +577,7 @@ def run(
         from flash_attn.utils.benchmark import pytorch_profiler
 
         pytorch_profiler(fn_cublas)
+        pytorch_profiler(fn)
         # pytorch_profiler(torch.sort, d_torch.squeeze(), dim=-1)
         # pytorch_profiler(torch.compile(torch.sort), d_torch.squeeze(), dim=-1)
         # pytorch_profiler(torch.topk, d_torch.squeeze(), dim=-1, k=1)
@@ -568,6 +608,8 @@ if __name__ == "__main__":
         args.dynamic_persistent,
         args.pingpong,
         args.varlen_m,
+        args.varlen_k,
+        args.permute_batch,
         args.gather_A,
         args.fp8_fast_accum,
         args.use_cpu_varlen_m,

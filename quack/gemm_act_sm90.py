@@ -2,21 +2,19 @@
 from typing import Tuple, Optional, Callable
 from dataclasses import dataclass
 
-import torch
 from torch import Tensor
-
-import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import warpgroup
 import cutlass.utils.hopper_helpers as sm90_utils
-from cutlass import Int32, Boolean, const_expr
-from cutlass.cute.runtime import from_dlpack, make_ptr
+from cutlass import Int32, Float32, Boolean, const_expr
+import cutlass.torch as cutlass_torch
 
 from quack.cute_dsl_utils import ArgumentsBase, ParamsBase
-from quack.dense_gemm_sm90 import GemmSm90, TileSchedulerOptions
-from quack.cute_dsl_utils import torch2cute_dtype_map, get_max_active_clusters
+from quack.dense_gemm_sm90 import GemmSm90
+from quack.cute_dsl_utils import get_max_active_clusters
+from quack.gemm_wrapper_utils import GemmWrapperBase
 import quack.activation
 
 
@@ -25,6 +23,8 @@ class GemmActSm90(GemmSm90):
     class EpilogueArguments(ArgumentsBase):
         mPostAct: cute.Tensor
         act_fn: cutlass.Constexpr[Optional[Callable]] = None
+        alpha: Optional[Float32] = None
+        beta: Optional[Float32] = None
 
     @dataclass
     class EpilogueParams(ParamsBase):
@@ -32,6 +32,8 @@ class GemmActSm90(GemmSm90):
         mPostAct_mnl: cute.Tensor
         epi_postact_smem_layout_staged: cute.ComposedLayout
         act_fn: cutlass.Constexpr[Optional[Callable]] = None
+        alpha: Optional[Float32] = None
+        beta: Optional[Float32] = None
 
     def epi_to_underlying_arguments(
         self, args: EpilogueArguments, *, loc=None, ip=None
@@ -64,7 +66,12 @@ class GemmActSm90(GemmSm90):
             store_or_load="store",
         )
         return GemmActSm90.EpilogueParams(
-            tma_atom_postact, tma_tensor_postact, epi_postact_smem_layout_staged, args.act_fn
+            tma_atom_postact,
+            tma_tensor_postact,
+            epi_postact_smem_layout_staged,
+            args.act_fn,
+            args.alpha,
+            args.beta,
         )
 
     @staticmethod
@@ -221,8 +228,17 @@ class GemmActSm90(GemmSm90):
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
+        # Apply alpha scaling to accumulator if alpha is provided (not None)
+        if const_expr(params.alpha is not None):
+            tRS_rD.store(tRS_rD.load() * params.alpha)
+        # Apply C with beta scaling
         if const_expr(tRS_rC is not None):
-            tRS_rD.store(tRS_rD.load() + tRS_rC.load().to(tRS_rD.element_type))
+            if const_expr(params.beta is None):
+                # beta is None, default behavior: add C (beta=1.0)
+                tRS_rD.store(tRS_rD.load() + tRS_rC.load().to(tRS_rD.element_type))
+            else:
+                tRS_rD.store(tRS_rD.load() + params.beta * tRS_rC.load().to(tRS_rD.element_type))
+        # Apply activation function if provided
         # If we don't have .shape here, the compiler generates local stores and loads
         if const_expr(params.act_fn is not None):
             tRS_rPostAct = cute.make_fragment(tRS_rD.layout.shape, self.acc_dtype)
@@ -257,109 +273,68 @@ def gemm_act_sm90(
     cluster_N: int,
     pingpong: bool = False,
     persistent: bool = True,
+    alpha: float = 1.0,
+    beta: float = 1.0,
 ) -> None:
     tile_count_semaphore = None
-    assert A.dim() == 3 and A.is_cuda, "A must be A 3D CUDA tensor"
-    L, M, K = A.shape
-    assert A.dtype in torch2cute_dtype_map, "Unsupported dtype for A"
-    assert B.dim() == 3 and B.is_cuda, "B must be A 3D CUDA tensor"
-    _, N, _ = B.shape
-    assert B.dtype == A.dtype
-    assert B.shape == (L, N, K), f"B must have shape {(L, N, K)}, got {B.shape}"
-    if D is not None:
-        assert D.dim() == 3 and D.is_cuda, "D must be A 3D CUDA tensor"
-        assert D.dtype in torch2cute_dtype_map, "Unsupported dtype for D"
-        assert D.shape == (L, M, N), f"D must have shape {(L, M, N)}, got {D.shape}"
-    assert PostAct.dim() == 3 and PostAct.is_cuda, "PostAct must be A 3D CUDA tensor"
-    assert PostAct.dtype in torch2cute_dtype_map, "Unsupported dtype for PostAct"
-    assert PostAct.shape == (L, M, N), f"PostAct must have shape {(L, M, N)}, got {PostAct.shape}"
-    if C is not None:
-        assert C.dim() == 3 and C.is_cuda, "C must be A 3D CUDA tensor"
-        assert C.shape == (L, M, N), f"C must have shape {(L, M, N)}, got {C.shape}"
-        assert C.dtype in torch2cute_dtype_map, "Unsupported dtype for C"
     assert activation in act_fn_map, f"Unsupported activation {activation}"
-    A, B, D, C, PostAct = [
-        x.permute(1, 2, 0) if x is not None else None for x in (A, B, D, C, PostAct)
-    ]  # (m, k, l), (n, k, l), (m, n, l)
+    L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
+        A, B, D, C, additional_tensors={"PostAct": PostAct}
+    )
+    GemmWrapperBase.permute_tensors(tensor_infos)
+    GemmWrapperBase.extract_dtypes(tensor_infos)
+    major_configs = {
+        "A": ("m", "k", "l"),
+        "B": ("n", "k", "l"),
+        "D": ("m", "n", "l"),
+        "C": ("m", "n", "l"),
+        "PostAct": ("m", "n", "l"),
+    }
+    GemmWrapperBase.determine_major_orders(tensor_infos, major_configs)
 
-    a_dtype = torch2cute_dtype_map[A.dtype]
-    b_dtype = a_dtype
-    d_dtype = torch2cute_dtype_map[D.dtype] if D is not None else None
-    postact_dtype = torch2cute_dtype_map[PostAct.dtype]
-    c_dtype = torch2cute_dtype_map[C.dtype] if C is not None else None
     acc_dtype = cutlass.Float32
     tile_shape_mnk = (tile_M, tile_N, 64)  # TODO: adjust for fp8
     cluster_shape_mnk = (cluster_M, cluster_N, 1)
-    a_major = "k" if A.stride(1) == 1 else "m"
-    b_major = "k" if B.stride(1) == 1 else "n"
-    d_major = "n" if D is not None and D.stride(1) == 1 else "m"
-    postact_major = "n" if PostAct.stride(1) == 1 else "m"
-    c_major = "n" if C is not None and C.stride(1) == 1 else "m"
-    if not GemmActSm90.is_valid_dtypes(a_dtype, b_dtype, acc_dtype, d_dtype, a_major, b_major):
-        raise TypeError(
-            f"Skipping due to unsupported combination of types and majors: {a_dtype}, {b_dtype}, {acc_dtype}, {d_dtype}, {a_major=}, {b_major=}"
-        )
-    if persistent:
-        max_active_clusters = get_max_active_clusters(cluster_M * cluster_N)
-    else:
-        max_active_clusters = 0
-    mA = from_dlpack(A.detach(), assumed_align=16).mark_layout_dynamic(
-        leading_dim=1 if a_major == "k" else 0
-    )
-    mB = from_dlpack(B.detach(), assumed_align=16).mark_layout_dynamic(
-        leading_dim=1 if b_major == "k" else 0
-    )
-    mD = (
-        from_dlpack(D.detach(), assumed_align=16).mark_layout_dynamic(
-            leading_dim=1 if d_major == "n" else 0
-        )
-        if D is not None
-        else None
-    )
-    mPostAct = from_dlpack(PostAct.detach(), assumed_align=16).mark_layout_dynamic(
-        leading_dim=1 if postact_major == "n" else 0
-    )
-    mC = (
-        from_dlpack(C.detach(), assumed_align=16).mark_layout_dynamic(
-            leading_dim=1 if c_major == "n" else 0
-        )
-        if C is not None
-        else None
-    )
-    act_fn = act_fn_map[activation]
-    epi_args = GemmActSm90.EpilogueArguments(mPostAct, act_fn)
-    scheduler_args = TileSchedulerOptions(
-        Int32(max_active_clusters),
-        tile_count_semaphore=make_ptr(
-            Int32, tile_count_semaphore.data_ptr(), cute.AddressSpace.gmem, assumed_align=4
-        )
-        if tile_count_semaphore is not None
-        else None,
-    )
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if not GemmActSm90.is_valid_dtypes(
+        tensor_infos["A"].dtype,
+        tensor_infos["B"].dtype,
+        acc_dtype,
+        tensor_infos["D"].dtype,
+        tensor_infos["A"].major,
+        tensor_infos["B"].major,
+    ):
+        raise TypeError("Skipping due to unsupported combination of types and majors")
 
-    compile_key = (
-        a_dtype,
-        d_dtype,
-        postact_dtype,
-        c_dtype,
+    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
+    GemmWrapperBase.create_cute_tensors(tensor_infos, major_configs)
+    act_fn = act_fn_map[activation]
+    epi_args = GemmActSm90.EpilogueArguments(
+        tensor_infos["PostAct"].cute_tensor,
+        act_fn,
+        alpha=Float32(alpha) if alpha != 1.0 else None,
+        beta=Float32(beta) if beta != 1.0 else None,
+    )
+    scheduler_args = GemmWrapperBase.create_scheduler_args(
+        max_active_clusters, tile_count_semaphore
+    )
+    current_stream = cutlass_torch.current_stream()
+    compile_key = GemmWrapperBase.get_compile_key(
+        tensor_infos,
         activation,
         tile_shape_mnk,
         cluster_shape_mnk,
-        a_major,
-        b_major,
-        d_major,
-        c_major,
         pingpong,
         persistent,
         tile_count_semaphore is not None,
+        alpha != 1.0,
+        beta != 1.0,
+        key_tensor_names=("A", "B", "D", "PostAct", "C"),
     )
-
     cache = gemm_act_sm90.compile_cache
     if compile_key not in cache:
         gemm = GemmActSm90(
             acc_dtype,
-            a_dtype,
+            tensor_infos["A"].dtype,
             tile_shape_mnk,
             cluster_shape_mnk,
             pingpong=pingpong,
@@ -367,17 +342,27 @@ def gemm_act_sm90(
         )
         cache[compile_key] = cute.compile(
             gemm,
-            mA,
-            mB,
-            mD,
-            mC,
+            tensor_infos["A"].cute_tensor,
+            tensor_infos["B"].cute_tensor,
+            tensor_infos["D"].cute_tensor,
+            tensor_infos["C"].cute_tensor,
             epi_args,
             scheduler_args,
             None,  # varlen_args
             None,  # mAIdx
             current_stream,
         )
-    cache[compile_key](mA, mB, mD, mC, epi_args, scheduler_args, None, None, current_stream)
+    cache[compile_key](
+        tensor_infos["A"].cute_tensor,
+        tensor_infos["B"].cute_tensor,
+        tensor_infos["D"].cute_tensor,
+        tensor_infos["C"].cute_tensor,
+        epi_args,
+        scheduler_args,
+        None,
+        None,
+        current_stream,
+    )
 
 
 gemm_act_sm90.compile_cache = {}
