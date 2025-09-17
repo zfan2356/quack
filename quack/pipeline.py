@@ -12,6 +12,7 @@ from cutlass.cutlass_dsl import dsl_user_op
 from cutlass._mlir.dialects import nvvm
 
 
+# TODO: replace in cutlass 4.2
 @dsl_user_op
 def cp_async_mbarrier_arrive_shared(
     mbar_ptr: cute.Pointer, noinc: bool = False, *, loc=None, ip=None
@@ -65,7 +66,7 @@ def make_pipeline_state(type: PipelineUserType, stages: int):
 @dataclass(frozen=True)
 class PipelineTmaCpAsync(PipelineTmaAsync):
     """
-    PipelineTmaCpAsync is used for CpAync + TMA producers and AsyncThread consumers
+    PipelineTmaCpAsync is used for CpAsync + TMA producers and AsyncThread consumers
     """
 
     @staticmethod

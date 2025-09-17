@@ -341,7 +341,7 @@ class GemmSm90:
         return r_cu_seqlens, cu_seqlens
 
     @cute.jit
-    def _process_varlen_tensor(self, varlen_args: VarlenArguments):
+    def _process_varlen_args(self, varlen_args: VarlenArguments):
         r_cu_seqlens_m, cu_seqlens_m = self._get_fragment_tensor(
             varlen_args.mCuSeqlensMCpu, varlen_args.mCuSeqlensM
         )
@@ -475,7 +475,7 @@ class GemmSm90:
 
         varlen_m = varlen_args.mCuSeqlensM is not None or varlen_args.mCuSeqlensMCpu is not None
         varlen_k = varlen_args.mCuSeqlensK is not None or varlen_args.mCuSeqlensKCpu is not None
-        r_cu_seqlens_m, cu_seqlens_m, r_cu_seqlens_k, cu_seqlens_k = self._process_varlen_tensor(
+        r_cu_seqlens_m, cu_seqlens_m, r_cu_seqlens_k, cu_seqlens_k = self._process_varlen_args(
             varlen_args
         )
         if const_expr(not varlen_m):
@@ -797,6 +797,7 @@ class GemmSm90:
                                 is_manager_warp=is_tma_warp,
                                 shapes=(cu_seqlens_k[batch_idx + 1], cu_seqlens_k[batch_idx + 1]),
                                 orders=(
+                                    # TODO: is_k_major_a is no longer there in cutlass 4.2
                                     0 if const_expr(self.a_layout.is_k_major_a()) else 1,
                                     # confusingly b_layout is ROW_MAJOR when it's k-major,
                                     # so the result of b_layout.is_k_major_b() is the opposite of
@@ -1204,7 +1205,7 @@ class GemmSm90:
                 # End of persistent scheduler loop
 
             if const_expr(not self.pingpong):
-                if warp_idx == 0:
+                if is_tma_warp:
                     cute.arch.cp_async_bulk_wait_group(0, read=True)
 
     @cute.jit
@@ -1846,9 +1847,7 @@ class GemmSm90:
         )
         mbar_helpers_bytes = 1024
 
-        remaining_bytes = (
-            (smem_capacity - occupancy * 1024) // occupancy - mbar_helpers_bytes - epi_bytes
-        )
+        remaining_bytes = smem_capacity // occupancy - mbar_helpers_bytes - epi_bytes
         ab_stage = remaining_bytes // ab_bytes_per_stage
 
         # Refine epilogue stages:
