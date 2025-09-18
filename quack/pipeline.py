@@ -8,22 +8,6 @@ from cutlass.cutlass_dsl import Boolean, Int32, if_generate
 from cutlass.pipeline import CooperativeGroup, PipelineOp, pipeline_init_wait
 from cutlass.pipeline import PipelineAsync, PipelineTmaAsync, PipelineState, PipelineUserType
 
-from cutlass.cutlass_dsl import dsl_user_op
-from cutlass._mlir.dialects import nvvm
-
-
-# TODO: replace in cutlass 4.2
-@dsl_user_op
-def cp_async_mbarrier_arrive_shared(
-    mbar_ptr: cute.Pointer, noinc: bool = False, *, loc=None, ip=None
-) -> None:
-    nvvm.cp_async_mbarrier_arrive_shared(
-        mbar_ptr.llvm_ptr,
-        noinc=noinc,
-        loc=loc,
-        ip=ip,
-    )
-
 
 class PipelineStateWAdvance(PipelineState):
     def advance_iters(self, num_iterations: Int32):
@@ -164,4 +148,4 @@ class PipelineTmaCpAsync(PipelineTmaAsync):
         """
         We need the mbarrier to track the completion of cp.async
         """
-        cp_async_mbarrier_arrive_shared(self.producer_get_barrier(state), noinc=True)
+        cute.arch.cp_async_mbarrier_arrive_noinc(self.producer_get_barrier(state))
