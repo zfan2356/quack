@@ -293,7 +293,7 @@ def gemm_act_sm90(
     GemmWrapperBase.determine_major_orders(tensor_infos, major_configs)
 
     acc_dtype = cutlass.Float32
-    tile_shape_mnk = (tile_M, tile_N, 64)  # TODO: adjust for fp8
+    tile_shape_mn = (tile_M, tile_N)
     cluster_shape_mnk = (cluster_M, cluster_N, 1)
     if not GemmActSm90.is_valid_dtypes(
         tensor_infos["A"].dtype,
@@ -321,7 +321,7 @@ def gemm_act_sm90(
     compile_key = GemmWrapperBase.get_compile_key(
         tensor_infos,
         activation,
-        tile_shape_mnk,
+        tile_shape_mn,
         cluster_shape_mnk,
         pingpong,
         persistent,
@@ -335,7 +335,7 @@ def gemm_act_sm90(
         gemm = GemmActSm90(
             acc_dtype,
             tensor_infos["A"].dtype,
-            tile_shape_mnk,
+            tile_shape_mn,
             cluster_shape_mnk,
             pingpong=pingpong,
             is_persistent=persistent,

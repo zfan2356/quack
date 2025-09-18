@@ -23,7 +23,7 @@ To run this example:
 .. code-block:: bash
 
     python examples/hopper/dense_gemm.py                                   \
-      --mnkl 8192,8192,8192,1 --tile_shape_mnk 128,256,64                  \
+      --mnkl 8192,8192,8192,1 --tile_shape_mn 128,256                      \
       --cluster_shape_mn 1,1 --a_dtype Float16 --b_dtype Float16           \
       --d_dtype Float16 --acc_dtype Float32                                \
       --a_major k --b_major k --d_major n
@@ -38,7 +38,7 @@ To collect performance with NCU profiler:
 .. code-block:: bash
 
     ncu python examples/hopper/dense_gemm.py                               \
-      --mnkl 8192,8192,8192,1 --tile_shape_mnk 128,256,64                  \
+      --mnkl 8192,8192,8192,1 --tile_shape_mn 128,256,64                  \
       --cluster_shape_mn 1,1 --a_dtype Float16 --b_dtype Float16           \
       --d_dtype Float16 --acc_dtype Float32                                \
       --a_major k --b_major k --d_major n
@@ -78,9 +78,9 @@ def parse_arguments() -> argparse.Namespace:
         help="mnkl dimensions (comma-separated)",
     )
     parser.add_argument(
-        "--tile_shape_mnk",
+        "--tile_shape_mn",
         type=parse_comma_separated_ints,
-        default=(128, 256, 64),
+        default=(128, 256),
         help="Cta tile shape (comma-separated)",
     )
     parser.add_argument(
@@ -143,8 +143,8 @@ def parse_arguments() -> argparse.Namespace:
 
     if len(args.mnkl) != 4:
         parser.error("--mnkl must contain exactly 4 values")
-    if len(args.tile_shape_mnk) != 3:
-        parser.error("--tile_shape_mnk must contain exactly 3 values")
+    if len(args.tile_shape_mn) != 2:
+        parser.error("--tile_shape_mn must contain exactly 2 values")
     if len(args.cluster_shape_mn) != 2:
         parser.error("--cluster_shape_mn must contain exactly 2 values")
 
@@ -162,7 +162,7 @@ def run(
     b_major: str,
     d_major: str,
     c_major: str,
-    tile_shape_mnk: Tuple[int, int, int],
+    tile_shape_mn: Tuple[int, int],
     cluster_shape_mn: Tuple[int, int],
     tolerance: float,
     warmup_iterations: int,
@@ -193,8 +193,8 @@ def run(
     :type acc_dtype: Type[cutlass.Numeric]
     :param a_major/b_major/d_major: Memory layout of tensor A/B/C
     :type a_major/b_major/d_major: str
-    :param tile_shape_mnk: CTA tile shape (M, N, K)
-    :type tile_shape_mnk: Tuple[int, int, int]
+    :param tile_shape_mn: CTA tile shape (M, N)
+    :type tile_shape_mn: Tuple[int, int, int]
     :param cluster_shape_mn: Cluster shape (M, N)
     :type cluster_shape_mn: Tuple[int, int]
     :param tolerance: Tolerance value for reference validation comparison
@@ -216,7 +216,7 @@ def run(
         f"A dtype: {a_dtype}, B dtype: {b_dtype}, D dtype: {d_dtype}, C_dtype: {c_dtype}, Acc dtype: {acc_dtype}"
     )
     print(f"Matrix majors - A: {a_major}, B: {b_major}, D: {d_major}")
-    print(f"Tile Shape: {tile_shape_mnk}, Cluster Shape: {cluster_shape_mn}")
+    print(f"Tile Shape: {tile_shape_mn}, Cluster Shape: {cluster_shape_mn}")
     print(f"Tolerance: {tolerance}")
     print(f"Warmup iterations: {warmup_iterations}")
     print(f"Iterations: {iterations}")
@@ -356,8 +356,8 @@ def run(
     if varlen_m or varlen_k:  # Need to allocate space in gmem to store tensormaps
         if not persistent:
             total_m = m * l
-            block_size_m = tile_shape_mnk[0] * cluster_shape_mnk[0]
-            block_size_n = tile_shape_mnk[1] * cluster_shape_mnk[1]
+            block_size_m = tile_shape_mn[0] * cluster_shape_mnk[0]
+            block_size_n = tile_shape_mn[1] * cluster_shape_mnk[1]
             total_clusters_m_max = (total_m + l * (block_size_m - 1)) // block_size_m
             total_clusters_max = total_clusters_m_max * ((n + block_size_n - 1) // block_size_n)
             total_ctas = total_clusters_max * cluster_shape_mnk[0] * cluster_shape_mnk[1]
@@ -375,7 +375,7 @@ def run(
     gemm = GemmSm90(
         acc_dtype,
         a_dtype,
-        tile_shape_mnk,
+        tile_shape_mn,
         cluster_shape_mnk,
         pingpong=pingpong,
         is_persistent=persistent,
@@ -581,7 +581,7 @@ if __name__ == "__main__":
         args.b_major,
         args.d_major,
         args.c_major,
-        args.tile_shape_mnk,
+        args.tile_shape_mn,
         args.cluster_shape_mn,
         args.tolerance,
         args.warmup_iterations,

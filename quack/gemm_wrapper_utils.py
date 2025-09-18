@@ -28,9 +28,9 @@ class GemmWrapperBase:
 
     @staticmethod
     def validate_shape(tensor: Tensor, expected_shape: Tuple[int, ...], name: str) -> None:
-        assert (
-            tensor.shape == expected_shape
-        ), f"{name} must have shape {expected_shape}, got {tensor.shape}"
+        assert tensor.shape == expected_shape, (
+            f"{name} must have shape {expected_shape}, got {tensor.shape}"
+        )
 
     @staticmethod
     def get_major_order(tensor: Tensor, dims: Tuple[str, str, str]) -> str:
@@ -136,7 +136,7 @@ class GemmWrapperBase:
     def get_compile_key(
         tensors: Dict[str, GemmTensorInfo],
         activation: Optional[str],
-        tile_shape_mnk: Tuple[int, int, int],
+        tile_shape_mn: Tuple[int, int],
         cluster_shape_mnk: Tuple[int, int, int],
         pingpong: bool,
         persistent: bool,
@@ -149,7 +149,7 @@ class GemmWrapperBase:
             if name in tensors:
                 key_parts.append(tensors[name].dtype)
         key_parts.append(activation)
-        key_parts.extend([tile_shape_mnk, cluster_shape_mnk])
+        key_parts.extend([tile_shape_mn, cluster_shape_mnk])
         for name in key_tensor_names:
             if name in tensors:
                 key_parts.append(tensors[name].major)

@@ -583,7 +583,7 @@ class VarlenMTileSchedulerArguments(ParamsBase):
     cu_seqlens_m: cute.Tensor
     raster_order: cutlass.Constexpr[RasterOrderOption]
     group_size: Int32
-    tile_shape_mnk: cutlass.Constexpr[cute.Shape]
+    tile_shape_mn: cutlass.Constexpr[cute.Shape]
     cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
     tile_count_semaphore: Optional[cute.Pointer] = None
     is_persistent: cutlass.Constexpr[bool] = False
@@ -612,7 +612,6 @@ class VarlenMTileScheduler(TileScheduler):
         ) -> "VarlenMTileScheduler.Params":
             assert args.cluster_shape_mnk[2] == 1
             cluster_shape_mn = const_expr(cute.select(args.cluster_shape_mnk, mode=[0, 1]))
-            tile_shape_mn = const_expr(cute.select(args.tile_shape_mnk, mode=[0, 1]))
             # problem_shape_ntile_mnl[0] will be None for VarlenM
             problem_shape_ntile_mn = cute.select(args.problem_shape_ntile_mnl, mode=[0, 1])
             problem_shape_ncluster_mn = (
@@ -660,7 +659,7 @@ class VarlenMTileScheduler(TileScheduler):
                 FastDivmod.create(num_clusters_in_group)
                 if num_clusters_in_group is not None
                 else None,
-                tile_shape_mn,
+                args.tile_shape_mn,
                 args.tile_count_semaphore if const_expr(args.is_persistent) else None,
                 cluster_shape_mn,
                 args.is_persistent,

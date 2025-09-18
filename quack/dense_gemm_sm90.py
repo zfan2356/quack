@@ -17,6 +17,7 @@ import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import Int32, Float32, Boolean, const_expr
+from cutlass.utils import LayoutEnum
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import make_ptr
 
@@ -94,8 +95,8 @@ class GemmSm90:
 
     :param acc_dtype: Data type for accumulation during computation
     :type acc_dtype: type[cutlass.Numeric]
-    :param tile_shape_mnk: Shape of the CTA tile (M,N,K)
-    :type tile_shape_mnk: Tuple[int, int, int]
+    :param tile_shape_mn: Shape of the CTA tile (M,N)
+    :type tile_shape_mn: Tuple[int, int, int]
     :param cluster_shape_mnk: Cluster dimensions (M,N,K) for parallel processing
     :type cluster_shape_mnk: Tuple[int, int, int]
 
@@ -118,7 +119,7 @@ class GemmSm90:
     Example:
         >>> gemm = GemmSm90(
         ...     acc_dtype=cutlass.Float32,
-        ...     tile_shape_mnk=(128, 256, 64),
+        ...     tile_shape_mn=(128, 256),
         ...     cluster_shape_mnk=(1, 1, 1)
         ... )
         >>> gemm(a_tensor, b_tensor, c_tensor, stream)
@@ -140,7 +141,7 @@ class GemmSm90:
         self,
         acc_dtype: Type[cutlass.Numeric],
         a_dtype: Type[cutlass.Numeric],
-        tile_shape_mnk: Tuple[int, int, int],
+        tile_shape_mn: Tuple[int, int],
         cluster_shape_mnk: Tuple[int, int, int],
         pingpong: bool = False,
         is_persistent: bool = True,
@@ -155,8 +156,8 @@ class GemmSm90:
 
         :param acc_dtype: Data type for accumulation during computation
         :type acc_dtype: type[cutlass.Numeric]
-        :param tile_shape_mnk: Shape of the CTA tile (M,N,K)
-        :type tile_shape_mnk: Tuple[int, int, int]
+        :param tile_shape_mn: Shape of the CTA tile (M,N)
+        :type tile_shape_mn: Tuple[int, int]
         :param cluster_shape_mnk: Cluster dimensions (M,N,K) for parallel processing
         :type cluster_shape_mnk: Tuple[int, int, int]
         """
@@ -172,8 +173,9 @@ class GemmSm90:
             assert cluster_shape_mnk[1] == 1, "Cluster shape N must be 1 for gather A "
 
         self.cluster_shape_mnk = cluster_shape_mnk
-        self.tile_shape_mnk = tuple(tile_shape_mnk)
-        tile_M, tile_N = tile_shape_mnk[0], tile_shape_mnk[1]
+        # K dimension is deferred in _setup_attributes
+        self.tile_shape_mnk = (*tile_shape_mn, 1)
+        tile_M, tile_N = self.tile_shape_mnk[0], self.tile_shape_mnk[1]
         # check the cta tile shape
         if not self.pingpong:
             if tile_M not in [64, 128, 192, 256, 320]:
@@ -197,8 +199,6 @@ class GemmSm90:
             tile_N_max = 256 if tile_M == 64 else (208 if tile_M == 128 else 128)
             if not (tile_N % 16 == 0 and tile_N <= tile_N_max):
                 raise ValueError(f"CTA tile shape N must be divisible by 16 and <= {tile_N_max}")
-        if not self.tile_shape_mnk[2] % 16 == 0:
-            raise ValueError("CTA tile shape K must be divisible by 16")
 
         if not self.pingpong:
             if tile_M == 320:  # tile_M / 64 is not even so we have to split along N
@@ -209,7 +209,7 @@ class GemmSm90:
                 else:
                     atom_layout_m, atom_layout_n = 1, 2
             else:
-                atom_layout_m = tile_shape_mnk[0] // 64 if tile_shape_mnk[0] < 256 else 2
+                atom_layout_m = self.tile_shape_mnk[0] // 64 if self.tile_shape_mnk[0] < 256 else 2
                 atom_layout_n = 1
             assert atom_layout_m in [1, 2, 3] and atom_layout_n in [1, 2]
         else:
@@ -281,6 +281,38 @@ class GemmSm90:
         - Setting up A/B/C stage counts in shared memory
         - Computing A/B/C shared memory layout
         """
+
+        self.tiled_mma = sm90_utils.make_trivial_tiled_mma(
+            self.a_dtype,
+            self.b_dtype,
+            self.a_layout.sm90_mma_major_mode(),
+            self.b_layout.sm90_mma_major_mode(),
+            self.acc_dtype,
+            self.atom_layout_mnk,
+            tiler_mn=(64, self.tile_shape_mnk[1] // self.atom_layout_mnk[1]),
+        )
+        if const_expr(self.atom_layout_mnk[1] > 1):
+            # If N dimension is split among 2 WGs, we need to permute the N dimension so
+            # that in the epilogue, WG0 and WG1 can write to epi smem of size e.g. (64, 32)
+            # containing accumulators that are next to each other in the N dimension.
+            # Without permutation WG0 would write to epi smem of size (64, 16) and
+            # WG1 would write to a separate epi smem of size (64, 16) that's far away.
+            atom_n = self.atom_layout_mnk[1]
+            permutation_n = cute.make_ordered_layout(
+                (8, self.tile_shape_mnk[1] // atom_n // 8, atom_n), order=(0, 2, 1)
+            )
+            self.tiled_mma = cute.make_tiled_mma(
+                cute.make_mma_atom(self.tiled_mma.op),
+                self.atom_layout_mnk,
+                permutation_mnk=(None, permutation_n, None),
+            )
+        mma_inst_shape_k = cute.size(self.tiled_mma.shape_mnk, mode=[2])
+        mma_inst_tile_k = 4
+        self.tile_shape_mnk = (
+            self.tile_shape_mnk[0],
+            self.tile_shape_mnk[1],
+            mma_inst_shape_k * mma_inst_tile_k,
+        )
 
         self.cluster_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
 
@@ -362,10 +394,10 @@ class GemmSm90:
         self.b_dtype = mB.element_type
         self.d_dtype = mD.element_type if mD is not None else None
         self.c_dtype = mC.element_type if mC is not None else None
-        self.a_layout = cutlass.utils.LayoutEnum.from_tensor(mA)
-        self.b_layout = cutlass.utils.LayoutEnum.from_tensor(mB)
-        self.d_layout = cutlass.utils.LayoutEnum.from_tensor(mD) if mD is not None else None
-        self.c_layout = cutlass.utils.LayoutEnum.from_tensor(mC) if mC is not None else None
+        self.a_layout = LayoutEnum.from_tensor(mA)
+        self.b_layout = LayoutEnum.from_tensor(mB)
+        self.d_layout = LayoutEnum.from_tensor(mD) if mD is not None else None
+        self.c_layout = LayoutEnum.from_tensor(mC) if mC is not None else None
 
         if const_expr(self.a_dtype.width == 16 and self.a_dtype != self.b_dtype):
             raise TypeError(f"Type mismatch: {self.a_dtype} != {self.b_dtype}")
@@ -388,31 +420,6 @@ class GemmSm90:
         ]
 
         self._setup_attributes(epilogue_args)
-
-        tiled_mma = sm90_utils.make_trivial_tiled_mma(
-            self.a_dtype,
-            self.b_dtype,
-            self.a_layout.sm90_mma_major_mode(),
-            self.b_layout.sm90_mma_major_mode(),
-            self.acc_dtype,
-            self.atom_layout_mnk,
-            tiler_mn=(64, self.tile_shape_mnk[1] // self.atom_layout_mnk[1]),
-        )
-        if const_expr(self.atom_layout_mnk[1] > 1):
-            # If N dimension is split among 2 WGs, we need to permute the N dimension so
-            # that in the epilogue, WG0 and WG1 can write to epi smem of size e.g. (64, 32)
-            # containing accumulators that are next to each other in the N dimension.
-            # Without permutation WG0 would write to epi smem of size (64, 16) and
-            # WG1 would write to a separate epi smem of size (64, 16) that's far away.
-            atom_n = self.atom_layout_mnk[1]
-            permutation_n = cute.make_ordered_layout(
-                (8, self.tile_shape_mnk[1] // atom_n // 8, atom_n), order=(0, 2, 1)
-            )
-            tiled_mma = cute.make_tiled_mma(
-                cute.make_mma_atom(tiled_mma.op),
-                self.atom_layout_mnk,
-                permutation_mnk=(None, permutation_n, None),
-            )
 
         if const_expr(not self.gather_A):
             tma_atom_a, tma_tensor_a = self._make_tma_atoms_and_tensors(
@@ -480,7 +487,7 @@ class GemmSm90:
                 cu_seqlens_m=varlen_args.mCuSeqlensM,
                 raster_order=scheduler_args.raster_order,
                 group_size=scheduler_args.max_swizzle_size,
-                tile_shape_mnk=self.tile_shape_mnk,
+                tile_shape_mn=self.tile_shape_mnk[:2],
                 cluster_shape_mnk=self.cluster_shape_mnk,
                 tile_count_semaphore=scheduler_args.tile_count_semaphore,
                 is_persistent=self.is_persistent,
@@ -540,7 +547,7 @@ class GemmSm90:
             varlen_args.mCuSeqlensM,
             varlen_args.mCuSeqlensK,
             varlen_args.mTensormaps,
-            tiled_mma,
+            self.tiled_mma,
             self.cluster_layout_mnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -761,12 +768,8 @@ class GemmSm90:
                                 is_manager_warp=is_tma_warp,
                                 shapes=(cu_seqlens_k[batch_idx + 1], cu_seqlens_k[batch_idx + 1]),
                                 orders=(
-                                    # TODO: is_k_major_a is no longer there in cutlass 4.2
-                                    0 if const_expr(self.a_layout.is_k_major_a()) else 1,
-                                    # confusingly b_layout is ROW_MAJOR when it's k-major,
-                                    # so the result of b_layout.is_k_major_b() is the opposite of
-                                    # what we want.
-                                    0 if const_expr(not self.b_layout.is_k_major_b()) else 1,
+                                    0 if const_expr(self.a_layout == LayoutEnum.ROW_MAJOR) else 1,
+                                    0 if const_expr(self.b_layout == LayoutEnum.ROW_MAJOR) else 1,
                                 ),
                                 tensormap_smem_ptr=None,
                             )
@@ -1616,14 +1619,14 @@ class GemmSm90:
     def epilog_smem_store_and_partition(
         self,
         tiled_mma: cute.TiledMma,
-        d_layout: Optional[cutlass.utils.LayoutEnum],
+        d_layout: Optional[LayoutEnum],
         dtype: Type[cutlass.Numeric],
         acc: cute.Tensor,
         sD: cute.Tensor,
         tidx: Int32,
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
         if d_layout is None:
-            d_layout = cutlass.utils.LayoutEnum.ROW_MAJOR
+            d_layout = LayoutEnum.ROW_MAJOR
         tiled_copy_C_atom = self.epilog_smem_copy_atom(tiled_mma)
         # Doesn't work with tile_N % 8 == 0 but tile_n % 16 != since this always
         # get st.matrix with num_matrices=4
@@ -1644,7 +1647,7 @@ class GemmSm90:
     def epilog_smem_load_and_partition(
         self,
         tiled_mma: cute.TiledMma,
-        c_layout: cutlass.utils.LayoutEnum,
+        c_layout: LayoutEnum,
         dtype: Type[cutlass.Numeric],
         sC: cute.Tensor,
         tRS_rD_layout: cutlass.Layout,
@@ -1870,15 +1873,15 @@ class GemmSm90:
         tile_shape_mnk: Tuple[int, int, int],
         epi_tile: Tuple[int, int],
         a_dtype: Type[cutlass.Numeric],
-        a_layout: cutlass.utils.LayoutEnum,
+        a_layout: LayoutEnum,
         b_dtype: Type[cutlass.Numeric],
-        b_layout: cutlass.utils.LayoutEnum,
+        b_layout: LayoutEnum,
         ab_stage: int,
         d_dtype: Optional[Type[cutlass.Numeric]],
-        d_layout: cutlass.utils.LayoutEnum,
+        d_layout: LayoutEnum,
         epi_stage: int,
         c_dtype: Optional[Type[cutlass.Numeric]],
-        c_layout: Optional[cutlass.utils.LayoutEnum],
+        c_layout: Optional[LayoutEnum],
         epi_c_stage: int,
     ) -> Tuple[
         cute.ComposedLayout, cute.ComposedLayout, cute.ComposedLayout, Optional[cute.ComposedLayout]
@@ -1892,17 +1895,17 @@ class GemmSm90:
         :param a_dtype: Data type for matrix A
         :type a_dtype: type[cutlass.Numeric]
         :param a_layout: Layout enum for matrix A
-        :type a_layout: cutlass.utils.LayoutEnum
+        :type a_layout: LayoutEnum
         :param b_dtype: Data type for matrix B
         :type b_dtype: type[cutlass.Numeric]
         :param b_layout: Layout enum for matrix B
-        :type b_layout: cutlass.utils.LayoutEnum
+        :type b_layout: LayoutEnum
         :param ab_stage: Number of stages for A/B tensors
         :type ab_stage: int
         :param d_dtype: Data type for output matrix D
         :type d_dtype: type[cutlass.Numeric]
         :param d_layout: Layout enum for the output matrix C
-        :type d_layout: cutlass.utils.LayoutEnum
+        :type d_layout: LayoutEnum
         :param epi_stage: Number of epilogue stages
         :type epi_stage: int
 
@@ -2056,7 +2059,7 @@ class GemmSm90:
         thread_layout = cute.make_layout(
             (num_threads // shape_dim_1, shape_dim_1), stride=(shape_dim_1, 1)
         )
-        if major_mode != cutlass.utils.LayoutEnum.ROW_MAJOR:
+        if major_mode != LayoutEnum.ROW_MAJOR:
             shape_dim_0 = cute.size(self.tile_shape_mnk[0]) // copy_elems
             thread_layout = cute.make_layout(
                 (shape_dim_0, num_threads // shape_dim_0), stride=(1, shape_dim_0)
@@ -2064,7 +2067,7 @@ class GemmSm90:
         # Value layout for copy
         value_layout = (
             cute.make_layout((1, copy_elems))
-            if major_mode == cutlass.utils.LayoutEnum.ROW_MAJOR
+            if major_mode == LayoutEnum.ROW_MAJOR
             else cute.make_layout((copy_elems, 1))
         )
         return cute.make_tiled_copy_tv(atom_async_copy, thread_layout, value_layout)
@@ -2165,7 +2168,7 @@ def gemm_sm90(
     GemmWrapperBase.determine_major_orders(tensor_infos, major_configs)
 
     acc_dtype = cutlass.Float32
-    tile_shape_mnk = (tile_M, tile_N, 64)  # TODO: adjust for fp8
+    tile_shape_mn = (tile_M, tile_N)
     cluster_shape_mnk = (cluster_M, cluster_N, 1)
     if not GemmSm90.is_valid_dtypes(
         tensor_infos["A"].dtype,
@@ -2195,7 +2198,7 @@ def gemm_sm90(
     compile_key = GemmWrapperBase.get_compile_key(
         tensor_infos,
         None,
-        tile_shape_mnk,
+        tile_shape_mn,
         cluster_shape_mnk,
         pingpong,
         persistent,
@@ -2209,7 +2212,7 @@ def gemm_sm90(
         gemm = GemmSm90(
             acc_dtype,
             tensor_infos["A"].dtype,
-            tile_shape_mnk,
+            tile_shape_mn,
             cluster_shape_mnk,
             pingpong=pingpong,
             is_persistent=persistent,
