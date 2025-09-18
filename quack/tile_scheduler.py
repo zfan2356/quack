@@ -262,8 +262,8 @@ class TileScheduler:
     @cute.jit
     def fetch_next_work(self, is_scheduler_warp: bool | Boolean = False, *, loc=None, ip=None):
         """is_scheduler_warp should only be true for one warp in the whole cluster"""
-        if const_expr(self.params.tile_count_semaphore is not None):
-            params = self.params
+        params = self.params
+        if const_expr(params.is_persistent and params.tile_count_semaphore is not None):
             current_work_linear_idx = self._current_work_linear_idx
             if is_scheduler_warp:
                 if cute.arch.lane_idx() == 0:
@@ -275,6 +275,38 @@ class TileScheduler:
                 # lane 0 already has the right tile_idx, just need to broadcast
                 current_work_linear_idx = cute.arch.shuffle_sync(current_work_linear_idx, 0)
             self._current_work_linear_idx = current_work_linear_idx
+
+    # We have to split broadcast_next_work and advance_to_next_work into two functions
+    # due to a bug in cute-dsl 4.2: https://github.com/NVIDIA/cutlass/issues/2647
+    @cute.jit
+    def broadcast_next_work(self, is_scheduler_warp: bool | Boolean = False, *, loc=None, ip=None):
+        """is_scheduler_warp should only be true for one warp in the whole cluster"""
+        params = self.params
+        if const_expr(params.is_persistent and params.tile_count_semaphore is not None):
+            current_work_linear_idx = self._current_work_linear_idx
+            if is_scheduler_warp:
+                self._scheduler_pipeline.producer_acquire(self._pipeline_state)
+                lane_idx = cute.arch.lane_idx()
+                if lane_idx < cute.size(params.cluster_shape_mn):
+                    # cute.printf("Producer bidx = {}, tidx = {}, after empty wait, idx = {}", bidx, tidx, current_work_linear_idx)
+                    if const_expr(cute.size(params.cluster_shape_mn) == 1):
+                        self._tile_count[self._pipeline_state.index] = current_work_linear_idx
+                        self._scheduler_pipeline.producer_commit(self._pipeline_state)
+                    else:
+                        peer_cta_rank_in_cluster = lane_idx
+                        mbar_ptr = self._scheduler_pipeline.producer_get_barrier(
+                            self._pipeline_state
+                        )
+                        cute.arch.mbarrier_arrive_and_expect_tx(
+                            mbar_ptr, 4, peer_cta_rank_in_cluster
+                        )
+                        utils.store_shared_remote(
+                            val=current_work_linear_idx,
+                            smem_ptr=self._tile_count.iterator + self._pipeline_state.index,
+                            mbar_ptr=mbar_ptr,
+                            peer_cta_rank_in_cluster=peer_cta_rank_in_cluster,
+                        )
+                    # cute.printf("Producer bidx = {}, tidx = {}, after full arrive", bidx, tidx)
 
     @cute.jit
     def advance_to_next_work(
@@ -296,30 +328,7 @@ class TileScheduler:
                 if const_expr(advance_count > 1):
                     self._pipeline_state.advance_iters(advance_count - 1)
                 current_work_linear_idx = self._current_work_linear_idx
-                if is_scheduler_warp:
-                    self._scheduler_pipeline.producer_acquire(self._pipeline_state)
-                    lane_idx = cute.arch.lane_idx()
-                    if lane_idx < cute.size(params.cluster_shape_mn):
-                        # cute.printf("Producer bidx = {}, tidx = {}, after empty wait, idx = {}", bidx, tidx, current_work_linear_idx)
-                        if const_expr(cute.size(params.cluster_shape_mn) == 1):
-                            self._tile_count[self._pipeline_state.index] = current_work_linear_idx
-                            self._scheduler_pipeline.producer_commit(self._pipeline_state)
-                        else:
-                            peer_cta_rank_in_cluster = lane_idx
-                            mbar_ptr = self._scheduler_pipeline.producer_get_barrier(
-                                self._pipeline_state
-                            )
-                            cute.arch.mbarrier_arrive_and_expect_tx(
-                                mbar_ptr, 4, peer_cta_rank_in_cluster
-                            )
-                            utils.store_shared_remote(
-                                val=current_work_linear_idx,
-                                smem_ptr=self._tile_count.iterator + self._pipeline_state.index,
-                                mbar_ptr=mbar_ptr,
-                                peer_cta_rank_in_cluster=peer_cta_rank_in_cluster,
-                            )
-                        # cute.printf("Producer bidx = {}, tidx = {}, after full arrive", bidx, tidx)
-                else:
+                if not is_scheduler_warp:
                     # if tidx % 64 == 0: cute.printf("bidx = {},tidx = {}, before full wait, idx = {}", bidx, tidx, current_work_linear_idx)
                     self._scheduler_pipeline.consumer_wait(self._pipeline_state)
                     # if tidx % 64 == 0: cute.printf("bidx = {}, tidx = {}, after full wait, idx = {}", bidx, tidx, current_work_linear_idx)

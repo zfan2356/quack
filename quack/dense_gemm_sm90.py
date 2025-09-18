@@ -912,11 +912,14 @@ class GemmSm90:
                             ),
                         )
                     tile_scheduler.fetch_next_work(is_scheduler_warp=is_scheduler_warp)
+                    tile_scheduler.broadcast_next_work(is_scheduler_warp=is_scheduler_warp)
                     tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
                     work_tile = tile_scheduler.get_current_work()
                     # End of persistent scheduler loop
                 if const_expr(self.pingpong and not varlen_k):
                     # Need to write the tile_idx to smem for the next WG in the pingpong mode
+                    # tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
+                    tile_scheduler.broadcast_next_work(is_scheduler_warp=is_scheduler_warp)
                     tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
                 ab_pipeline.producer_tail(ab_producer_state)
                 if is_scheduler_warp:
